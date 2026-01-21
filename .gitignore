@@ -1,0 +1,26 @@
+# virtual env
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# builds
+dist/
+build/
+*.spec
+
+# vosk models (VERY LARGE)
+models/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# logs
+*.log

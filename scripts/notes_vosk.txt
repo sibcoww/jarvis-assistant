@@ -1,0 +1,6 @@
+Vosk ASR (черновые заметки):
+1) pip install vosk sounddevice
+2) Скачай модель RU (например, vosk-model-small-ru):
+   https://alphacephei.com/vosk/models
+3) Распакуй в models/vosk-ru и укажи путь при инициализации VoskASR.
+4) Реализуй VoskASR.listen_once(): открыть стрим sounddevice, читать аудио, парсить результаты.
