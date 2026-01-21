@@ -3,9 +3,10 @@ from typing import Callable, Optional
 
 from .nlu import SimpleNLU
 from .executor import Executor
+from PySide6.QtCore import QTimer
 
 class JarvisEngine:
-    def __init__(self, asr, log: Optional[Callable[[str], None]] = None):
+    def __init__(self, asr=None, log= None):
         self.asr = asr
         self.nlu = SimpleNLU()
         self.ex = Executor()
@@ -14,18 +15,70 @@ class JarvisEngine:
         self.log = log or (lambda msg: None)
 
         self.armed = False  # ждём ли команду после wake-word
+        self._asr_lock = threading.Lock()
+        self.is_loading = False
+        self.is_ready = False
+        self.is_running = False
+
+    def _ensure_asr(self):
+        if self.asr is not None:
+            self.is_ready = True
+            return
+
+        with self._asr_lock:
+            if self.asr is not None:
+                self.is_ready = True
+                return
+
+            self.is_loading = True
+            self.log("⏳ Загрузка модели распознавания речи...")
+            from .vosk_asr import VoskASR
+            self.asr = VoskASR("models/vosk-model-ru-0.42")
+            self.is_loading = False
+            self.is_ready = True
+            self.log("✅ Модель загружена, микрофон готов")
 
     def start(self):
+        if self.is_running:
+            return
         if self._thread and self._thread.is_alive():
             return
+
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._bootstrap_and_run, daemon=True)
         self._thread.start()
-        self.log("🟢 Движок запущен. Скажи «Джарвис».")
+
+
+    def _bootstrap_and_run(self):
+        try:
+            self._ensure_asr()
+
+            self.is_running = True
+            self.log("🟢 Движок запущен. Скажи «Джарвис».")
+            self._run()
+
+        except Exception as e:
+            self.log(f"❌ Ошибка запуска движка: {e}")
+        finally:
+            self.is_running = False
+
 
     def stop(self):
+        if not self.is_running and not self.is_loading:
+            return
         self._stop.set()
+        self.armed = False
         self.log("🔴 Движок остановлен.")
+
+        
+    def preload(self):
+        try:
+            self._ensure_asr()
+        except Exception as e:
+            self.is_loading = False
+            self.log(f"❌ Ошибка загрузки модели: {e}")
+
+
 
     def _has_wake_word(self, text: str) -> bool:
         wake_words = {"джарвис", "жарвис", "джервис", "джанверт", "джанвис", "джаврис"}

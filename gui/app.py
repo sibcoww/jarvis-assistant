@@ -1,13 +1,14 @@
 import sys
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
-    QVBoxLayout, QWidget, QSystemTrayIcon, QMenu
+    QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel
 )
-from PySide6.QtGui import QAction, QIcon
-from PySide6.QtCore import Signal, QObject
 
-from src.jarvis.vosk_asr import VoskASR
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtCore import Signal, QObject, QTimer
+
 from src.jarvis.engine import JarvisEngine
+
 
 
 class LogBus(QObject):
@@ -24,6 +25,7 @@ class MainWindow(QMainWindow):
         self.resize(700, 450)
 
         self.log_view = QTextEdit()
+        self.status_label = QLabel("Статус: INIT")
         self.log_view.setReadOnly(True)
 
         self.btn_start = QPushButton("Старт")
@@ -33,15 +35,52 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.engine.stop)
 
         layout = QVBoxLayout()
+        layout.addWidget(self.status_label)
         layout.addWidget(self.log_view)
         layout.addWidget(self.btn_start)
         layout.addWidget(self.btn_stop)
+        
 
         w = QWidget()
         w.setLayout(layout)
         self.setCentralWidget(w)
 
         self.bus.log.connect(self.append_log)
+
+        self.btn_stop.setEnabled(False)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_buttons)
+        self.timer.start(300)
+
+    def refresh_buttons(self):
+        # LOADING
+        if getattr(self.engine, "is_loading", False):
+            self.status_label.setText("Статус: LOADING (загрузка модели)")
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+            return
+
+        # RUNNING
+        if getattr(self.engine, "is_running", False):
+            self.status_label.setText("Статус: RUNNING (слушаю)")
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+            return
+
+        # READY
+        if getattr(self.engine, "is_ready", False):
+            self.status_label.setText("Статус: READY (готов)")
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            return
+
+        # INIT / UNKNOWN
+        self.status_label.setText("Статус: INIT")
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+
+
 
     def append_log(self, msg: str):
         self.log_view.append(msg)
@@ -52,12 +91,10 @@ def main():
 
     bus = LogBus()
 
-    # создаём ASR
-    model_path = "models/vosk-model-ru-0.42"
-    asr = VoskASR(model_path=model_path)
-
     # движок + лог callback в Qt сигнал
-    engine = JarvisEngine(asr=asr, log=lambda m: bus.log.emit(m))
+    engine = JarvisEngine(asr=None, log=lambda m: bus.log.emit(m))
+    import threading
+    threading.Thread(target=engine.preload, daemon=True).start()
 
     win = MainWindow(engine, bus)
 
