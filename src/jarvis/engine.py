@@ -19,6 +19,8 @@ class JarvisEngine:
         self.is_loading = False
         self.is_ready = False
         self.is_running = False
+        self.device = None  # индекс микрофона sounddevice
+
 
     def _ensure_asr(self):
         if self.asr is not None:
@@ -33,10 +35,19 @@ class JarvisEngine:
             self.is_loading = True
             self.log("⏳ Загрузка модели распознавания речи...")
             from .vosk_asr import VoskASR
-            self.asr = VoskASR("models/vosk-model-ru-0.42")
+            self.asr = VoskASR("models/vosk-model-ru-0.42", device=self.device)
             self.is_loading = False
             self.is_ready = True
             self.log("✅ Модель загружена, микрофон готов")
+
+    def set_device(self, device_index: int | None):
+        if self.is_running or self.is_loading:
+            self.log("⚠ Нельзя менять микрофон во время работы/загрузки.")
+            return
+        self.device = device_index
+        self.asr = None
+        self.is_ready = False
+        self.log(f"🎤 Выбран микрофон: {device_index}. Нажми Старт (модель загрузится заново).")
 
     def start(self):
         if self.is_running:

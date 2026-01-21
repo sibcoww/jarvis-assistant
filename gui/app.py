@@ -1,8 +1,11 @@
 import sys
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
-    QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel
+    QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
+    QComboBox, QHBoxLayout
 )
+
+import sounddevice as sd
 
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtCore import Signal, QObject, QTimer
@@ -27,6 +30,11 @@ class MainWindow(QMainWindow):
         self.log_view = QTextEdit()
         self.status_label = QLabel("Статус: INIT")
         self.log_view.setReadOnly(True)
+        self.device_combo = QComboBox()
+        self.btn_refresh_devices = QPushButton("Обновить микрофоны")
+
+        self.btn_refresh_devices.clicked.connect(self.load_devices)
+        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
 
         self.btn_start = QPushButton("Старт")
         self.btn_stop = QPushButton("Стоп")
@@ -39,6 +47,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_view)
         layout.addWidget(self.btn_start)
         layout.addWidget(self.btn_stop)
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Микрофон:"))
+        top_row.addWidget(self.device_combo)
+        top_row.addWidget(self.btn_refresh_devices)
+
+        layout.addWidget(self.status_label)
+        layout.addLayout(top_row)
+        layout.addWidget(self.log_view)
+
         
 
         w = QWidget()
@@ -46,6 +63,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(w)
 
         self.bus.log.connect(self.append_log)
+        self.load_devices() 
 
         self.btn_stop.setEnabled(False)
 
@@ -85,6 +103,36 @@ class MainWindow(QMainWindow):
     def append_log(self, msg: str):
         self.log_view.append(msg)
 
+    def load_devices(self):
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
+
+        devices = sd.query_devices()
+        input_devices = []
+        for i, d in enumerate(devices):
+            if d.get("max_input_channels", 0) > 0:
+                name = d.get("name", f"Device {i}")
+                self.device_combo.addItem(f"{i}: {name}", i)
+                input_devices.append(i)
+
+        self.device_combo.blockSignals(False)
+
+        if input_devices:
+            # выберем дефолтный input, если он есть
+            try:
+                default_in = sd.default.device[0]
+                idx = input_devices.index(default_in) if default_in in input_devices else 0
+            except Exception:
+                idx = 0
+
+            self.device_combo.setCurrentIndex(idx)
+            self.on_device_changed(idx)
+
+    def on_device_changed(self, combo_index: int):
+        if combo_index < 0:
+            return
+        device_index = self.device_combo.itemData(combo_index)
+        self.engine.set_device(device_index)
 
 def main():
     app = QApplication(sys.argv)
