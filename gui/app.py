@@ -3,7 +3,7 @@ import logging
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
-    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QSpinBox
+    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox
 )
 
 import sounddevice as sd
@@ -119,10 +119,12 @@ class MainWindow(QMainWindow):
         # Таймаут фразы
         timeout_layout = QHBoxLayout()
         timeout_layout.addWidget(QLabel("Таймаут фразы (сек):"))
-        self.timeout_spinbox = QSpinBox()
-        self.timeout_spinbox.setMinimum(1)
-        self.timeout_spinbox.setMaximum(30)
-        self.timeout_spinbox.setValue(6)
+        self.timeout_spinbox = QDoubleSpinBox()
+        self.timeout_spinbox.setMinimum(1.0)
+        self.timeout_spinbox.setMaximum(30.0)
+        self.timeout_spinbox.setValue(6.0)
+        self.timeout_spinbox.setSingleStep(0.5)
+        self.timeout_spinbox.setDecimals(1)
         self.timeout_spinbox.setToolTip("Максимальное время ожидания фразы")
         timeout_layout.addWidget(self.timeout_spinbox)
         timeout_layout.addStretch()
@@ -131,12 +133,12 @@ class MainWindow(QMainWindow):
         # Таймаут молчания
         silence_layout = QHBoxLayout()
         silence_layout.addWidget(QLabel("Таймаут молчания (сек):"))
-        self.silence_spinbox = QSpinBox()
-        self.silence_spinbox.setMinimum(1)
-        self.silence_spinbox.setMaximum(10)
-        self.silence_spinbox.setValue(1)
-        self.silence_spinbox.setSingleStep(1)
-        self.silence_spinbox.setDecimals(1)  # Если поддерживает
+        self.silence_spinbox = QDoubleSpinBox()
+        self.silence_spinbox.setMinimum(0.1)
+        self.silence_spinbox.setMaximum(10.0)
+        self.silence_spinbox.setValue(1.2)
+        self.silence_spinbox.setSingleStep(0.1)
+        self.silence_spinbox.setDecimals(1)
         self.silence_spinbox.setToolTip("Время тишины для завершения фразы")
         silence_layout.addWidget(self.silence_spinbox)
         silence_layout.addStretch()
