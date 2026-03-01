@@ -60,6 +60,32 @@ class SimpleNLU:
     def parse(self, text: str) -> dict:
         t = text.lower()
 
+        # browser commands (проверяем ДО open_app чтобы не было конфликта)
+        if "перейди на" in t or "открой сайт" in t:
+            m = re.search(r"(?:перейди на|открой сайт)\s+(.+)", t)
+            if m:
+                site = m.group(1).strip()
+                return {"type": "browser_navigate", "slots": {"url": site}}
+        
+        if "гугл" in t or "поиск" in t:
+            m = re.search(r"(?:гугл|поиск)\s+(.+)", t)
+            if m:
+                query = m.group(1).strip()
+                return {"type": "browser_search", "slots": {"query": query}}
+        
+        # media commands (проверяем ДО open_app чтобы не было конфликта с "включи")
+        if any(w in t for w in ("включи музыку", "включи музик", "запусти музыку")):
+            return {"type": "media_play", "slots": {}}
+        
+        if any(w in t for w in ("пауза", "стоп", "остановись")):
+            return {"type": "media_pause", "slots": {}}
+        
+        if any(w in t for w in ("далее", "следующая", "следующий")):
+            return {"type": "media_next", "slots": {}}
+        
+        if any(w in t for w in ("назад", "предыдущая", "предыдущий")):
+            return {"type": "media_previous", "slots": {}}
+
         # open app
         if any(w in t for w in ("открой", "запусти", "включи")):
             if any(w in t for w in ("браузер", "хром", "chrome")):
@@ -115,6 +141,29 @@ class SimpleNLU:
         m = re.search(r"(создай|сделай)\s+папк[ауы]\s+(.+)", t)
         if m:
             return {"type": "create_folder", "slots": {"name": m.group(2).strip()}}
+        
+        # calendar/time commands
+        if any(w in t for w in ("какая дата", "сегодня дата", "текущая дата")):
+            return {"type": "show_date", "slots": {}}
+        
+        if any(w in t for w in ("какое время", "текущее время", "который час")):
+            return {"type": "show_time", "slots": {}}
+        
+        if "напоминание" in t or "напомни" in t:
+            m = re.search(r"(?:напоминание|напомни)(?:\s+через|\s+на)?\s+(.+)", t)
+            if m:
+                reminder = m.group(1).strip()
+                return {"type": "create_reminder", "slots": {"reminder": reminder}}
+        
+        # notes commands
+        if "запомни" in t or "запишись" in t:
+            m = re.search(r"(?:запомни|запишись)(?:\s+что)?\s+(.+)", t)
+            if m:
+                note = m.group(1).strip()
+                return {"type": "add_note", "slots": {"text": note}}
+        
+        if "вспомни" in t or "напомни записал" in t or "прочитай заметк" in t:
+            return {"type": "read_notes", "slots": {}}
 
         return {"type": "unknown", "slots": {"text": text}}
     

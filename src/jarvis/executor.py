@@ -5,6 +5,13 @@ import os
 import shutil
 from pathlib import Path
 from ctypes import cast, POINTER
+from datetime import datetime
+import webbrowser
+
+try:
+    import pyautogui
+except ImportError:
+    pyautogui = None
 
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
@@ -204,6 +211,54 @@ class Executor:
             if t == "create_folder":
                 self.create_folder(slots.get("name", ""))
                 return
+            
+            # Browser commands
+            if t == "browser_navigate":
+                self.browser_navigate(slots.get("url", ""))
+                return
+            
+            if t == "browser_search":
+                self.browser_search(slots.get("query", ""))
+                return
+            
+            # Media commands
+            if t == "media_play":
+                self.media_play()
+                return
+            
+            if t == "media_pause":
+                self.media_pause()
+                return
+            
+            if t == "media_next":
+                self.media_next()
+                return
+            
+            if t == "media_previous":
+                self.media_previous()
+                return
+            
+            # Calendar/Time commands
+            if t == "show_date":
+                self.show_date()
+                return
+            
+            if t == "show_time":
+                self.show_time()
+                return
+            
+            # Reminders & Notes
+            if t == "create_reminder":
+                self.create_reminder(slots.get("reminder", ""))
+                return
+            
+            if t == "add_note":
+                self.add_note(slots.get("text", ""))
+                return
+            
+            if t == "read_notes":
+                self.read_notes()
+                return
 
             logger.warning(f"Не понял команду: {intent}")
         except Exception as e:
@@ -272,3 +327,169 @@ class Executor:
             logger.info(f"Файл создан: {path}")
         except Exception as e:
             logger.error(f"Ошибка создания файла: {e}")
+    
+    # ============ Browser Commands ============
+    def browser_navigate(self, url: str):
+        """Открыть URL в браузере"""
+        try:
+            # Добавляем https если нет протокола
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            
+            webbrowser.open(url)
+            logger.info(f"Открываю в браузере: {url}")
+        except Exception as e:
+            logger.error(f"Ошибка навигации в браузере: {e}")
+    
+    def browser_search(self, query: str):
+        """Поиск в Google"""
+        try:
+            search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+            webbrowser.open(search_url)
+            logger.info(f"Ищу в Google: {query}")
+        except Exception as e:
+            logger.error(f"Ошибка поиска: {e}")
+    
+    # ============ Media Commands ============
+    def media_play(self):
+        """Включить музыку (Play)"""
+        try:
+            if pyautogui is None:
+                logger.warning("pyautogui не установлен. Media команды недоступны.")
+                return
+            pyautogui.press('playpause')
+            logger.info("Музыка включена")
+        except Exception as e:
+            logger.error(f"Ошибка воспроизведения: {e}")
+    
+    def media_pause(self):
+        """Пауза"""
+        try:
+            if pyautogui is None:
+                logger.warning("pyautogui не установлен.")
+                return
+            pyautogui.press('playpause')
+            logger.info("Пауза")
+        except Exception as e:
+            logger.error(f"Ошибка паузы: {e}")
+    
+    def media_next(self):
+        """Следующий трек"""
+        try:
+            if pyautogui is None:
+                logger.warning("pyautogui не установлен.")
+                return
+            pyautogui.press('nexttrack')
+            logger.info("Следующий трек")
+        except Exception as e:
+            logger.error(f"Ошибка переключения трека: {e}")
+    
+    def media_previous(self):
+        """Предыдущий трек"""
+        try:
+            if pyautogui is None:
+                logger.warning("pyautogui не установлен.")
+                return
+            pyautogui.press('prevtrack')
+            logger.info("Предыдущий трек")
+        except Exception as e:
+            logger.error(f"Ошибка переключения на предыдущий трек: {e}")
+    
+    # ============ Calendar/Time Commands ============
+    def show_date(self):
+        """Показать текущую дату"""
+        try:
+            from .tts import TextToSpeech
+            date_str = datetime.now().strftime("%d %B %Y года")
+            date_ru = date_str.replace("January", "января").replace("February", "февраля") \
+                               .replace("March", "марта").replace("April", "апреля") \
+                               .replace("May", "мая").replace("June", "июня") \
+                               .replace("July", "июля").replace("August", "августа") \
+                               .replace("September", "сентября").replace("October", "октября") \
+                               .replace("November", "ноября").replace("December", "декабря")
+            
+            tts = TextToSpeech()
+            tts.speak(f"Сегодня {date_ru}")
+            logger.info(f"Дата: {date_ru}")
+        except Exception as e:
+            logger.error(f"Ошибка показа даты: {e}")
+    
+    def show_time(self):
+        """Показать текущее время"""
+        try:
+            from .tts import TextToSpeech
+            time_str = datetime.now().strftime("%H:%M")
+            time_ru = f"{datetime.now().hour} часов {datetime.now().minute} минут"
+            
+            tts = TextToSpeech()
+            tts.speak(f"Текущее время: {time_ru}")
+            logger.info(f"Время: {time_str}")
+        except Exception as e:
+            logger.error(f"Ошибка показа времени: {e}")
+    
+    # ============ Reminders & Notes ============
+    def create_reminder(self, reminder: str):
+        """Создать напоминание"""
+        try:
+            reminders_file = Path.home() / ".jarvis" / "reminders.json"
+            reminders_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            reminders = []
+            if reminders_file.exists():
+                reminders = json.loads(reminders_file.read_text(encoding="utf-8"))
+            
+            reminders.append({
+                "text": reminder,
+                "created": datetime.now().isoformat(),
+                "done": False
+            })
+            
+            reminders_file.write_text(json.dumps(reminders, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"Напоминание создано: {reminder}")
+        except Exception as e:
+            logger.error(f"Ошибка создания напоминания: {e}")
+    
+    def add_note(self, text: str):
+        """Добавить заметку"""
+        try:
+            notes_file = Path.home() / ".jarvis" / "notes.json"
+            notes_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            notes = []
+            if notes_file.exists():
+                notes = json.loads(notes_file.read_text(encoding="utf-8"))
+            
+            notes.append({
+                "text": text,
+                "timestamp": datetime.now().isoformat(),
+                "tags": []
+            })
+            
+            notes_file.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"Заметка добавлена: {text}")
+        except Exception as e:
+            logger.error(f"Ошибка добавления заметки: {e}")
+    
+    def read_notes(self):
+        """Прочитать все заметки"""
+        try:
+            from .tts import TextToSpeech
+            notes_file = Path.home() / ".jarvis" / "notes.json"
+            
+            if not notes_file.exists():
+                logger.warning("Заметок не найдено")
+                return
+            
+            notes = json.loads(notes_file.read_text(encoding="utf-8"))
+            
+            if not notes:
+                logger.info("Заметок нет")
+                return
+            
+            tts = TextToSpeech()
+            for i, note in enumerate(notes[-5:], 1):  # Последние 5 заметок
+                tts.speak(f"Заметка {i}: {note['text']}")
+            
+            logger.info(f"Прочитано {len(notes)} заметок")
+        except Exception as e:
+            logger.error(f"Ошибка чтения заметок: {e}")

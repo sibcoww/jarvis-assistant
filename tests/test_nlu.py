@@ -173,5 +173,133 @@ class TestNLUEdgeCases(unittest.TestCase):
         self.assertIsNotNone(intent)
 
 
+class TestNLUBrowserCommands(unittest.TestCase):
+    """Тесты для команд браузера"""
+    
+    def setUp(self):
+        self.nlu = SimpleNLU()
+    
+    def test_browser_navigate(self):
+        """Распознавание команды перехода на сайт"""
+        intent = self.nlu.parse("перейди на google.com")
+        self.assertEqual(intent["type"], "browser_navigate")
+        self.assertIn("google.com", intent["slots"]["url"])
+        
+        intent = self.nlu.parse("открой сайт wikipedia.org")
+        self.assertEqual(intent["type"], "browser_navigate")
+        self.assertIn("wikipedia.org", intent["slots"]["url"])
+    
+    def test_browser_search(self):
+        """Распознавание команды поиска"""
+        intent = self.nlu.parse("гугл python")
+        self.assertEqual(intent["type"], "browser_search")
+        self.assertEqual(intent["slots"]["query"], "python")
+        
+        intent = self.nlu.parse("поиск как готовить торт")
+        self.assertEqual(intent["type"], "browser_search")
+        self.assertIn("торт", intent["slots"]["query"])
+
+
+class TestNLUMediaCommands(unittest.TestCase):
+    """Тесты для медиа-команд"""
+    
+    def setUp(self):
+        self.nlu = SimpleNLU()
+    
+    def test_media_play(self):
+        """Распознавание команды включения музыки"""
+        intent = self.nlu.parse("включи музыку")
+        self.assertEqual(intent["type"], "media_play")
+        
+        intent = self.nlu.parse("запусти музыку")
+        self.assertEqual(intent["type"], "media_play")
+    
+    def test_media_pause(self):
+        """Распознавание команды паузы"""
+        intent = self.nlu.parse("пауза")
+        self.assertEqual(intent["type"], "media_pause")
+        
+        intent = self.nlu.parse("стоп")
+        self.assertEqual(intent["type"], "media_pause")
+        
+        intent = self.nlu.parse("остановись")
+        self.assertEqual(intent["type"], "media_pause")
+    
+    def test_media_next(self):
+        """Распознавание команды следующего трека"""
+        intent = self.nlu.parse("далее")
+        self.assertEqual(intent["type"], "media_next")
+        
+        intent = self.nlu.parse("следующая")
+        self.assertEqual(intent["type"], "media_next")
+    
+    def test_media_previous(self):
+        """Распознавание команды предыдущего трека"""
+        intent = self.nlu.parse("назад")
+        self.assertEqual(intent["type"], "media_previous")
+        
+        intent = self.nlu.parse("предыдущая")
+        self.assertEqual(intent["type"], "media_previous")
+
+
+class TestNLUCalendarCommands(unittest.TestCase):
+    """Тесты для команд календаря и времени"""
+    
+    def setUp(self):
+        self.nlu = SimpleNLU()
+    
+    def test_show_date(self):
+        """Распознавание команды показа даты"""
+        intent = self.nlu.parse("какая дата")
+        self.assertEqual(intent["type"], "show_date")
+        
+        intent = self.nlu.parse("сегодня дата")
+        self.assertEqual(intent["type"], "show_date")
+        
+        intent = self.nlu.parse("текущая дата")
+        self.assertEqual(intent["type"], "show_date")
+    
+    def test_show_time(self):
+        """Распознавание команды показа времени"""
+        intent = self.nlu.parse("какое время")
+        self.assertEqual(intent["type"], "show_time")
+        
+        intent = self.nlu.parse("текущее время")
+        self.assertEqual(intent["type"], "show_time")
+        
+        intent = self.nlu.parse("который час")
+        self.assertEqual(intent["type"], "show_time")
+    
+    def test_create_reminder(self):
+        """Распознавание команды создания напоминания"""
+        intent = self.nlu.parse("напоминание купить молоко")
+        self.assertEqual(intent["type"], "create_reminder")
+        self.assertIn("молоко", intent["slots"]["reminder"])
+
+
+class TestNLUNotesCommands(unittest.TestCase):
+    """Тесты для команд заметок"""
+    
+    def setUp(self):
+        self.nlu = SimpleNLU()
+    
+    def test_add_note(self):
+        """Распознавание команды добавления заметки"""
+        intent = self.nlu.parse("запомни позвонить маме")
+        self.assertEqual(intent["type"], "add_note")
+        self.assertIn("маме", intent["slots"]["text"])
+        
+        intent = self.nlu.parse("запишись что нужно купить хлеб")
+        self.assertEqual(intent["type"], "add_note")
+    
+    def test_read_notes(self):
+        """Распознавание команды чтения заметок"""
+        intent = self.nlu.parse("вспомни")
+        self.assertEqual(intent["type"], "read_notes")
+        
+        intent = self.nlu.parse("прочитай заметки")
+        self.assertEqual(intent["type"], "read_notes")
+
+
 if __name__ == "__main__":
     unittest.main()
