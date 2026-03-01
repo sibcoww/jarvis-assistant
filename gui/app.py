@@ -1,8 +1,9 @@
 import sys
+import logging
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
-    QComboBox, QHBoxLayout, QProgressBar
+    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QSpinBox
 )
 
 import sounddevice as sd
@@ -12,6 +13,7 @@ from PySide6.QtCore import Signal, QObject, QTimer
 
 from src.jarvis.engine import JarvisEngine
 
+logger = logging.getLogger(__name__)
 
 
 class LogBus(QObject):
@@ -25,55 +27,133 @@ class MainWindow(QMainWindow):
         self.bus = bus
 
         self.setWindowTitle("Jarvis Assistant")
-        self.resize(700, 500)
+        self.resize(800, 600)
 
-        self.log_view = QTextEdit()
-        self.status_label = QLabel("Статус: INIT")
-        self.log_view.setReadOnly(True)
-        self.device_combo = QComboBox()
-        self.btn_refresh_devices = QPushButton("Обновить микрофоны")
+        # Вкладки для навигации
+        self.tabs = QTabWidget()
         
+        # Вкладка 1: Основное окно
+        self.main_tab = QWidget()
+        self.setup_main_tab()
+        
+        # Вкладка 2: Настройки
+        self.settings_tab = QWidget()
+        self.setup_settings_tab()
+        
+        self.tabs.addTab(self.main_tab, "Основное")
+        self.tabs.addTab(self.settings_tab, "Настройки")
+        
+        self.setCentralWidget(self.tabs)
+
+        self.bus.log.connect(self.append_log)
+        self.load_devices()
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_buttons)
+        self.timer.start(100)
+    
+    def setup_main_tab(self):
+        """Настройка основной вкладки"""
+        layout = QVBoxLayout()
+        
+        # Статус
+        self.status_label = QLabel("Статус: INIT")
+        status_font = self.status_label.font()
+        status_font.setPointSize(12)
+        status_font.setBold(True)
+        self.status_label.setFont(status_font)
+        layout.addWidget(self.status_label)
+        
+        # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setMinimum(0)
         self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
-
-        self.btn_refresh_devices.clicked.connect(self.load_devices)
-        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
-
-        self.btn_start = QPushButton("Старт")
-        self.btn_stop = QPushButton("Стоп")
-
-        self.btn_start.clicked.connect(self.engine.start)
-        self.btn_stop.clicked.connect(self.engine.stop)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
         
-        top_row = QHBoxLayout()
-        top_row.addWidget(QLabel("Микрофон:"))
-        top_row.addWidget(self.device_combo)
-        top_row.addWidget(self.btn_refresh_devices)
-        
-        layout.addLayout(top_row)
+        # Логирование
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        layout.addWidget(QLabel("Лог:"))
         layout.addWidget(self.log_view)
-        layout.addWidget(self.btn_start)
-        layout.addWidget(self.btn_stop)
-
-        w = QWidget()
-        w.setLayout(layout)
-        self.setCentralWidget(w)
-
-        self.bus.log.connect(self.append_log)
-        self.load_devices() 
-
+        
+        # Кнопки управления
+        button_layout = QHBoxLayout()
+        self.btn_start = QPushButton("▶ Старт")
+        self.btn_stop = QPushButton("⏹ Стоп")
+        self.btn_start.clicked.connect(self.engine.start)
+        self.btn_stop.clicked.connect(self.engine.stop)
         self.btn_stop.setEnabled(False)
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh_buttons)
-        self.timer.start(100)  # обновляем чаще для более плавного UI
+        
+        button_layout.addWidget(self.btn_start)
+        button_layout.addWidget(self.btn_stop)
+        layout.addLayout(button_layout)
+        
+        self.main_tab.setLayout(layout)
+    
+    def setup_settings_tab(self):
+        """Настройка вкладки настроек"""
+        layout = QVBoxLayout()
+        
+        # Выбор микрофона
+        device_layout = QHBoxLayout()
+        device_layout.addWidget(QLabel("Микрофон:"))
+        self.device_combo = QComboBox()
+        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+        device_layout.addWidget(self.device_combo)
+        
+        self.btn_refresh_devices = QPushButton("🔄 Обновить")
+        self.btn_refresh_devices.clicked.connect(self.load_devices)
+        device_layout.addWidget(self.btn_refresh_devices)
+        
+        layout.addLayout(device_layout)
+        
+        # Параметры ASR
+        params_group_label = QLabel("Параметры распознавания:")
+        params_font = params_group_label.font()
+        params_font.setBold(True)
+        params_group_label.setFont(params_font)
+        layout.addWidget(params_group_label)
+        
+        # Таймаут фразы
+        timeout_layout = QHBoxLayout()
+        timeout_layout.addWidget(QLabel("Таймаут фразы (сек):"))
+        self.timeout_spinbox = QSpinBox()
+        self.timeout_spinbox.setMinimum(1)
+        self.timeout_spinbox.setMaximum(30)
+        self.timeout_spinbox.setValue(6)
+        self.timeout_spinbox.setToolTip("Максимальное время ожидания фразы")
+        timeout_layout.addWidget(self.timeout_spinbox)
+        timeout_layout.addStretch()
+        layout.addLayout(timeout_layout)
+        
+        # Таймаут молчания
+        silence_layout = QHBoxLayout()
+        silence_layout.addWidget(QLabel("Таймаут молчания (сек):"))
+        self.silence_spinbox = QSpinBox()
+        self.silence_spinbox.setMinimum(1)
+        self.silence_spinbox.setMaximum(10)
+        self.silence_spinbox.setValue(1)
+        self.silence_spinbox.setSingleStep(1)
+        self.silence_spinbox.setDecimals(1)  # Если поддерживает
+        self.silence_spinbox.setToolTip("Время тишины для завершения фразы")
+        silence_layout.addWidget(self.silence_spinbox)
+        silence_layout.addStretch()
+        layout.addLayout(silence_layout)
+        
+        # Информация
+        info_label = QLabel(
+            "💡 Информация:\n"
+            "• Таймаут фразы: максимальное время ожидания одной фразы\n"
+            "• Таймаут молчания: время тишины, после которого фраза считается завершённой\n"
+            "• Нажми 'Обновить' для переподключения микрофона"
+        )
+        info_label.setStyleSheet("color: #666; font-size: 10px;")
+        layout.addWidget(info_label)
+        
+        layout.addStretch()
+        self.settings_tab.setLayout(layout)
 
     def refresh_buttons(self):
         # LOADING

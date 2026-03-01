@@ -70,6 +70,7 @@ class SimpleNLU:
                 return {"type": "open_app", "slots": {"target": "vscode"}}
             if any(w in t for w in ("блокнот", "notepad", "блокноту")):
                 return {"type": "open_app", "slots": {"target": "notepad"}}
+            # Если указано открой/запусти, но приложение не распознано, ищем дальше
 
         # volume up/down X
         if "сделай тише" in t or "убавь громкость" in t:
@@ -85,7 +86,7 @@ class SimpleNLU:
         if "рабочий режим" in t:
             return {"type": "run_scenario", "slots": {"name": "рабочий режим"}}
 
-        if "громк" in text or "звук" in text:
+        if "громк" in t or "звук" in t:
             value = extract_number(text)
             if value is not None:
                 value = max(0, min(100, value))
@@ -94,20 +95,20 @@ class SimpleNLU:
                     "slots": {"value": value}
                 }
 
+        # open app (generic pattern)
+        if t.startswith(("открой", "запусти")):
+            target = t.replace("открой", "").replace("запусти", "").strip()
+            if target:
+                return {
+                    "type": "open_app",
+                    "slots": {"target": target}
+                }
 
-        # открыть приложение
-        if text.startswith(("открой", "запусти")):
-            target = text.replace("открой", "").replace("запусти", "").strip()
-            return {
-                "type": "open_app",
-                "slots": {"target": target}
-            }
-
-        # сценарий
-        if text in ("рабочий режим", "рабочий"):
+        # scenario
+        if t in ("рабочий режим", "рабочий"):
             return {
                 "type": "run_scenario",
-                "slots": {"name": text}
+                "slots": {"name": t}
             }
         
         # create folder
