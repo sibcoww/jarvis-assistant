@@ -2,6 +2,7 @@ import json
 import subprocess
 import logging
 import os
+import shutil
 from pathlib import Path
 from ctypes import cast, POINTER
 
@@ -207,3 +208,67 @@ class Executor:
             logger.warning(f"Не понял команду: {intent}")
         except Exception as e:
             logger.error(f"Ошибка выполнения команды: {e}")
+    
+    def copy_file(self, source: str, destination: str):
+        """Копировать файл"""
+        try:
+            src = Path(source)
+            dst = Path(destination)
+            
+            if not src.exists():
+                logger.warning(f"Файл не найден: {source}")
+                return
+            
+            if src.is_file():
+                shutil.copy2(src, dst)
+                logger.info(f"Файл скопирован: {source} → {destination}")
+            else:
+                logger.warning(f"Это не файл: {source}")
+        except Exception as e:
+            logger.error(f"Ошибка копирования файла: {e}")
+    
+    def move_file(self, source: str, destination: str):
+        """Переместить файл"""
+        try:
+            src = Path(source)
+            dst = Path(destination)
+            
+            if not src.exists():
+                logger.warning(f"Файл не найден: {source}")
+                return
+            
+            shutil.move(str(src), str(dst))
+            logger.info(f"Файл перемещён: {source} → {destination}")
+        except Exception as e:
+            logger.error(f"Ошибка перемещения файла: {e}")
+    
+    def delete_file(self, path: str):
+        """Удалить файл"""
+        try:
+            p = Path(path)
+            
+            if not p.exists():
+                logger.warning(f"Файл не найден: {path}")
+                return
+            
+            if p.is_file():
+                p.unlink()
+                logger.info(f"Файл удалён: {path}")
+            else:
+                logger.warning(f"Это не файл: {path}")
+        except Exception as e:
+            logger.error(f"Ошибка удаления файла: {e}")
+    
+    def create_file(self, path: str, content: str = ""):
+        """Создать файл с содержимым"""
+        try:
+            p = Path(path)
+            
+            # Создаём необходимые папки
+            p.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Создаём файл
+            p.write_text(content, encoding="utf-8")
+            logger.info(f"Файл создан: {path}")
+        except Exception as e:
+            logger.error(f"Ошибка создания файла: {e}")
