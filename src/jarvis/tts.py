@@ -88,7 +88,13 @@ class TextToSpeech:
                 self.is_speaking = True
                 logger.debug(f"TTS: {text}")
                 self.engine.say(text)
-                self.engine.runAndWait()
+                # Используем startLoop вместо runAndWait для избежания конфликтов
+                try:
+                    self.engine.runAndWait()
+                except RuntimeError:
+                    # Если loop уже запущен, просто ждём
+                    import time
+                    time.sleep(len(text) * 0.05)  # Примерная оценка времени
             finally:
                 self.is_speaking = False
     

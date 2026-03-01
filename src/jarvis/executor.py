@@ -20,8 +20,20 @@ logger = logging.getLogger(__name__)
 
 
 class Executor:
-    def __init__(self, config=None):
+    def __init__(self, config=None, enable_tts=False):
         self.config = config or self._load_default_config()
+        self.enable_tts = enable_tts
+        self._tts = None
+        
+        # Инициализируем TTS только если нужно
+        if self.enable_tts:
+            try:
+                from src.jarvis.tts import TextToSpeech
+                self._tts = TextToSpeech()
+                logger.info("TTS инициализирован")
+            except Exception as e:
+                logger.warning(f"TTS недоступен: {e}")
+                self._tts = None
 
     def _load_default_config(self) -> dict:
         config_path = Path(__file__).with_name("config.json")
@@ -399,31 +411,34 @@ class Executor:
     def show_date(self):
         """Показать текущую дату"""
         try:
-            from .tts import TextToSpeech
-            date_str = datetime.now().strftime("%d %B %Y года")
-            date_ru = date_str.replace("January", "января").replace("February", "февраля") \
-                               .replace("March", "марта").replace("April", "апреля") \
-                               .replace("May", "мая").replace("June", "июня") \
-                               .replace("July", "июля").replace("August", "августа") \
-                               .replace("September", "сентября").replace("October", "октября") \
-                               .replace("November", "ноября").replace("December", "декабря")
+            now = datetime.now()
+            months_ru = {
+                1: "января", 2: "февраля", 3: "марта", 4: "апреля",
+                5: "мая", 6: "июня", 7: "июля", 8: "августа",
+                9: "сентября", 10: "октября", 11: "ноября", 12: "декабря"
+            }
+            date_str = f"{now.day} {months_ru[now.month]} {now.year} года"
             
-            tts = TextToSpeech()
-            tts.speak(f"Сегодня {date_ru}")
-            logger.info(f"Дата: {date_ru}")
+            logger.info(f"📅 Дата: {date_str}")
+            
+            # Озвучиваем если TTS включен
+            if self._tts:
+                self._tts.speak(f"Сегодня {date_str}")
         except Exception as e:
             logger.error(f"Ошибка показа даты: {e}")
     
     def show_time(self):
         """Показать текущее время"""
         try:
-            from .tts import TextToSpeech
-            time_str = datetime.now().strftime("%H:%M")
-            time_ru = f"{datetime.now().hour} часов {datetime.now().minute} минут"
+            now = datetime.now()
+            time_str = now.strftime("%H:%M")
+            time_ru = f"{now.hour} часов {now.minute} минут"
             
-            tts = TextToSpeech()
-            tts.speak(f"Текущее время: {time_ru}")
-            logger.info(f"Время: {time_str}")
+            logger.info(f"🕐 Время: {time_str}")
+            
+            # Озвучиваем если TTS включен
+            if self._tts:
+                self._tts.speak(f"Текущее время: {time_ru}")
         except Exception as e:
             logger.error(f"Ошибка показа времени: {e}")
     
@@ -445,7 +460,7 @@ class Executor:
             })
             
             reminders_file.write_text(json.dumps(reminders, ensure_ascii=False, indent=2), encoding="utf-8")
-            logger.info(f"Напоминание создано: {reminder}")
+            logger.info(f"⏰ Напоминание создано: {reminder}")
         except Exception as e:
             logger.error(f"Ошибка создания напоминания: {e}")
     
@@ -466,30 +481,33 @@ class Executor:
             })
             
             notes_file.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
-            logger.info(f"Заметка добавлена: {text}")
+            logger.info(f"📝 Заметка добавлена: {text}")
         except Exception as e:
             logger.error(f"Ошибка добавления заметки: {e}")
     
     def read_notes(self):
         """Прочитать все заметки"""
         try:
-            from .tts import TextToSpeech
             notes_file = Path.home() / ".jarvis" / "notes.json"
             
             if not notes_file.exists():
-                logger.warning("Заметок не найдено")
+                logger.warning("📝 Заметок не найдено")
                 return
             
             notes = json.loads(notes_file.read_text(encoding="utf-8"))
             
             if not notes:
-                logger.info("Заметок нет")
+                logger.info("📝 Заметок нет")
                 return
             
-            tts = TextToSpeech()
-            for i, note in enumerate(notes[-5:], 1):  # Последние 5 заметок
-                tts.speak(f"Заметка {i}: {note['text']}")
+            logger.info(f"📝 Найдено заметок: {len(notes)}")
             
-            logger.info(f"Прочитано {len(notes)} заметок")
+            # Показываем последние 5 заметок
+            for i, note in enumerate(notes[-5:], 1):
+                logger.info(f"  {i}. {note['text']}")
+                
+                # Озвучиваем если TTS включен
+                if self._tts:
+                    self._tts.speak(f"Заметка {i}: {note['text']}")
         except Exception as e:
             logger.error(f"Ошибка чтения заметок: {e}")
