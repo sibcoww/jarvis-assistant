@@ -51,16 +51,12 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
-        layout.addWidget(self.log_view)
-        layout.addWidget(self.btn_start)
-        layout.addWidget(self.btn_stop)
+        
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("Микрофон:"))
         top_row.addWidget(self.device_combo)
         top_row.addWidget(self.btn_refresh_devices)
-
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.progress_bar)
+        
         layout.addLayout(top_row)
         layout.addWidget(self.log_view)
         layout.addWidget(self.btn_start)

@@ -1,8 +1,10 @@
 import argparse
-from rich import print
+import logging
+from .logger import setup_logging
 from .nlu import SimpleNLU
 from .executor import Executor
-from .asr import MockASR
+
+logger = logging.getLogger(__name__)
 
 WAKE_WORDS = {
     "джарвис", "жарвис", "джервис",
@@ -19,13 +21,13 @@ def run_loop(asr):
 
     armed = False  # ждём ли команду после wake-word
 
-    print("[green]Скажи «Джарвис», чтобы активировать ассистента[/green]")
+    logger.info("🔵 Скажи «Джарвис», чтобы активировать ассистента")
 
     while True:
         try:
             text = asr.listen_once()
         except KeyboardInterrupt:
-            print("\n[yellow]Выход по Ctrl+C[/yellow]")
+            logger.info("🟡 Выход по Ctrl+C")
             break
 
         if not text:
@@ -35,30 +37,32 @@ def run_loop(asr):
 
         # выход (даже без wake-word)
         if t in ("exit", "quit", "выход"):
-            print("[yellow]Завершение работы[/yellow]")
+            logger.info("🟡 Завершение работы")
             break
 
-        print(f"[cyan]Распознано:[/] {text}")
+        logger.info(f"🎤 Распознано: {text}")
 
         # 1) если ещё не активирован — ждём wake-word
         if not armed:
             if has_wake_word(t):
                 armed = True
-                print("[green]✅ Активирован. Скажи команду...[/green]")
+                logger.info("✅ Активирован. Скажи команду...")
             # иначе игнорируем всё
             continue
 
         # 2) если активирован — обрабатываем следующую фразу как команду
         intent = nlu.parse(text)
-        print(f"[magenta]Интент:[/] {intent}")
+        logger.info(f"🧠 Интент: {intent}")
         ex.run(intent)
 
         # 3) после выполнения снова ждём wake-word
         armed = False
-        print("[green]Скажи «Джарвис», чтобы активировать ассистента[/green]")
+        logger.info("🔵 Скажи «Джарвис», чтобы активировать ассистента")
 
 
 def main():
+    setup_logging()
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--mock", action="store_true", help="Запуск без микрофона (ввод с клавиатуры)")
     parser.add_argument("--asr", type=str, default="mock", help="mock|vosk")
@@ -69,14 +73,16 @@ def main():
     if args.asr == "vosk" and not args.mock:
         try:
             from .vosk_asr import VoskASR
-            print(f"[green]Jarvis — режим Vosk[/green]  (модель: {args.model})")
+            logger.info(f"🔵 Jarvis — режим Vosk (модель: {args.model})")
             asr = VoskASR(model_path=args.model)
         except Exception as e:
-            print(f"[red]Ошибка инициализации VoskASR:[/] {e}")
-            print("[yellow]Падаем обратно в mock-режим[/yellow]")
+            logger.error(f"🔴 Ошибка инициализации VoskASR: {e}")
+            logger.warning("🟡 Падаем обратно в mock-режим")
+            from .asr import MockASR
             asr = MockASR()
     else:
-        print("[green]Jarvis — mock режим[/green]")
+        logger.info("🔵 Jarvis — mock режим")
+        from .asr import MockASR
         asr = MockASR()
 
     run_loop(asr)

@@ -1,0 +1,30 @@
+{
+  "apps": {
+    "browser": "${PROGRAMFILES}/Google/Chrome/Application/chrome.exe",
+    "vscode": "${VSCODE_PATH}",
+    "telegram": "${APPDATA}/Telegram Desktop/Telegram.exe",
+    "notepad": "notepad"
+  },
+  "synonyms": {
+    "браузер": "browser",
+    "хром": "browser",
+    "chrome": "browser",
+
+    "телеграм": "telegram",
+    "телеграмм": "telegram",
+    "телеграмму": "telegram",
+    "telegram": "telegram",
+
+    "vscode": "vscode",
+    "вс код": "vscode",
+    "визуал студио код": "vscode",
+    "визу студию код": "vscode",
+
+    "блокнот": "notepad",
+    "блокноту": "notepad",
+    "нотпад": "notepad"
+  },
+  "scenarios": {
+    "рабочий режим": ["open:vscode", "open:browser"]
+  }
+}

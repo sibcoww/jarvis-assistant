@@ -1,12 +1,14 @@
 import queue
 import json
 import time
+import logging
 
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
 
 _TIMING_DEBUG = False  # Set True to see detailed timing logs during loading
 _MODEL_CACHE = {}  # Global cache for loaded models
+logger = logging.getLogger(__name__)
 
 
 class VoskASR:
@@ -35,12 +37,12 @@ class VoskASR:
         if model_path in _MODEL_CACHE:
             self.model = _MODEL_CACHE[model_path]
             if _TIMING_DEBUG:
-                print(f"[TIMING] Model loaded from cache: {time.time() - t0:.3f}s")
+                logger.debug(f"[TIMING] Model loaded from cache: {time.time() - t0:.3f}s")
         else:
             self.model = Model(model_path)
             _MODEL_CACHE[model_path] = self.model
             if _TIMING_DEBUG:
-                print(f"[TIMING] Model init (fresh): {time.time() - t0:.2f}s")
+                logger.debug(f"[TIMING] Model init (fresh): {time.time() - t0:.2f}s")
         
         self.q: "queue.Queue[bytes]" = queue.Queue()
 
@@ -63,7 +65,7 @@ class VoskASR:
         self.rec = KaldiRecognizer(self.model, self.samplerate)
         self.rec.SetWords(False)
         if _TIMING_DEBUG:
-            print(f"[TIMING] KaldiRecognizer init: {time.time() - t0:.2f}s")
+            logger.debug(f"[TIMING] KaldiRecognizer init: {time.time() - t0:.2f}s")
 
         if on_progress:
             on_progress(2, 2)
@@ -72,7 +74,7 @@ class VoskASR:
         self.stream = None
         
         if _TIMING_DEBUG:
-            print(f"[TIMING] VoskASR total init: {time.time() - start_total:.2f}s")
+            logger.debug(f"[TIMING] VoskASR total init: {time.time() - start_total:.2f}s")
 
     def _callback(self, indata, frames, time_info, status):
         # не спамим логами, но статус можно отладить при необходимости
@@ -94,7 +96,7 @@ class VoskASR:
         )
         self.stream.start()
         if _TIMING_DEBUG:
-            print(f"[TIMING] Stream init (lazy): {time.time() - t0:.2f}s")
+            logger.debug(f"[TIMING] Stream init (lazy): {time.time() - t0:.2f}s")
 
     def _drain_queue(self):
         # очистить очередь перед новой фразой (иначе могут тянуться старые куски)

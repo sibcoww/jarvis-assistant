@@ -1,10 +1,14 @@
 import json
 import subprocess
+import logging
+import os
 from pathlib import Path
 from ctypes import cast, POINTER
 
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
+
+logger = logging.getLogger(__name__)
 
 
 class Executor:
@@ -16,9 +20,14 @@ class Executor:
         if not config_path.exists():
             return {}
         try:
-            return json.loads(config_path.read_text(encoding="utf-8"))
+            config_data = json.loads(config_path.read_text(encoding="utf-8"))
+            # Разрешаем переменные окружения в путях
+            if "apps" in config_data:
+                for key, path in config_data["apps"].items():
+                    config_data["apps"][key] = os.path.expandvars(path)
+            return config_data
         except Exception as error:
-            print(f"Не удалось загрузить config.json: {error}")
+            logger.error(f"Не удалось загрузить config.json: {error}")
             return {}
 
     def _resolve_target(self, target: str) -> str:
@@ -39,16 +48,21 @@ class Executor:
         target = self._resolve_target(target)
         apps = self.config.get("apps", {})
         if target in apps:
-            subprocess.Popen(apps[target], shell=True)
-            print(f"Запускаю: {apps[target]}")
+            cmd_path = apps[target]
+            try:
+                # Безопасный запуск без shell=True
+                subprocess.Popen([cmd_path], shell=False)
+                logger.info(f"Запускаю: {cmd_path}")
+            except Exception as e:
+                logger.error(f"Ошибка запуска приложения {cmd_path}: {e}")
         else:
-            print(f"Неизвестное приложение: {target}")
+            logger.warning(f"Неизвестное приложение: {target}")
 
     def set_volume(self, value: int):
         value = max(0, min(100, int(value)))
         volume = self._get_volume_endpoint()
         volume.SetMasterVolumeLevelScalar(value / 100.0, None)
-        print(f"Громкость установлена на {value}%")
+        logger.info(f"Громкость установлена на {value}%")
 
     def change_volume(self, delta: int):
         volume = self._get_volume_endpoint()
@@ -58,17 +72,17 @@ class Executor:
     def create_folder(self, name: str):
         folder_name = name.strip().strip("\"'")
         if not folder_name:
-            print("Имя папки пустое")
+            logger.warning("Имя папки пустое")
             return
 
         folder_path = Path.cwd() / folder_name
         folder_path.mkdir(parents=True, exist_ok=True)
-        print(f"Папка готова: {folder_path}")
+        logger.info(f"Папка готова: {folder_path}")
 
     def run_scenario(self, name: str):
         scenarios = self.config.get("scenarios", {})
         if name not in scenarios:
-            print(f"Сценарий не найден: {name}")
+            logger.warning(f"Сценарий не найден: {name}")
             return
 
         for action in scenarios[name]:
@@ -103,4 +117,4 @@ class Executor:
             self.create_folder(slots.get("name", ""))
             return
 
-        print("Не понял команду:", intent)
+        logger.warning(f"Не понял команду: {intent}")

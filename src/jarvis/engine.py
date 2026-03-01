@@ -1,9 +1,12 @@
 import threading
+import logging
 from typing import Callable, Optional
 
 from .nlu import SimpleNLU
 from .executor import Executor
 from PySide6.QtCore import QTimer
+
+logger = logging.getLogger(__name__)
 
 class JarvisEngine:
     def __init__(self, asr=None, log= None):
