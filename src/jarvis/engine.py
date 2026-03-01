@@ -12,10 +12,10 @@ class JarvisEngine:
     def __init__(self, asr=None, log= None):
         self.asr = asr
         self.nlu = SimpleNLU()
-        self.ex = Executor()
+        self.log = log or (lambda msg: None)
+        self.ex = Executor(enable_tts=False, log_callback=self.log)  # Передаём callback в Executor
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self.log = log or (lambda msg: None)
 
         self.armed = False  # ждём ли команду после wake-word
         self._asr_lock = threading.Lock()

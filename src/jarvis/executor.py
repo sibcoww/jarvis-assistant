@@ -20,10 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 class Executor:
-    def __init__(self, config=None, enable_tts=False):
+    def __init__(self, config=None, enable_tts=False, log_callback=None):
         self.config = config or self._load_default_config()
         self.enable_tts = enable_tts
         self._tts = None
+        self.log_callback = log_callback  # Callback для GUI
         
         # Инициализируем TTS только если нужно
         if self.enable_tts:
@@ -34,6 +35,12 @@ class Executor:
             except Exception as e:
                 logger.warning(f"TTS недоступен: {e}")
                 self._tts = None
+    
+    def _log(self, message: str):
+        """Универсальное логирование - в logger и GUI callback"""
+        logger.info(message)
+        if self.log_callback:
+            self.log_callback(message)
 
     def _load_default_config(self) -> dict:
         config_path = Path(__file__).with_name("config.json")
@@ -419,7 +426,7 @@ class Executor:
             }
             date_str = f"{now.day} {months_ru[now.month]} {now.year} года"
             
-            logger.info(f"📅 Дата: {date_str}")
+            self._log(f"📅 Дата: {date_str}")
             
             # Озвучиваем если TTS включен
             if self._tts:
@@ -434,7 +441,7 @@ class Executor:
             time_str = now.strftime("%H:%M")
             time_ru = f"{now.hour} часов {now.minute} минут"
             
-            logger.info(f"🕐 Время: {time_str}")
+            self._log(f"🕐 Время: {time_str}")
             
             # Озвучиваем если TTS включен
             if self._tts:
@@ -460,7 +467,7 @@ class Executor:
             })
             
             reminders_file.write_text(json.dumps(reminders, ensure_ascii=False, indent=2), encoding="utf-8")
-            logger.info(f"⏰ Напоминание создано: {reminder}")
+            self._log(f"⏰ Напоминание создано: {reminder}")
         except Exception as e:
             logger.error(f"Ошибка создания напоминания: {e}")
     
@@ -481,7 +488,7 @@ class Executor:
             })
             
             notes_file.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
-            logger.info(f"📝 Заметка добавлена: {text}")
+            self._log(f"📝 Заметка добавлена: {text}")
         except Exception as e:
             logger.error(f"Ошибка добавления заметки: {e}")
     
@@ -491,20 +498,20 @@ class Executor:
             notes_file = Path.home() / ".jarvis" / "notes.json"
             
             if not notes_file.exists():
-                logger.warning("📝 Заметок не найдено")
+                self._log("📝 Заметок не найдено")
                 return
             
             notes = json.loads(notes_file.read_text(encoding="utf-8"))
             
             if not notes:
-                logger.info("📝 Заметок нет")
+                self._log("📝 Заметок нет")
                 return
             
-            logger.info(f"📝 Найдено заметок: {len(notes)}")
+            self._log(f"📝 Найдено заметок: {len(notes)}")
             
             # Показываем последние 5 заметок
             for i, note in enumerate(notes[-5:], 1):
-                logger.info(f"  {i}. {note['text']}")
+                self._log(f"  {i}. {note['text']}")
                 
                 # Озвучиваем если TTS включен
                 if self._tts:
