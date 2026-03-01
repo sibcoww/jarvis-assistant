@@ -2,7 +2,7 @@ import sys
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
-    QComboBox, QHBoxLayout
+    QComboBox, QHBoxLayout, QProgressBar
 )
 
 import sounddevice as sd
@@ -25,13 +25,19 @@ class MainWindow(QMainWindow):
         self.bus = bus
 
         self.setWindowTitle("Jarvis Assistant")
-        self.resize(700, 450)
+        self.resize(700, 500)
 
         self.log_view = QTextEdit()
         self.status_label = QLabel("Статус: INIT")
         self.log_view.setReadOnly(True)
         self.device_combo = QComboBox()
         self.btn_refresh_devices = QPushButton("Обновить микрофоны")
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
 
         self.btn_refresh_devices.clicked.connect(self.load_devices)
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
@@ -44,6 +50,7 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addWidget(self.status_label)
+        layout.addWidget(self.progress_bar)
         layout.addWidget(self.log_view)
         layout.addWidget(self.btn_start)
         layout.addWidget(self.btn_stop)
@@ -53,10 +60,11 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.btn_refresh_devices)
 
         layout.addWidget(self.status_label)
+        layout.addWidget(self.progress_bar)
         layout.addLayout(top_row)
         layout.addWidget(self.log_view)
-
-        
+        layout.addWidget(self.btn_start)
+        layout.addWidget(self.btn_stop)
 
         w = QWidget()
         w.setLayout(layout)
@@ -69,31 +77,38 @@ class MainWindow(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_buttons)
-        self.timer.start(300)
+        self.timer.start(100)  # обновляем чаще для более плавного UI
 
     def refresh_buttons(self):
         # LOADING
         if getattr(self.engine, "is_loading", False):
             self.status_label.setText("Статус: LOADING (загрузка модели)")
+            self.progress_bar.setVisible(True)
+            if self.progress_bar.value() < 100:
+                self.progress_bar.setValue(self.progress_bar.value() + 2)  # плавное увеличение
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(False)
             return
 
-        # RUNNING
-        if getattr(self.engine, "is_running", False):
-            self.status_label.setText("Статус: RUNNING (слушаю)")
-            self.btn_start.setEnabled(False)
-            self.btn_stop.setEnabled(True)
-            return
-
-        # READY
-        if getattr(self.engine, "is_ready", False):
+        # READY (после LOADING)
+        if getattr(self.engine, "is_ready", False) and not getattr(self.engine, "is_running", False):
+            self.progress_bar.setVisible(False)
+            self.progress_bar.setValue(0)
             self.status_label.setText("Статус: READY (готов)")
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
             return
 
+        # RUNNING
+        if getattr(self.engine, "is_running", False):
+            self.progress_bar.setVisible(False)
+            self.status_label.setText("Статус: RUNNING (слушаю)")
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+            return
+
         # INIT / UNKNOWN
+        self.progress_bar.setVisible(False)
         self.status_label.setText("Статус: INIT")
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(False)

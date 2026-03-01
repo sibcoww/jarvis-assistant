@@ -34,8 +34,13 @@ class JarvisEngine:
 
             self.is_loading = True
             self.log("⏳ Загрузка модели распознавания речи...")
+            
+            def on_progress(step, total):
+                percent = int((step / total) * 100)
+                self.log(f"📊 Загрузка: {percent}% ({step}/{total})")
+            
             from .vosk_asr import VoskASR
-            self.asr = VoskASR("models/vosk-model-ru-0.42", device=self.device)
+            self.asr = VoskASR("models/vosk-model-ru-0.42", device=self.device, on_progress=on_progress)
             self.is_loading = False
             self.is_ready = True
             self.log("✅ Модель загружена, микрофон готов")

@@ -37,5 +37,15 @@ python -m src.jarvis.main --asr vosk
 - «рабочий режим» (пример сценария: открыть VS Code и браузер)
 - «создай папку Проект»
 
+## ✅ Запуск тестов
+```bash
+python -m unittest discover -s tests -p "test_*.py" -q
+```
+
+После установки `pytest` из `requirements.txt` можно также запускать:
+```bash
+pytest -q
+```
+
 ## 📄 Лицензия и авторство
 Ты — автор. Добавь лицензию по желанию.
