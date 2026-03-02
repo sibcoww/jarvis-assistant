@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-Тест системы плагинов Jarvis Assistant
+Test system for Jarvis Assistant plugins
 """
 
 import logging
+import sys
+import os
+
+# Fix Unicode encoding on Windows
+if os.name == 'nt':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 from src.jarvis.plugin_api import JarvisPlugin, PluginManager
@@ -132,7 +140,7 @@ def test_example_plugins():
     
     for intent_type, slots in test_cases:
         result = pm.handle_intent(intent_type, slots)
-        status = "✓" if result else "✗"
+        status = "[OK]" if result else "[FAIL]"
         print(f"  {status} {intent_type}")
 
 
@@ -143,13 +151,13 @@ if __name__ == "__main__":
         test_example_plugins()
         
         print("\n" + "="*50)
-        print("✓ ВСЕ ТЕСТЫ ПРОЙДЕНЫ!")
+        print("[OK] ALL TESTS PASSED!")
         print("="*50)
     except AssertionError as e:
-        print(f"\n✗ Тест провален: {e}")
+        print(f"\n[FAIL] Test failed: {e}")
         exit(1)
     except Exception as e:
-        print(f"\n✗ Ошибка: {e}")
+        print(f"\n[ERROR] {e}")
         import traceback
         traceback.print_exc()
         exit(1)

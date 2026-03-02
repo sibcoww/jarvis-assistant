@@ -15,7 +15,7 @@ except ImportError:
 
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
-from src.jarvis.plugin_api import PluginManager
+from .plugin_api import PluginManager
 
 logger = logging.getLogger(__name__)
 

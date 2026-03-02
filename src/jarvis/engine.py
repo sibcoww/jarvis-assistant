@@ -3,16 +3,32 @@ import logging
 from typing import Callable, Optional
 
 from .nlu import SimpleNLU
+from .ml_nlu import MLNLU
 from .executor import Executor
 from PySide6.QtCore import QTimer
 
 logger = logging.getLogger(__name__)
 
 class JarvisEngine:
-    def __init__(self, asr=None, log= None):
+    def __init__(self, asr=None, log=None, use_ml_nlu: bool = True):
         self.asr = asr
-        self.nlu = SimpleNLU()
         self.log = log or (lambda msg: None)
+        
+        # Initialize NLU: try ML first, fallback to SimpleNLU
+        if use_ml_nlu:
+            try:
+                self.log("🤖 Loading ML-based NLU...")
+                self.nlu = MLNLU()
+                self.nlu_type = "ML"
+                self.log("✅ ML NLU loaded")
+            except Exception as e:
+                logger.warning(f"ML NLU initialization failed: {e}. Falling back to SimpleNLU.")
+                self.nlu = SimpleNLU()
+                self.nlu_type = "Simple"
+        else:
+            self.nlu = SimpleNLU()
+            self.nlu_type = "Simple"
+        
         self.ex = Executor(enable_tts=False, log_callback=self.log)  # Передаём callback в Executor
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
