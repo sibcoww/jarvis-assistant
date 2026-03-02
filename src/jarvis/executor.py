@@ -15,6 +15,7 @@ except ImportError:
 
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
+from src.jarvis.plugin_api import PluginManager
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,9 @@ class Executor:
         self.enable_tts = enable_tts
         self._tts = None
         self.log_callback = log_callback  # Callback для GUI
+        
+        # Инициализируем систему плагинов
+        self.plugin_manager = PluginManager()
         
         # Инициализируем TTS только если нужно
         if self.enable_tts:
@@ -206,6 +210,10 @@ class Executor:
         try:
             t = intent["type"]
             slots = intent.get("slots", {})
+            
+            # Сначала проверяем плагины
+            if self.plugin_manager.handle_intent(t, slots):
+                return
 
             if t == "set_volume":
                 self.set_volume(slots.get("value", 50))
