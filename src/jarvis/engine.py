@@ -1,6 +1,9 @@
 import threading
 import logging
 import time
+import json
+from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
 
 from .nlu import SimpleNLU
@@ -16,6 +19,13 @@ class JarvisEngine:
         self.log = log or (lambda msg: None)
         self.continuous_mode_timeout = continuous_mode_timeout  # Время ожидания след. команды без wake-word (сек)
         self.min_intent_confidence = 0.55
+        self._app_started_wall = datetime.now()
+        self._app_started_monotonic = time.perf_counter()
+        self._asr_loading_started_monotonic = None
+        self._startup_timing_log_path = Path.home() / ".jarvis" / "startup_timing.log"
+
+        self._record_startup_timing("app_start")
+        self.log(f"⏱ Запуск приложения: {self._app_started_wall.strftime('%H:%M:%S')}")
         
         # Initialize NLU: try ML first, fallback to SimpleNLU
         if use_ml_nlu:
@@ -45,6 +55,19 @@ class JarvisEngine:
         self.is_running = False
         self.device = None  # индекс микрофона sounddevice
 
+    def _record_startup_timing(self, event: str, **fields):
+        payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+            **fields,
+        }
+        try:
+            self._startup_timing_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._startup_timing_log_path.open("a", encoding="utf-8") as timing_log:
+                timing_log.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as error:
+            logger.warning(f"Не удалось записать startup timing log: {error}")
+
 
     def _ensure_asr(self):
         if self.asr is not None:
@@ -57,6 +80,8 @@ class JarvisEngine:
                 return
 
             self.is_loading = True
+            self._asr_loading_started_monotonic = time.perf_counter()
+            self._record_startup_timing("asr_load_start")
             self.log("⏳ Загрузка модели распознавания речи...")
             
             def on_progress(step, total):
@@ -68,6 +93,28 @@ class JarvisEngine:
             self.is_loading = False
             self.is_ready = True
             self.log("✅ Модель загружена, микрофон готов")
+
+            asr_load_seconds = None
+            if self._asr_loading_started_monotonic is not None:
+                asr_load_seconds = time.perf_counter() - self._asr_loading_started_monotonic
+
+            since_app_start_seconds = time.perf_counter() - self._app_started_monotonic
+
+            if asr_load_seconds is not None:
+                self.log(
+                    f"⏱ Время загрузки модели: {asr_load_seconds:.2f}с "
+                    f"(с запуска приложения: {since_app_start_seconds:.2f}с)"
+                )
+                self._record_startup_timing(
+                    "asr_ready",
+                    asr_load_seconds=round(asr_load_seconds, 3),
+                    since_app_start_seconds=round(since_app_start_seconds, 3),
+                )
+            else:
+                self._record_startup_timing(
+                    "asr_ready",
+                    since_app_start_seconds=round(since_app_start_seconds, 3),
+                )
 
     def set_device(self, device_index: int | None):
         if self.is_running or self.is_loading:

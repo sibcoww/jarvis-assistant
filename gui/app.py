@@ -1,5 +1,8 @@
 import sys
 import logging
+import threading
+import re
+import argparse
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
@@ -9,7 +12,7 @@ from PySide6.QtWidgets import (
 import sounddevice as sd
 
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtCore import Signal, QObject, QTimer
+from PySide6.QtCore import Signal, QObject, QTimer, QEvent
 
 from src.jarvis.engine import JarvisEngine
 
@@ -25,6 +28,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.engine = engine
         self.bus = bus
+        self.tray: QSystemTrayIcon | None = None
+        self._quit_requested = False
+        self._loading_progress_value = 0
 
         self.setWindowTitle("Jarvis Assistant")
         self.resize(800, 600)
@@ -51,6 +57,34 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_buttons)
         self.timer.start(100)
+
+    def set_tray(self, tray: QSystemTrayIcon):
+        self.tray = tray
+
+    def show_and_raise(self):
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def closeEvent(self, event):
+        if self._quit_requested:
+            event.accept()
+            return
+
+        event.ignore()
+        self.hide()
+        if self.tray:
+            self.tray.showMessage(
+                "Jarvis Assistant",
+                "Приложение свернуто в трей и продолжает работать в фоне.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
+            QTimer.singleShot(0, self.hide)
+        super().changeEvent(event)
     
     def setup_main_tab(self):
         """Настройка основной вкладки"""
@@ -162,8 +196,7 @@ class MainWindow(QMainWindow):
         if getattr(self.engine, "is_loading", False):
             self.status_label.setText("Статус: LOADING (загрузка модели)")
             self.progress_bar.setVisible(True)
-            if self.progress_bar.value() < 100:
-                self.progress_bar.setValue(self.progress_bar.value() + 2)  # плавное увеличение
+            self.progress_bar.setValue(self._loading_progress_value)
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(False)
             return
@@ -172,6 +205,7 @@ class MainWindow(QMainWindow):
         if getattr(self.engine, "is_ready", False) and not getattr(self.engine, "is_running", False):
             self.progress_bar.setVisible(False)
             self.progress_bar.setValue(0)
+            self._loading_progress_value = 0
             self.status_label.setText("Статус: READY (готов)")
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
@@ -195,6 +229,15 @@ class MainWindow(QMainWindow):
 
     def append_log(self, msg: str):
         self.log_view.append(msg)
+
+        # Привязываем прогресс-бар к реальному прогрессу загрузки из логов:
+        # "📊 Загрузка: 50% (1/2)"
+        match = re.search(r"Загрузка:\s*(\d+)%", msg)
+        if match:
+            progress = int(match.group(1))
+            self._loading_progress_value = max(0, min(100, progress))
+            if self.progress_bar.isVisible():
+                self.progress_bar.setValue(self._loading_progress_value)
 
     def load_devices(self):
         self.device_combo.blockSignals(True)
@@ -235,7 +278,21 @@ class MainWindow(QMainWindow):
         self.engine.set_device(device_index)
 
 def main():
+    # Подавить Qt DPI-related ошибки на Windows
+    if sys.platform == "win32":
+        import os
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = ""
+    
+    parser = argparse.ArgumentParser(description="Jarvis Assistant GUI")
+    parser.add_argument(
+        "--minimized",
+        action="store_true",
+        help="Запускать приложение свернутым в трей",
+    )
+    args, _unknown = parser.parse_known_args()
+
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
 
     bus = LogBus()
 
@@ -243,7 +300,6 @@ def main():
     engine = JarvisEngine(asr=None, log=lambda m: bus.log.emit(m))
     win = MainWindow(engine, bus)
 
-    import threading
     threading.Thread(target=engine.preload, daemon=True).start()
 
     # трей
@@ -259,10 +315,16 @@ def main():
     act_stop = QAction("Стоп")
     act_quit = QAction("Выход")
 
-    act_show.triggered.connect(win.show)
+    act_show.triggered.connect(win.show_and_raise)
     act_start.triggered.connect(engine.start)
     act_stop.triggered.connect(engine.stop)
-    act_quit.triggered.connect(lambda: (engine.stop(), app.quit()))
+
+    def _quit_app():
+        win._quit_requested = True
+        engine.stop()
+        app.quit()
+
+    act_quit.triggered.connect(_quit_app)
 
     menu.addAction(act_show)
     menu.addSeparator()
@@ -272,9 +334,22 @@ def main():
     menu.addAction(act_quit)
 
     tray.setContextMenu(menu)
+    tray.activated.connect(lambda reason: win.show_and_raise() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
     tray.show()
 
-    win.show()
+    win.set_tray(tray)
+
+    if args.minimized:
+        win.hide()
+        tray.showMessage(
+            "Jarvis Assistant",
+            "Запущен в фоне. Модель загружается в трее.",
+            QSystemTrayIcon.MessageIcon.Information,
+            2500,
+        )
+    else:
+        win.show()
+
     sys.exit(app.exec())
 
 
