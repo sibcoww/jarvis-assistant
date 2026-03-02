@@ -1,5 +1,6 @@
 import threading
 import logging
+import time
 from typing import Callable, Optional
 
 from .nlu import SimpleNLU
@@ -10,9 +11,10 @@ from PySide6.QtCore import QTimer
 logger = logging.getLogger(__name__)
 
 class JarvisEngine:
-    def __init__(self, asr=None, log=None, use_ml_nlu: bool = True):
+    def __init__(self, asr=None, log=None, use_ml_nlu: bool = True, continuous_mode_timeout: float = 10.0):
         self.asr = asr
         self.log = log or (lambda msg: None)
+        self.continuous_mode_timeout = continuous_mode_timeout  # Время ожидания след. команды без wake-word (сек)
         
         # Initialize NLU: try ML first, fallback to SimpleNLU
         if use_ml_nlu:
@@ -34,6 +36,8 @@ class JarvisEngine:
         self._thread: Optional[threading.Thread] = None
 
         self.armed = False  # ждём ли команду после wake-word
+        self.continuous_mode = False  # ждём ли команду в continuous режиме
+        self.continuous_mode_until = 0.0  # timestamp когда выключить continuous режим
         self._asr_lock = threading.Lock()
         self.is_loading = False
         self.is_ready = False
@@ -103,6 +107,7 @@ class JarvisEngine:
             return
         self._stop.set()
         self.armed = False
+        self.continuous_mode = False
         self.log("🔴 Движок остановлен.")
 
         
@@ -137,6 +142,11 @@ class JarvisEngine:
                 self.stop()
                 break
 
+            # Check if continuous mode timed out
+            if self.continuous_mode and time.time() > self.continuous_mode_until:
+                self.continuous_mode = False
+                self.log("⏰ Режим continuous истёк. Скажи «Джарвис» для активации.")
+
             # Check if text contains both wake word and command
             if self._has_wake_word(t):
                 # Wake word detected - parse with ML NLU which handles wake word stripping
@@ -151,7 +161,11 @@ class JarvisEngine:
                     self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                     self.ex.run(intent)
                     self.log("✅ Готово.")
-                    self.log("🟢 Скажи «Джарвис» для активации.")
+                    
+                    # Enter continuous mode - wait for next command without wake word
+                    self.continuous_mode = True
+                    self.continuous_mode_until = time.time() + self.continuous_mode_timeout
+                    self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
                     continue
                 else:
                     # Wake word found but no command after it - arm and wait for command
@@ -159,17 +173,38 @@ class JarvisEngine:
                     self.log("✅ Активирован. Скажи команду…")
                     continue
             
-            # No wake word - check if armed
-            if not self.armed:
-                # Not armed and no wake word - just log and continue
-                self.log("🟢 Скажи «Джарвис» для активации.")
+            # No wake word detected
+            
+            # Check if we're in continuous mode
+            if self.continuous_mode:
+                intent = self.nlu.parse(text)
+                if intent.get("type") != "unknown":
+                    self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
+                    self.ex.run(intent)
+                    self.log("✅ Готово.")
+                    
+                    # Reset continuous mode timer
+                    self.continuous_mode_until = time.time() + self.continuous_mode_timeout
+                    self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
+                    continue
+                else:
+                    # No valid intent in continuous mode - just log and continue listening
+                    self.log("❓ Не понял команду. Повтори.")
+                    continue
+            
+            # Check if armed (regular two-step activation)
+            if self.armed:
+                intent = self.nlu.parse(text)
+                self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
+                self.ex.run(intent)
+                self.log("✅ Готово.")
+
+                # Enter continuous mode after command execution
+                self.continuous_mode = True
+                self.continuous_mode_until = time.time() + self.continuous_mode_timeout
+                self.armed = False
+                self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
                 continue
 
-            # Armed and got text without wake word - this is the command
-            intent = self.nlu.parse(text)
-            self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
-            self.ex.run(intent)
-            self.log("✅ Готово.")
-
-            self.armed = False
+            # Not armed and no wake word - just log and continue
             self.log("🟢 Скажи «Джарвис» для активации.")
