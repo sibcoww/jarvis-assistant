@@ -11,6 +11,8 @@ import spacy
 from spacy.vocab import Vocab
 import numpy as np
 
+from .nlu import extract_number
+
 logger = logging.getLogger(__name__)
 
 # Training data: (text, {"intents": [...], "slots": {...}})
@@ -296,14 +298,12 @@ class MLNLU:
                     break
         
         elif "volume" in intent:
-            # Extract volume delta/value
-            import re
-            match = re.search(r"(\d+)", text)
-            if match:
-                value = int(match.group(1))
-                if "down" in intent or "тише" in text:
+            # Extract volume delta/value using extract_number (handles both digits and words)
+            value = extract_number(text)
+            if value is not None:
+                if "down" in intent or "тише" in text or "убавь" in text:
                     slots["delta"] = value
-                elif "up" in intent or "громче" in text:
+                elif "up" in intent or "громче" in text or "добавь" in text:
                     slots["delta"] = value
                 else:
                     slots["value"] = value
