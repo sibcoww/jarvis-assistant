@@ -15,6 +15,7 @@ class JarvisEngine:
         self.asr = asr
         self.log = log or (lambda msg: None)
         self.continuous_mode_timeout = continuous_mode_timeout  # Время ожидания след. команды без wake-word (сек)
+        self.min_intent_confidence = 0.55
         
         # Initialize NLU: try ML first, fallback to SimpleNLU
         if use_ml_nlu:
@@ -157,6 +158,10 @@ class JarvisEngine:
                     intent = self.nlu.parse(t)
                 
                 if intent.get("type") != "unknown":
+                    if intent.get("confidence", 0.0) < self.min_intent_confidence:
+                        self.log(f"⚠ Низкая уверенность ({intent.get('confidence', 0):.2f}). Повтори команду.")
+                        continue
+
                     # Got valid intent in same sentence as wake word
                     self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                     self.ex.run(intent)
@@ -179,6 +184,10 @@ class JarvisEngine:
             if self.continuous_mode:
                 intent = self.nlu.parse(text)
                 if intent.get("type") != "unknown":
+                    if intent.get("confidence", 0.0) < self.min_intent_confidence:
+                        self.log(f"⚠ Низкая уверенность ({intent.get('confidence', 0):.2f}). Повтори команду.")
+                        continue
+
                     self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                     self.ex.run(intent)
                     self.log("✅ Готово.")
@@ -195,6 +204,14 @@ class JarvisEngine:
             # Check if armed (regular two-step activation)
             if self.armed:
                 intent = self.nlu.parse(text)
+                if intent.get("type") == "unknown":
+                    self.log("❓ Не понял команду. Повтори.")
+                    continue
+
+                if intent.get("confidence", 0.0) < self.min_intent_confidence:
+                    self.log(f"⚠ Низкая уверенность ({intent.get('confidence', 0):.2f}). Повтори команду.")
+                    continue
+
                 self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                 self.ex.run(intent)
                 self.log("✅ Готово.")

@@ -24,6 +24,13 @@
     "блокноту": "notepad",
     "нотпад": "notepad"
   },
+  "sites": {
+    "ютуб": "www.youtube.com",
+    "youtube": "www.youtube.com",
+    "гугл": "google.com",
+    "яндекс": "yandex.ru",
+    "гитхаб": "github.com"
+  },
   "scenarios": {
     "рабочий режим": ["open:vscode", "open:browser"]
   }

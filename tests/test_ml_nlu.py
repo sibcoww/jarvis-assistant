@@ -35,6 +35,7 @@ class TestMLNLU(unittest.TestCase):
             ("перейди на гугл", "browser_navigate"),
             ("гугл котики", "browser_search"),
             ("поиск погода", "browser_search"),
+            ("включи youtube", "browser_navigate"),
         ]
         
         for text, expected_intent in test_cases:
@@ -42,6 +43,14 @@ class TestMLNLU(unittest.TestCase):
             self.assertEqual(result["type"], expected_intent, 
                            f"Failed for: {text}")
             print(f"  ✓ '{text}' -> {result['type']} (conf: {result['confidence']:.2f})")
+
+    def test_site_alias_routing(self):
+        """Test offline mapping for site aliases like YouTube."""
+        result = self.nlu.parse("включи ютуб")
+        self.assertEqual(result["type"], "browser_navigate")
+        self.assertIn("url", result["slots"])
+        self.assertIn("youtube", result["slots"]["url"])
+        print(f"  ✓ 'включи ютуб' -> browser_navigate ({result['slots']['url']})")
     
     def test_media_commands(self):
         """Test media playback intents."""

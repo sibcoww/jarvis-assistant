@@ -3,7 +3,7 @@ import logging
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
-    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox
+    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle
 )
 
 import sounddevice as sd
@@ -225,6 +225,13 @@ class MainWindow(QMainWindow):
         if combo_index < 0:
             return
         device_index = self.device_combo.itemData(combo_index)
+
+        if device_index == self.engine.device:
+            return
+
+        if getattr(self.engine, "is_loading", False) or getattr(self.engine, "is_running", False):
+            return
+
         self.engine.set_device(device_index)
 
 def main():
@@ -234,14 +241,16 @@ def main():
 
     # движок + лог callback в Qt сигнал
     engine = JarvisEngine(asr=None, log=lambda m: bus.log.emit(m))
+    win = MainWindow(engine, bus)
+
     import threading
     threading.Thread(target=engine.preload, daemon=True).start()
 
-    win = MainWindow(engine, bus)
-
     # трей
     tray = QSystemTrayIcon()
-    tray.setIcon(QIcon())  # можно позже поставить иконку
+    fallback_icon = app.style().standardIcon(QStyle.SP_ComputerIcon)
+    tray.setIcon(fallback_icon)
+    win.setWindowIcon(fallback_icon)
     tray.setToolTip("Jarvis Assistant")
 
     menu = QMenu()

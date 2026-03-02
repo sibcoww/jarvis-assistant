@@ -19,6 +19,19 @@ from .plugin_api import PluginManager
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SITE_ALIASES = {
+    "youtube": "www.youtube.com",
+    "you tube": "www.youtube.com",
+    "ютуб": "www.youtube.com",
+    "ютюб": "www.youtube.com",
+    "ютьюб": "www.youtube.com",
+    "яндекс": "yandex.ru",
+    "гугл": "google.com",
+    "google": "google.com",
+    "github": "github.com",
+    "гитхаб": "github.com",
+}
+
 
 class Executor:
     def __init__(self, config=None, enable_tts=False, log_callback=None):
@@ -62,7 +75,8 @@ class Executor:
                 for key, path in config_data["apps"].items():
                     expanded_path = os.path.expandvars(path)
                     # Проверяем, существует ли приложение
-                    if not Path(expanded_path).exists():
+                    in_path = shutil.which(expanded_path) is not None
+                    if not Path(expanded_path).exists() and not in_path:
                         logger.warning(f"Приложение не найдено: {key} -> {expanded_path}")
                     config_data["apps"][key] = expanded_path
             
@@ -131,6 +145,20 @@ class Executor:
         normalized = target.strip().lower()
         synonyms = self.config.get("synonyms", {})
         return synonyms.get(normalized, normalized)
+
+    def _resolve_site_target(self, target: str) -> str:
+        normalized = target.strip().lower()
+        site_aliases = DEFAULT_SITE_ALIASES.copy()
+        site_aliases.update(self.config.get("sites", {}))
+
+        if normalized in site_aliases:
+            return site_aliases[normalized]
+
+        for alias, resolved in site_aliases.items():
+            if alias in normalized:
+                return resolved
+
+        return normalized
 
     def _get_volume_endpoint(self):
         """Получить эндпоинт громкости с обработкой ошибок"""
@@ -359,6 +387,8 @@ class Executor:
     def browser_navigate(self, url: str):
         """Открыть URL в браузере"""
         try:
+            url = self._resolve_site_target(url)
+
             # Добавляем https если нет протокола
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url

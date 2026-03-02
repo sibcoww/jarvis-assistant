@@ -111,6 +111,15 @@ class TestExecutorBrowserCommands(unittest.TestCase):
             self.assertIn("search", called_url)
             self.assertIn("python", called_url)
 
+    def test_browser_navigate_resolves_site_alias(self):
+        ex = _make_executor({"sites": {"ютуб": "www.youtube.com"}})
+
+        with patch("src.jarvis.executor.webbrowser.open") as mock_open:
+            ex.browser_navigate("включи ютуб")
+            mock_open.assert_called_once()
+            called_url = mock_open.call_args.args[0]
+            self.assertIn("youtube.com", called_url)
+
 
 class TestExecutorMediaCommands(unittest.TestCase):
     """Тесты для медиа-команд"""

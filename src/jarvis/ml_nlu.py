@@ -15,6 +15,20 @@ from .nlu import extract_number
 
 logger = logging.getLogger(__name__)
 
+SITE_ALIASES = {
+    "youtube": "www.youtube.com",
+    "you tube": "www.youtube.com",
+    "ютуб": "www.youtube.com",
+    "ютюб": "www.youtube.com",
+    "ютьюб": "www.youtube.com",
+    "ютубе": "www.youtube.com",
+    "яндекс": "yandex.ru",
+    "гугл": "google.com",
+    "google": "google.com",
+    "github": "github.com",
+    "гитхаб": "github.com",
+}
+
 # Training data: (text, {"intents": [...], "slots": {...}})
 TRAINING_DATA = [
     # Browser commands
@@ -152,6 +166,16 @@ class MLNLU:
         
         # Strip wake word if present
         text_clean = self._strip_wake_word(text_lower)
+
+        # Rule-based fast path for offline site opening commands
+        # Examples: "включи youtube", "открой ютуб", "запусти github"
+        site_url = self._resolve_site_url(text_clean)
+        if site_url and self._is_open_site_command(text_clean):
+            return {
+                "type": "browser_navigate",
+                "slots": {"url": site_url},
+                "confidence": 0.99,
+            }
         
         # Try exact match first
         for intent, examples in self.intent_map.items():
@@ -192,6 +216,10 @@ class MLNLU:
         
         # Extract slots
         slots = self._extract_slots(text_clean, best_intent, best_example)
+
+        if not self._is_plausible_intent(text_clean, best_intent, slots):
+            logger.debug(f"Intent rejected by plausibility filter: {best_intent} for '{text_clean}'")
+            return {"type": "unknown", "slots": {}, "confidence": float(best_score)}
         
         logger.debug(f"Parsed '{text}' -> {best_intent} (conf: {best_score:.2f})")
         
@@ -200,6 +228,58 @@ class MLNLU:
             "slots": slots,
             "confidence": float(best_score)
         }
+
+    def _is_plausible_intent(self, text: str, intent: str, slots: Dict) -> bool:
+        """Guardrail to reduce false positives for ambiguous phrases."""
+        text_lower = text.lower()
+
+        if intent == "add_note":
+            return any(keyword in text_lower for keyword in ("запомни", "заметка", "запиши")) and bool(slots.get("text"))
+
+        if intent == "create_reminder":
+            return "напомин" in text_lower and bool(slots.get("time"))
+
+        if intent == "read_notes":
+            return any(keyword in text_lower for keyword in ("вспомни", "заметки", "прочитай заметки"))
+
+        if intent == "open_app":
+            return bool(slots.get("target"))
+
+        if intent == "browser_navigate":
+            return bool(slots.get("url"))
+
+        if intent == "browser_search":
+            return bool(slots.get("query"))
+
+        if intent == "set_volume":
+            return slots.get("value") is not None
+
+        if intent in ("volume_up", "volume_down"):
+            return slots.get("delta") is not None
+
+        if intent == "show_date":
+            return any(keyword in text_lower for keyword in ("дата", "число", "сегодня"))
+
+        if intent == "show_time":
+            return any(keyword in text_lower for keyword in ("время", "час"))
+
+        return True
+
+    def _is_open_site_command(self, text: str) -> bool:
+        open_keywords = (
+            "открой",
+            "зайди",
+            "перейди",
+            "запусти",
+            "включи",
+        )
+        return any(keyword in text for keyword in open_keywords)
+
+    def _resolve_site_url(self, text: str) -> Optional[str]:
+        for alias, url in SITE_ALIASES.items():
+            if alias in text:
+                return url
+        return None
     
     def _strip_wake_word(self, text: str) -> str:
         """Remove wake word from text if present.
@@ -277,6 +357,9 @@ class MLNLU:
             Dictionary of extracted slots
         """
         slots = example.get("slots", {}).copy()
+
+        if intent in {"add_note", "create_reminder", "read_notes", "browser_search", "browser_navigate"}:
+            slots = {}
         
         # Try to extract values from text
         if "url" in slots or "browser_navigate" in intent:
@@ -318,7 +401,7 @@ class MLNLU:
         elif intent in ["add_note", "create_reminder"]:
             # Extract note/reminder text
             import re
-            match = re.search(r"(?:запомни|напоминание|вспомни)\s+(.+)", text)
+            match = re.search(r"(?:запомни|запиши|напоминание|напомни)\s+(.+)", text)
             if match:
                 slot_key = "text" if intent == "add_note" else "time"
                 slots[slot_key] = match.group(1).strip()
