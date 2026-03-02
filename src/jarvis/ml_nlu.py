@@ -50,6 +50,9 @@ TRAINING_DATA = [
     ("добавь громкость на 5", {"intents": ["volume_up"], "slots": {"delta": 5}}),
     ("громкость 50", {"intents": ["set_volume"], "slots": {"value": 50}}),
     ("установи звук на 80", {"intents": ["set_volume"], "slots": {"value": 80}}),
+    ("поставь громкость на 50", {"intents": ["set_volume"], "slots": {"value": 50}}),
+    ("громкость на 30", {"intents": ["set_volume"], "slots": {"value": 30}}),
+    ("громкость на 70", {"intents": ["set_volume"], "slots": {"value": 70}}),
     
     # Scenarios
     ("рабочий режим", {"intents": ["run_scenario"], "slots": {"name": "рабочий режим"}}),
@@ -80,15 +83,17 @@ TRAINING_DATA = [
 class MLNLU:
     """Hybrid ML-based NLU using spaCy embeddings + pattern matching."""
     
-    def __init__(self, model_name: str = "ru_core_news_sm"):
+    def __init__(self, model_name: str = "ru_core_news_sm", wake_word: str = "джарвис"):
         """Initialize ML NLU.
         
         Args:
             model_name: Name of spaCy model to load
+            wake_word: Wake word to strip from input (default: 'джарвис')
         """
         self.training_data = TRAINING_DATA
         self.intent_map: Dict[str, Dict] = {}  # Maps intent to training examples
         self.intent_vectors: Dict[str, np.ndarray] = {}  # Intent embeddings
+        self.wake_word = wake_word.lower()
         
         # Load spaCy model
         logger.info(f"Loading spaCy model: {model_name}")
@@ -136,17 +141,20 @@ class MLNLU:
         """Parse user input and return intent with slots.
         
         Args:
-            text: User input text
+            text: User input text (may include wake word)
             
         Returns:
             Dictionary with "type" (intent), "slots" (extracted values), and "confidence"
         """
         text_lower = text.lower()
         
+        # Strip wake word if present
+        text_clean = self._strip_wake_word(text_lower)
+        
         # Try exact match first
         for intent, examples in self.intent_map.items():
             for ex in examples:
-                if ex["text"] == text_lower:
+                if ex["text"] == text_clean:
                     logger.debug(f"Exact match: {text} -> {intent}")
                     return {
                         "type": intent,
@@ -155,7 +163,7 @@ class MLNLU:
                     }
         
         # Get embedding for input
-        doc = self.nlp(text_lower)
+        doc = self.nlp(text_clean)
         if not doc.has_vector:
             logger.warning(f"No vector for: {text}")
             return {"type": "unknown", "slots": {}, "confidence": 0.0}
@@ -181,7 +189,7 @@ class MLNLU:
             return {"type": "unknown", "slots": {}, "confidence": 0.0}
         
         # Extract slots
-        slots = self._extract_slots(text_lower, best_intent, best_example)
+        slots = self._extract_slots(text_clean, best_intent, best_example)
         
         logger.debug(f"Parsed '{text}' -> {best_intent} (conf: {best_score:.2f})")
         
@@ -190,6 +198,60 @@ class MLNLU:
             "slots": slots,
             "confidence": float(best_score)
         }
+    
+    def _strip_wake_word(self, text: str) -> str:
+        """Remove wake word from text if present.
+        
+        Args:
+            text: Input text (lowercase)
+            
+        Returns:
+            Text without wake word
+        """
+        if not text or self.wake_word not in text:
+            return text
+        
+        # Pattern 1: "джарвис команда" or "джарвис, команда"
+        patterns = [
+            (f"{self.wake_word},", " "),  # "джарвис," -> remove with space
+            (f"{self.wake_word} ", " "),  # "джарвис " -> remove with space
+            (self.wake_word, ""),         # "джарвис" -> just remove
+        ]
+        
+        text_clean = text
+        for old, new in patterns:
+            if old in text_clean:
+                text_clean = text_clean.replace(old, new, 1)  # Replace only first occurrence
+                text_clean = text_clean.strip()
+                logger.debug(f"Stripped wake word: '{text}' -> '{text_clean}'")
+                return text_clean
+        
+        return text_clean
+    
+    def parse_with_wake_word(self, text: str) -> Dict:
+        """Parse input that may contain both wake word and command.
+        
+        This method handles cases like:
+        - "джарвис поставь громкость на 50"
+        - "джарвис, включи музыку"
+        - "привет джарвис включи свет"
+        
+        Args:
+            text: User input text
+            
+        Returns:
+            Dictionary with "type" (intent), "slots", "confidence", and "wake_word_detected"
+        """
+        text_lower = text.lower()
+        
+        # Check if wake word is present
+        wake_word_detected = self.wake_word in text_lower
+        
+        # Parse the full text or cleaned text
+        result = self.parse(text_lower)
+        result["wake_word_detected"] = wake_word_detected
+        
+        return result
     
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         """Compute cosine similarity between two vectors."""

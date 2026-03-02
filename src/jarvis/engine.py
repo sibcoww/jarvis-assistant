@@ -116,6 +116,7 @@ class JarvisEngine:
 
 
     def _has_wake_word(self, text: str) -> bool:
+        """Check if text contains wake word."""
         wake_words = {"джарвис", "жарвис", "джервис", "джанверт", "джанвис", "джаврис"}
         words = text.lower().split()
         return any(w in wake_words for w in words)
@@ -136,16 +137,37 @@ class JarvisEngine:
                 self.stop()
                 break
 
-            # ждём wake-word
-            if not self.armed:
-                if self._has_wake_word(t):
+            # Check if text contains both wake word and command
+            if self._has_wake_word(t):
+                # Wake word detected - parse with ML NLU which handles wake word stripping
+                if hasattr(self.nlu, 'parse_with_wake_word'):
+                    intent = self.nlu.parse_with_wake_word(t)
+                else:
+                    # Fallback: parse after manual wake word removal
+                    intent = self.nlu.parse(t)
+                
+                if intent.get("type") != "unknown":
+                    # Got valid intent in same sentence as wake word
+                    self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
+                    self.ex.run(intent)
+                    self.log("✅ Готово.")
+                    self.log("🟢 Скажи «Джарвис» для активации.")
+                    continue
+                else:
+                    # Wake word found but no command after it - arm and wait for command
                     self.armed = True
                     self.log("✅ Активирован. Скажи команду…")
+                    continue
+            
+            # No wake word - check if armed
+            if not self.armed:
+                # Not armed and no wake word - just log and continue
+                self.log("🟢 Скажи «Джарвис» для активации.")
                 continue
 
-            # это уже команда
+            # Armed and got text without wake word - this is the command
             intent = self.nlu.parse(text)
-            self.log(f"🧠 Интент: {intent}")
+            self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
             self.ex.run(intent)
             self.log("✅ Готово.")
 
