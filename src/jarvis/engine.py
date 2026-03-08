@@ -65,6 +65,7 @@ class JarvisEngine:
         # Push-to-talk
         self._hotkey_manager = None
         self._ptt_active = False
+        self._ptt_pressed = False  # Флаг для предотвращения повторных срабатываний
 
     def enable_push_to_talk(self) -> bool:
         """Включает режим push-to-talk (F6)"""
@@ -76,16 +77,18 @@ class JarvisEngine:
                 self._hotkey_manager = HotkeyManager()
             
             def on_press():
-                if not self.is_running:
+                if not self.is_running or self._ptt_pressed:
                     return
+                self._ptt_pressed = True
                 self.log("🎯 PTT: начало записи")
                 self._ptt_active = True
                 self.armed = True
                 self._pending_command_since = time.perf_counter()
             
             def on_release():
-                if not self.is_running:
+                if not self.is_running or not self._ptt_pressed:
                     return
+                self._ptt_pressed = False
                 self.log("🎯 PTT: конец записи")
                 self._ptt_active = False
                 self.armed = False
@@ -109,6 +112,7 @@ class JarvisEngine:
         if self._hotkey_manager:
             self._hotkey_manager.unregister()
             self._ptt_active = False
+            self._ptt_pressed = False
 
 
     def _record_startup_timing(self, event: str, **fields):
