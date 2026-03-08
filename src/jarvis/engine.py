@@ -61,6 +61,55 @@ class JarvisEngine:
         self._wake_detected_at: float | None = None
         self._pending_command_since: float | None = None
         self._porcupine_access_key = os.getenv("PICOVOICE_ACCESS_KEY")
+        
+        # Push-to-talk
+        self._hotkey_manager = None
+        self._ptt_active = False
+
+    def enable_push_to_talk(self) -> bool:
+        """Включает режим push-to-talk (F6)"""
+        try:
+            from .hotkeys import HotkeyManager
+            from pynput import keyboard
+            
+            if self._hotkey_manager is None:
+                self._hotkey_manager = HotkeyManager()
+            
+            def on_press():
+                if not self.is_running:
+                    return
+                self.log("🎯 PTT: начало записи")
+                self._ptt_active = True
+                self.armed = True
+                self._pending_command_since = time.perf_counter()
+            
+            def on_release():
+                if not self.is_running:
+                    return
+                self.log("🎯 PTT: конец записи")
+                self._ptt_active = False
+                self.armed = False
+                self._pending_command_since = None
+            
+            success = self._hotkey_manager.register_push_to_talk(
+                hotkey=keyboard.Key.f6,
+                on_press=on_press,
+                on_release=on_release
+            )
+            return success
+        except ImportError:
+            self.log("⚠ pynput не установлен. Push-to-talk недоступен.")
+            return False
+        except Exception as e:
+            self.log(f"❌ Ошибка активации push-to-talk: {e}")
+            return False
+    
+    def disable_push_to_talk(self):
+        """Отключает режим push-to-talk"""
+        if self._hotkey_manager:
+            self._hotkey_manager.unregister()
+            self._ptt_active = False
+
 
     def _record_startup_timing(self, event: str, **fields):
         payload = {

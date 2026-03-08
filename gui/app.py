@@ -136,6 +136,18 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
         
+        # Информация о микрофоне и режиме
+        info_layout = QHBoxLayout()
+        self.microphone_label = QLabel("🎤 Микрофон: не выбран")
+        self.microphone_label.setStyleSheet("color: #666;")
+        info_layout.addWidget(self.microphone_label)
+        
+        self.mode_label = QLabel("⏸ Режим: не активен")
+        self.mode_label.setStyleSheet("color: #666;")
+        info_layout.addWidget(self.mode_label)
+        info_layout.addStretch()
+        layout.addLayout(info_layout)
+        
         # Логирование
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -175,6 +187,11 @@ class MainWindow(QMainWindow):
         self.btn_refresh_devices = QPushButton("🔄 Обновить")
         self.btn_refresh_devices.clicked.connect(self.load_devices)
         device_layout.addWidget(self.btn_refresh_devices)
+        
+        self.btn_test_mic = QPushButton("🎙 Тест")
+        self.btn_test_mic.setToolTip("Проверить уровень звука микрофона")
+        self.btn_test_mic.clicked.connect(self.on_test_microphone)
+        device_layout.addWidget(self.btn_test_mic)
         
         layout.addLayout(device_layout)
         
@@ -253,6 +270,15 @@ class MainWindow(QMainWindow):
         self.autostart_checkbox.setChecked(self._is_autostart_enabled())
         self.autostart_checkbox.blockSignals(False)
         
+        # Push-to-talk
+        ptt_layout = QHBoxLayout()
+        self.ptt_checkbox = QCheckBox("Push-to-talk режим (F6)")
+        self.ptt_checkbox.setToolTip("Удерживай F6 для записи команды без wake-word")
+        self.ptt_checkbox.stateChanged.connect(self.on_ptt_toggled)
+        ptt_layout.addWidget(self.ptt_checkbox)
+        ptt_layout.addStretch()
+        layout.addLayout(ptt_layout)
+        
         # Кнопки управления конфигом
         config_buttons_layout = QHBoxLayout()
         
@@ -270,6 +296,22 @@ class MainWindow(QMainWindow):
         self.settings_tab.setLayout(layout)
 
     def refresh_buttons(self):
+        # Обновление микрофона
+        mic_name = self.device_combo.currentText() if self.device_combo.currentIndex() >= 0 else "не выбран"
+        self.microphone_label.setText(f"🎤 Микрофон: {mic_name}")
+        
+        # Обновление режима
+        if getattr(self.engine, "is_running", False):
+            if getattr(self.engine, "continuous_mode", False):
+                self.mode_label.setText("🔄 Режим: continuous")
+            elif getattr(self.engine, "armed", False):
+                self.mode_label.setText("🎙 Режим: ожидание команды")
+            else:
+                wake_engine = getattr(self.engine, "wakeword_engine", "vosk_text")
+                self.mode_label.setText(f"👂 Режим: ожидание wake-word ({wake_engine})")
+        else:
+            self.mode_label.setText("⏸ Режим: не активен")
+        
         # LOADING
         if getattr(self.engine, "is_loading", False):
             self.status_label.setText("Статус: LOADING (загрузка модели)")
@@ -385,6 +427,84 @@ class MainWindow(QMainWindow):
 
     def on_silence_timeout_changed(self, value):
         self.save_audio_setting("silence_timeout", value)
+    
+    def on_autostart_toggled(self, state: int):
+        enabled = state != 0
+        try:
+            self._set_autostart_enabled(enabled)
+            status_text = "включён" if enabled else "выключен"
+            self.append_log(f"⚙ Автозапуск {status_text}")
+        except Exception as error:
+            self.autostart_checkbox.blockSignals(True)
+            self.autostart_checkbox.setChecked(not enabled)
+            self.autostart_checkbox.blockSignals(False)
+            self.append_log(f"❌ Не удалось изменить автозапуск: {error}")
+    
+    def on_ptt_toggled(self, state: int):
+        enabled = state != 0
+        try:
+            if enabled:
+                success = self.engine.enable_push_to_talk()
+                if success:
+                    self.append_log("🎯 Push-to-talk активирован (F6)")
+                else:
+                    self.ptt_checkbox.blockSignals(True)
+                    self.ptt_checkbox.setChecked(False)
+                    self.ptt_checkbox.blockSignals(False)
+                    self.append_log("❌ Не удалось активировать push-to-talk (нужен pynput)")
+            else:
+                self.engine.disable_push_to_talk()
+                self.append_log("⏸ Push-to-talk отключён")
+        except Exception as error:
+            self.ptt_checkbox.blockSignals(True)
+            self.ptt_checkbox.setChecked(not enabled)
+            self.ptt_checkbox.blockSignals(False)
+            self.append_log(f"❌ Ошибка push-to-talk: {error}")
+    
+    def on_test_microphone(self):
+        """Тест микрофона с визуализацией уровня звука"""
+        if self.device_combo.currentIndex() < 0:
+            self.append_log("❌ Сначала выбери микрофон")
+            return
+        
+        device_id = self.device_combo.itemData(self.device_combo.currentIndex())
+        self.append_log(f"🎙 Тест микрофона (говори 3 секунды)...")
+        
+        try:
+            import numpy as np
+            duration = 3.0
+            sample_rate = 16000
+            
+            recording = sd.rec(
+                int(duration * sample_rate),
+                samplerate=sample_rate,
+                channels=1,
+                device=device_id,
+                dtype='int16'
+            )
+            sd.wait()
+            
+            # Анализ уровня звука
+            audio_data = recording.flatten()
+            max_amplitude = np.abs(audio_data).max()
+            rms = np.sqrt(np.mean(audio_data.astype(np.float32)**2))
+            
+            # Нормализация к 100
+            max_percent = (max_amplitude / 32768.0) * 100
+            rms_percent = (rms / 32768.0) * 100
+            
+            if max_percent < 1:
+                self.append_log("⚠ Очень тихо! Проверь микрофон или увеличь громкость")
+            elif max_percent < 10:
+                self.append_log("🔉 Уровень низкий. Говори громче или ближе к микрофону")
+            elif max_percent > 90:
+                self.append_log("🔊 Уровень слишком высокий! Уменьши громкость микрофона")
+            else:
+                self.append_log(f"✅ Микрофон работает (пик: {max_percent:.1f}%, средний: {rms_percent:.1f}%)")
+                
+        except Exception as e:
+            self.append_log(f"❌ Ошибка теста микрофона: {e}")
+
 
     def save_audio_setting(self, key: str, value):
         config_path = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "config.json"
@@ -434,19 +554,6 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             logger.error(f"Не удалось загрузить настройки аудио: {e}")
-
-
-    def on_autostart_toggled(self, state: int):
-        enabled = state != 0
-        try:
-            self._set_autostart_enabled(enabled)
-            status_text = "включён" if enabled else "выключен"
-            self.append_log(f"⚙ Автозапуск {status_text}")
-        except Exception as error:
-            self.autostart_checkbox.blockSignals(True)
-            self.autostart_checkbox.setChecked(not enabled)
-            self.autostart_checkbox.blockSignals(False)
-            self.append_log(f"❌ Не удалось изменить автозапуск: {error}")
 
     def on_wake_engine_changed(self, combo_index: int):
         if combo_index < 0:
