@@ -3,7 +3,8 @@
     "microphone_name": "1: Microphone (G435 Wireless Gamin",
     "phrase_timeout": 8.0,
     "silence_timeout": 1.1,
-    "wake_engine": "porcupine"
+    "wake_engine": "porcupine",
+    "ptt_hotkey": "f6"
   },
   "apps": {
     "browser": "C:/Program Files/Google/Chrome/Application/chrome.exe",

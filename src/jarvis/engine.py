@@ -68,19 +68,23 @@ class JarvisEngine:
         self._ptt_pressed = False  # Флаг для предотвращения повторных срабатываний
 
     def enable_push_to_talk(self, hotkey_str: str = "f6") -> bool:
-        """Включает режим push-to-talk с указанной клавишей
+        """Включает режим push-to-talk с указанной клавишей/комбинацией
         
         Args:
-            hotkey_str: Название клавиши (f1-f12, space, ctrl, alt, shift и т.д.)
+            hotkey_str: Название клавиши, кнопки мыши или комбинация через "+"
+                       Примеры: "f6", "ctrl+f6", "mouse_x1", "alt+space"
         """
         try:
             from .hotkeys import HotkeyManager
-            from pynput import keyboard
+            from pynput import keyboard, mouse
             
             if self._hotkey_manager is None:
                 self._hotkey_manager = HotkeyManager()
             
-            # Маппинг строки на объект клавиши pynput
+            # Парсим hotkey string
+            parts = [p.strip() for p in hotkey_str.split("+")]
+            
+            # Маппинг строк на объекты pynput
             key_map = {
                 "f1": keyboard.Key.f1, "f2": keyboard.Key.f2, "f3": keyboard.Key.f3,
                 "f4": keyboard.Key.f4, "f5": keyboard.Key.f5, "f6": keyboard.Key.f6,
@@ -88,10 +92,32 @@ class JarvisEngine:
                 "f10": keyboard.Key.f10, "f11": keyboard.Key.f11, "f12": keyboard.Key.f12,
                 "space": keyboard.Key.space, "ctrl": keyboard.Key.ctrl,
                 "alt": keyboard.Key.alt, "shift": keyboard.Key.shift,
-                "caps_lock": keyboard.Key.caps_lock
+                "caps_lock": keyboard.Key.caps_lock, "tab": keyboard.Key.tab,
+                "enter": keyboard.Key.enter, "esc": keyboard.Key.esc,
+                "backspace": keyboard.Key.backspace, "delete": keyboard.Key.delete,
+                "insert": keyboard.Key.insert, "home": keyboard.Key.home,
+                "end": keyboard.Key.end, "page_up": keyboard.Key.page_up,
+                "page_down": keyboard.Key.page_down,
+                "mouse_left": mouse.Button.left,
+                "mouse_right": mouse.Button.right,
+                "mouse_middle": mouse.Button.middle,
+                "mouse_x1": mouse.Button.x1,
+                "mouse_x2": mouse.Button.x2
             }
             
-            hotkey = key_map.get(hotkey_str.lower(), keyboard.Key.f6)
+            # Конвертируем в pynput объекты
+            hotkey_objects = []
+            for part in parts:
+                key_obj = key_map.get(part.lower())
+                if key_obj:
+                    hotkey_objects.append(key_obj)
+            
+            if not hotkey_objects:
+                self.log(f"⚠ Неизвестная комбинация: {hotkey_str}")
+                return False
+            
+            # Если одна клавиша - передаём как объект, если несколько - как tuple
+            hotkey = hotkey_objects[0] if len(hotkey_objects) == 1 else tuple(hotkey_objects)
             
             def on_press():
                 if not self.is_running or self._ptt_pressed:

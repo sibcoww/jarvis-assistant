@@ -37,6 +37,7 @@ class MainWindow(QMainWindow):
         self._loading_progress_value = 0
         self._ptt_hotkey = "f6"  # По умолчанию F6
         self._recording_key = False  # Флаг записи клавиши
+        self._recorded_combo = []  # Комбинация клавиш во время записи
 
         self.setWindowTitle("Jarvis Assistant")
         self.resize(800, 600)
@@ -479,21 +480,23 @@ class MainWindow(QMainWindow):
             self.append_log(f"❌ Ошибка push-to-talk: {error}")
     
     def on_record_ptt_key(self):
-        """Запись новой горячей клавиши для PTT"""
+        """Запись новой горячей клавиши/комбинации для PTT"""
         if self.ptt_checkbox.isChecked():
             self.append_log("⚠ Сначала отключи Push-to-talk")
             return
         
         self._recording_key = True
-        self.ptt_key_input.setText("Нажми клавишу...")
+        self._recorded_combo = []
+        self.ptt_key_input.setText("Нажми клавишу/мышь...")
         self.ptt_key_input.setStyleSheet("background-color: #ffeeaa;")
-        self.append_log("⌨ Нажми нужную клавишу для PTT...")
+        self.append_log("⌨ Нажми клавишу, кнопку мыши или комбинацию (удерживай модификаторы)...")
     
     def keyPressEvent(self, event):
         """Перехват нажатия клавиши для записи PTT hotkey"""
         if self._recording_key:
             from PySide6.QtCore import Qt
             key = event.key()
+            modifiers = event.modifiers()
             
             # Маппинг Qt клавиш на pynput формат
             key_map = {
@@ -501,23 +504,86 @@ class MainWindow(QMainWindow):
                 Qt.Key_F5: "f5", Qt.Key_F6: "f6", Qt.Key_F7: "f7", Qt.Key_F8: "f8",
                 Qt.Key_F9: "f9", Qt.Key_F10: "f10", Qt.Key_F11: "f11", Qt.Key_F12: "f12",
                 Qt.Key_Space: "space", Qt.Key_Control: "ctrl", Qt.Key_Alt: "alt",
-                Qt.Key_Shift: "shift", Qt.Key_CapsLock: "caps_lock"
+                Qt.Key_Shift: "shift", Qt.Key_CapsLock: "caps_lock",
+                Qt.Key_Tab: "tab", Qt.Key_Return: "enter", Qt.Key_Escape: "esc",
+                Qt.Key_Backspace: "backspace", Qt.Key_Delete: "delete",
+                Qt.Key_Insert: "insert", Qt.Key_Home: "home", Qt.Key_End: "end",
+                Qt.Key_PageUp: "page_up", Qt.Key_PageDown: "page_down"
             }
             
-            key_name = key_map.get(key)
-            if key_name:
-                self._ptt_hotkey = key_name
-                display_name = key_name.upper() if len(key_name) <= 3 else key_name.title()
+            # Собираем комбинацию
+            combo = []
+            
+            # Добавляем модификаторы
+            if modifiers & Qt.ControlModifier:
+                combo.append("ctrl")
+            if modifiers & Qt.AltModifier:
+                combo.append("alt")
+            if modifiers & Qt.ShiftModifier and key not in [Qt.Key_Control, Qt.Key_Alt, Qt.Key_Shift]:
+                combo.append("shift")
+            
+            # Добавляем основную клавишу (если не модификатор)
+            if key not in [Qt.Key_Control, Qt.Key_Alt, Qt.Key_Shift]:
+                key_name = key_map.get(key)
+                if key_name and key_name not in combo:
+                    combo.append(key_name)
+            
+            if combo:
+                # Сохраняем как строку с + разделителем
+                combo_str = "+".join(combo)
+                self._ptt_hotkey = combo_str
+                display_name = " + ".join([k.upper() if len(k) <= 3 else k.title() for k in combo])
                 self.ptt_key_input.setText(display_name)
                 self.ptt_key_input.setStyleSheet("")
                 self._recording_key = False
-                self.save_audio_setting("ptt_hotkey", key_name)
-                self.append_log(f"✅ PTT клавиша установлена: {display_name}")
+                self.save_audio_setting("ptt_hotkey", combo_str)
+                self.append_log(f"✅ PTT установлен: {display_name}")
             else:
-                self.append_log("⚠ Эта клавиша не поддерживается. Попробуй F1-F12 или Space")
+                # Только модификатор нажат, ждём основную клавишу
+                display_parts = []
+                if modifiers & Qt.ControlModifier:
+                    display_parts.append("Ctrl")
+                if modifiers & Qt.AltModifier:
+                    display_parts.append("Alt")
+                if modifiers & Qt.ShiftModifier:
+                    display_parts.append("Shift")
+                if display_parts:
+                    self.ptt_key_input.setText(" + ".join(display_parts) + " + ...")
             return
         
         super().keyPressEvent(event)
+    
+    def mousePressEvent(self, event):
+        """Перехват нажатия мыши для записи PTT hotkey"""
+        if self._recording_key:
+            from PySide6.QtCore import Qt
+            button_map = {
+                Qt.LeftButton: "mouse_left",
+                Qt.RightButton: "mouse_right",
+                Qt.MiddleButton: "mouse_middle",
+                Qt.BackButton: "mouse_x1",
+                Qt.ForwardButton: "mouse_x2"
+            }
+            
+            button_name = button_map.get(event.button())
+            if button_name:
+                self._ptt_hotkey = button_name
+                display_map = {
+                    "mouse_left": "ЛКМ",
+                    "mouse_right": "ПКМ",
+                    "mouse_middle": "СКМ",
+                    "mouse_x1": "X1",
+                    "mouse_x2": "X2"
+                }
+                display_name = display_map.get(button_name, button_name)
+                self.ptt_key_input.setText(display_name)
+                self.ptt_key_input.setStyleSheet("")
+                self._recording_key = False
+                self.save_audio_setting("ptt_hotkey", button_name)
+                self.append_log(f"✅ PTT установлен: {display_name}")
+                return
+        
+        super().mousePressEvent(event)
     
     def on_test_microphone(self):
         """Тест микрофона с визуализацией уровня звука"""
