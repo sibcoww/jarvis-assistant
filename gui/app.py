@@ -175,6 +175,22 @@ class MainWindow(QMainWindow):
         params_font.setBold(True)
         params_group_label.setFont(params_font)
         layout.addWidget(params_group_label)
+
+        wakeword_layout = QHBoxLayout()
+        wakeword_layout.addWidget(QLabel("Движок активации:"))
+        self.wake_engine_combo = QComboBox()
+        self.wake_engine_combo.addItem("Vosk (текстовый)", "vosk_text")
+        self.wake_engine_combo.addItem("Porcupine (Picovoice)", "porcupine")
+        self.wake_engine_combo.currentIndexChanged.connect(self.on_wake_engine_changed)
+        wakeword_layout.addWidget(self.wake_engine_combo)
+        wakeword_layout.addStretch()
+        layout.addLayout(wakeword_layout)
+
+        self.wake_engine_combo.blockSignals(True)
+        current_engine = getattr(self.engine, "wakeword_engine", "vosk_text")
+        current_idx = self.wake_engine_combo.findData(current_engine)
+        self.wake_engine_combo.setCurrentIndex(current_idx if current_idx >= 0 else 0)
+        self.wake_engine_combo.blockSignals(False)
         
         # Таймаут фразы
         timeout_layout = QHBoxLayout()
@@ -326,6 +342,27 @@ class MainWindow(QMainWindow):
             self.autostart_checkbox.setChecked(not enabled)
             self.autostart_checkbox.blockSignals(False)
             self.append_log(f"❌ Не удалось изменить автозапуск: {error}")
+
+    def on_wake_engine_changed(self, combo_index: int):
+        if combo_index < 0:
+            return
+
+        selected_engine = self.wake_engine_combo.itemData(combo_index)
+
+        if getattr(self.engine, "is_loading", False) or getattr(self.engine, "is_running", False):
+            self.append_log("⚠ Сначала останови движок, затем меняй движок активации.")
+            self.wake_engine_combo.blockSignals(True)
+            current_idx = self.wake_engine_combo.findData(getattr(self.engine, "wakeword_engine", "vosk_text"))
+            self.wake_engine_combo.setCurrentIndex(current_idx if current_idx >= 0 else 0)
+            self.wake_engine_combo.blockSignals(False)
+            return
+
+        changed = self.engine.set_wakeword_engine(selected_engine)
+        if not changed:
+            self.wake_engine_combo.blockSignals(True)
+            current_idx = self.wake_engine_combo.findData(getattr(self.engine, "wakeword_engine", "vosk_text"))
+            self.wake_engine_combo.setCurrentIndex(current_idx if current_idx >= 0 else 0)
+            self.wake_engine_combo.blockSignals(False)
 
 def main():
     # Подавить Qt DPI-related ошибки на Windows
