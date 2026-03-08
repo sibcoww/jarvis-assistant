@@ -19,7 +19,7 @@ class JarvisEngine:
         self.asr = asr
         self.log = log or (lambda msg: None)
         self.continuous_mode_timeout = continuous_mode_timeout  # Время ожидания след. команды без wake-word (сек)
-        self.min_intent_confidence = 0.55
+        self.min_intent_confidence = 0.65
         self._app_started_wall = datetime.now()
         self._app_started_monotonic = time.perf_counter()
         self._asr_loading_started_monotonic = None
