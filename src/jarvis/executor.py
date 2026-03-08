@@ -59,6 +59,10 @@ class Executor:
         if self.log_callback:
             self.log_callback(message)
 
+    def load_config(self):
+        """Перезагружает конфигурацию из файла"""
+        self.config = self._load_default_config()
+
     def _load_default_config(self) -> dict:
         config_path = Path(__file__).with_name("config.json")
         if not config_path.exists():

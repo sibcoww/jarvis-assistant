@@ -3,6 +3,9 @@ import logging
 import threading
 import re
 import argparse
+import json
+import os
+import subprocess
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
@@ -54,6 +57,7 @@ class MainWindow(QMainWindow):
 
         self.bus.log.connect(self.append_log)
         self.load_devices()
+        self.load_audio_settings()
         
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_buttons)
@@ -137,6 +141,11 @@ class MainWindow(QMainWindow):
         self.log_view.setReadOnly(True)
         layout.addWidget(QLabel("Лог:"))
         layout.addWidget(self.log_view)
+        
+        # Кнопка очистки лога
+        clear_log_btn = QPushButton("🗑 Очистить лог")
+        clear_log_btn.clicked.connect(self.on_clear_log)
+        layout.addWidget(clear_log_btn)
         
         # Кнопки управления
         button_layout = QHBoxLayout()
@@ -242,6 +251,19 @@ class MainWindow(QMainWindow):
         self.autostart_checkbox.setChecked(self._is_autostart_enabled())
         self.autostart_checkbox.blockSignals(False)
         
+        # Кнопки управления конфигом
+        config_buttons_layout = QHBoxLayout()
+        
+        open_config_btn = QPushButton("📄 Открыть config.json")
+        open_config_btn.clicked.connect(self.on_open_config)
+        config_buttons_layout.addWidget(open_config_btn)
+        
+        reload_config_btn = QPushButton("🔄 Перезагрузить конфиг")
+        reload_config_btn.clicked.connect(self.on_reload_config)
+        config_buttons_layout.addWidget(reload_config_btn)
+        
+        layout.addLayout(config_buttons_layout)
+        
         layout.addStretch()
         self.settings_tab.setLayout(layout)
 
@@ -330,6 +352,81 @@ class MainWindow(QMainWindow):
             return
 
         self.engine.set_device(device_index)
+        self.save_audio_setting("microphone_name", self.device_combo.currentText())
+
+    def on_clear_log(self):
+        self.log_view.clear()
+        self.append_log("📋 Лог очищен")
+
+    def on_open_config(self):
+        config_path = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "config.json"
+        if config_path.exists():
+            if sys.platform == "win32":
+                os.startfile(config_path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(config_path)])
+            else:
+                subprocess.run(["xdg-open", str(config_path)])
+            self.append_log(f"📄 Открыт config.json: {config_path}")
+        else:
+            self.append_log(f"❌ Файл не найден: {config_path}")
+
+    def on_reload_config(self):
+        try:
+            self.engine.reload_config()
+            self.append_log("🔄 Конфиг перезагружен")
+        except Exception as e:
+            self.append_log(f"❌ Ошибка при перезагрузке конфига: {e}")
+
+    def save_audio_setting(self, key: str, value):
+        config_path = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            
+            if "audio" not in config:
+                config["audio"] = {}
+            
+            config["audio"][key] = value
+            
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Не удалось сохранить настройку {key}: {e}")
+
+    def load_audio_settings(self):
+        config_path = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            
+            audio = config.get("audio", {})
+            
+            # Загрузка микрофона
+            mic_name = audio.get("microphone_name")
+            if mic_name:
+                for i in range(self.device_combo.count()):
+                    if mic_name in self.device_combo.itemText(i):
+                        self.device_combo.setCurrentIndex(i)
+                        break
+            
+            # Загрузка таймаутов
+            phrase_timeout = audio.get("phrase_timeout", 6.0)
+            silence_timeout = audio.get("silence_timeout", 1.2)
+            self.timeout_spinbox.setValue(phrase_timeout)
+            self.silence_spinbox.setValue(silence_timeout)
+            
+            # Загрузка движка wake-word
+            wake_engine = audio.get("wake_engine", "vosk_text")
+            wake_idx = 0 if wake_engine == "vosk_text" else 1
+            self.wake_engine_combo.blockSignals(True)
+            self.wake_engine_combo.setCurrentIndex(wake_idx)
+            self.wake_engine_combo.blockSignals(False)
+            self.engine.set_wakeword_engine(wake_engine)
+            
+        except Exception as e:
+            logger.error(f"Не удалось загрузить настройки аудио: {e}")
+
 
     def on_autostart_toggled(self, state: int):
         enabled = state != 0
@@ -363,6 +460,8 @@ class MainWindow(QMainWindow):
             current_idx = self.wake_engine_combo.findData(getattr(self.engine, "wakeword_engine", "vosk_text"))
             self.wake_engine_combo.setCurrentIndex(current_idx if current_idx >= 0 else 0)
             self.wake_engine_combo.blockSignals(False)
+        else:
+            self.save_audio_setting("wake_engine", selected_engine)
 
 def main():
     # Подавить Qt DPI-related ошибки на Windows

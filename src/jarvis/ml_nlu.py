@@ -124,6 +124,11 @@ class MLNLU:
         self._build_intent_map()
         self._compute_intent_vectors()
     
+    def load_config(self):
+        """Перезагружает конфигурацию (для совместимости с engine.reload_config)"""
+        # ML NLU не использует config.json напрямую, но метод нужен для единообразия
+        pass
+    
     def _build_intent_map(self):
         """Build mapping of intents to training examples."""
         for text, meta in self.training_data:

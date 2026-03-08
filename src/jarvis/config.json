@@ -1,4 +1,10 @@
 {
+  "audio": {
+    "microphone_name": null,
+    "phrase_timeout": 6.0,
+    "silence_timeout": 1.2,
+    "wake_engine": "vosk_text"
+  },
   "apps": {
     "browser": "C:/Program Files/Google/Chrome/Application/chrome.exe",
     "vscode": "E:/Tools/Microsoft VS Code/Code.exe",

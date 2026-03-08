@@ -133,6 +133,18 @@ class JarvisEngine:
         self.is_ready = False
         self.log(f"🎤 Выбран микрофон: {device_index}. Нажми Старт (модель загрузится заново).")
 
+    def reload_config(self):
+        """Перезагружает конфигурацию из config.json"""
+        try:
+            self.log("🔄 Перезагрузка конфигурации...")
+            self.nlu.load_config()
+            self.ex.load_config()
+            self.log("✅ Конфигурация перезагружена")
+        except Exception as e:
+            self.log(f"❌ Ошибка при перезагрузке конфигурации: {e}")
+            raise
+
+
     def _on_wakeword_detected(self, keyword: str):
         self._wake_detected_at = time.perf_counter()
         self._wake_event.set()
