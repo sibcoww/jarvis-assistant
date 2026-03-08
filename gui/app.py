@@ -211,6 +211,7 @@ class MainWindow(QMainWindow):
         self.timeout_spinbox.setSingleStep(0.5)
         self.timeout_spinbox.setDecimals(1)
         self.timeout_spinbox.setToolTip("Максимальное время ожидания фразы")
+        self.timeout_spinbox.valueChanged.connect(self.on_phrase_timeout_changed)
         timeout_layout.addWidget(self.timeout_spinbox)
         timeout_layout.addStretch()
         layout.addLayout(timeout_layout)
@@ -225,6 +226,7 @@ class MainWindow(QMainWindow):
         self.silence_spinbox.setSingleStep(0.1)
         self.silence_spinbox.setDecimals(1)
         self.silence_spinbox.setToolTip("Время тишины для завершения фразы")
+        self.silence_spinbox.valueChanged.connect(self.on_silence_timeout_changed)
         silence_layout.addWidget(self.silence_spinbox)
         silence_layout.addStretch()
         layout.addLayout(silence_layout)
@@ -377,6 +379,12 @@ class MainWindow(QMainWindow):
             self.append_log("🔄 Конфиг перезагружен")
         except Exception as e:
             self.append_log(f"❌ Ошибка при перезагрузке конфига: {e}")
+
+    def on_phrase_timeout_changed(self, value):
+        self.save_audio_setting("phrase_timeout", value)
+
+    def on_silence_timeout_changed(self, value):
+        self.save_audio_setting("silence_timeout", value)
 
     def save_audio_setting(self, key: str, value):
         config_path = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "config.json"

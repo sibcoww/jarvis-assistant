@@ -10,7 +10,6 @@ from typing import Callable, Optional
 from .nlu import SimpleNLU
 from .ml_nlu import MLNLU
 from .executor import Executor
-from PySide6.QtCore import QTimer
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +91,29 @@ class JarvisEngine:
             self._record_startup_timing("asr_load_start")
             self.log("⏳ Загрузка модели распознавания речи...")
             
+            # Проверка наличия модели
+            model_path = Path("models/vosk-model-ru-0.42")
+            if not model_path.exists():
+                self.is_loading = False
+                self.log("❌ ОШИБКА: Модель не найдена!")
+                self.log(f"📂 Ожидаемый путь: {model_path.resolve()}")
+                self.log("📥 Скачай модель с https://alphacephei.com/vosk/models")
+                self.log("   и распакуй в папку models/")
+                return
+            
             def on_progress(step, total):
                 percent = int((step / total) * 100)
                 self.log(f"📊 Загрузка: {percent}% ({step}/{total})")
             
-            from .vosk_asr import VoskASR
-            self.asr = VoskASR("models/vosk-model-ru-0.42", device=self.device, on_progress=on_progress)
+            try:
+                from .vosk_asr import VoskASR
+                self.asr = VoskASR(str(model_path), device=self.device, on_progress=on_progress)
+            except Exception as e:
+                self.is_loading = False
+                self.log(f"❌ Ошибка загрузки модели: {e}")
+                self.log("💡 Проверь, что модель распакована правильно")
+                return
+            
             self.is_loading = False
             self.is_ready = True
             self.log("✅ Модель загружена, микрофон готов")
