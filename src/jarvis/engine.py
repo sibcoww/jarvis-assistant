@@ -67,14 +67,31 @@ class JarvisEngine:
         self._ptt_active = False
         self._ptt_pressed = False  # Флаг для предотвращения повторных срабатываний
 
-    def enable_push_to_talk(self) -> bool:
-        """Включает режим push-to-talk (F6)"""
+    def enable_push_to_talk(self, hotkey_str: str = "f6") -> bool:
+        """Включает режим push-to-talk с указанной клавишей
+        
+        Args:
+            hotkey_str: Название клавиши (f1-f12, space, ctrl, alt, shift и т.д.)
+        """
         try:
             from .hotkeys import HotkeyManager
             from pynput import keyboard
             
             if self._hotkey_manager is None:
                 self._hotkey_manager = HotkeyManager()
+            
+            # Маппинг строки на объект клавиши pynput
+            key_map = {
+                "f1": keyboard.Key.f1, "f2": keyboard.Key.f2, "f3": keyboard.Key.f3,
+                "f4": keyboard.Key.f4, "f5": keyboard.Key.f5, "f6": keyboard.Key.f6,
+                "f7": keyboard.Key.f7, "f8": keyboard.Key.f8, "f9": keyboard.Key.f9,
+                "f10": keyboard.Key.f10, "f11": keyboard.Key.f11, "f12": keyboard.Key.f12,
+                "space": keyboard.Key.space, "ctrl": keyboard.Key.ctrl,
+                "alt": keyboard.Key.alt, "shift": keyboard.Key.shift,
+                "caps_lock": keyboard.Key.caps_lock
+            }
+            
+            hotkey = key_map.get(hotkey_str.lower(), keyboard.Key.f6)
             
             def on_press():
                 if not self.is_running or self._ptt_pressed:
@@ -95,7 +112,7 @@ class JarvisEngine:
                 self._pending_command_since = None
             
             success = self._hotkey_manager.register_push_to_talk(
-                hotkey=keyboard.Key.f6,
+                hotkey=hotkey,
                 on_press=on_press,
                 on_release=on_release
             )

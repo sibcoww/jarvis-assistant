@@ -35,6 +35,8 @@ class MainWindow(QMainWindow):
         self.tray: QSystemTrayIcon | None = None
         self._quit_requested = False
         self._loading_progress_value = 0
+        self._ptt_hotkey = "f6"  # По умолчанию F6
+        self._recording_key = False  # Флаг записи клавиши
 
         self.setWindowTitle("Jarvis Assistant")
         self.resize(800, 600)
@@ -278,10 +280,18 @@ class MainWindow(QMainWindow):
         
         # Push-to-talk
         ptt_layout = QHBoxLayout()
-        self.ptt_checkbox = QCheckBox("Push-to-talk режим (F6)")
-        self.ptt_checkbox.setToolTip("Удерживай F6 для записи команды без wake-word")
+        self.ptt_checkbox = QCheckBox("Push-to-talk режим")
+        self.ptt_checkbox.setToolTip("Удерживай горячую клавишу для записи команды без wake-word")
         self.ptt_checkbox.stateChanged.connect(self.on_ptt_toggled)
         ptt_layout.addWidget(self.ptt_checkbox)
+        
+        ptt_layout.addWidget(QLabel("Клавиша:"))
+        self.ptt_key_input = QPushButton("F6")
+        self.ptt_key_input.setMaximumWidth(120)
+        self.ptt_key_input.setToolTip("Нажми для записи новой клавиши")
+        self.ptt_key_input.clicked.connect(self.on_record_ptt_key)
+        ptt_layout.addWidget(self.ptt_key_input)
+        
         ptt_layout.addStretch()
         layout.addLayout(ptt_layout)
         
@@ -450,9 +460,10 @@ class MainWindow(QMainWindow):
         enabled = state != 0
         try:
             if enabled:
-                success = self.engine.enable_push_to_talk()
+                success = self.engine.enable_push_to_talk(self._ptt_hotkey)
                 if success:
-                    self.append_log("🎯 Push-to-talk активирован (F6)")
+                    key_display = self.ptt_key_input.text()
+                    self.append_log(f"🎯 Push-to-talk активирован ({key_display})")
                 else:
                     self.ptt_checkbox.blockSignals(True)
                     self.ptt_checkbox.setChecked(False)
@@ -466,6 +477,47 @@ class MainWindow(QMainWindow):
             self.ptt_checkbox.setChecked(not enabled)
             self.ptt_checkbox.blockSignals(False)
             self.append_log(f"❌ Ошибка push-to-talk: {error}")
+    
+    def on_record_ptt_key(self):
+        """Запись новой горячей клавиши для PTT"""
+        if self.ptt_checkbox.isChecked():
+            self.append_log("⚠ Сначала отключи Push-to-talk")
+            return
+        
+        self._recording_key = True
+        self.ptt_key_input.setText("Нажми клавишу...")
+        self.ptt_key_input.setStyleSheet("background-color: #ffeeaa;")
+        self.append_log("⌨ Нажми нужную клавишу для PTT...")
+    
+    def keyPressEvent(self, event):
+        """Перехват нажатия клавиши для записи PTT hotkey"""
+        if self._recording_key:
+            from PySide6.QtCore import Qt
+            key = event.key()
+            
+            # Маппинг Qt клавиш на pynput формат
+            key_map = {
+                Qt.Key_F1: "f1", Qt.Key_F2: "f2", Qt.Key_F3: "f3", Qt.Key_F4: "f4",
+                Qt.Key_F5: "f5", Qt.Key_F6: "f6", Qt.Key_F7: "f7", Qt.Key_F8: "f8",
+                Qt.Key_F9: "f9", Qt.Key_F10: "f10", Qt.Key_F11: "f11", Qt.Key_F12: "f12",
+                Qt.Key_Space: "space", Qt.Key_Control: "ctrl", Qt.Key_Alt: "alt",
+                Qt.Key_Shift: "shift", Qt.Key_CapsLock: "caps_lock"
+            }
+            
+            key_name = key_map.get(key)
+            if key_name:
+                self._ptt_hotkey = key_name
+                display_name = key_name.upper() if len(key_name) <= 3 else key_name.title()
+                self.ptt_key_input.setText(display_name)
+                self.ptt_key_input.setStyleSheet("")
+                self._recording_key = False
+                self.save_audio_setting("ptt_hotkey", key_name)
+                self.append_log(f"✅ PTT клавиша установлена: {display_name}")
+            else:
+                self.append_log("⚠ Эта клавиша не поддерживается. Попробуй F1-F12 или Space")
+            return
+        
+        super().keyPressEvent(event)
     
     def on_test_microphone(self):
         """Тест микрофона с визуализацией уровня звука"""
@@ -568,6 +620,12 @@ class MainWindow(QMainWindow):
             self.wake_engine_combo.setCurrentIndex(wake_idx)
             self.wake_engine_combo.blockSignals(False)
             self.engine.set_wakeword_engine(wake_engine)
+            
+            # Загрузка PTT клавиши
+            ptt_hotkey = audio.get("ptt_hotkey", "f6")
+            self._ptt_hotkey = ptt_hotkey
+            display_name = ptt_hotkey.upper() if len(ptt_hotkey) <= 3 else ptt_hotkey.title()
+            self.ptt_key_input.setText(display_name)
             
         except Exception as e:
             logger.error(f"Не удалось загрузить настройки аудио: {e}")
