@@ -335,6 +335,41 @@ class JarvisEngine:
 
     def _run_porcupine(self):
         while not self._stop.is_set():
+            # Проверка PTT активности
+            if self._ptt_active and self.armed:
+                if self._pending_command_since is not None:
+                    delay_ms = (time.perf_counter() - self._pending_command_since) * 1000
+                    self.log(f"⏱ PTT активирован, ждём отпускания F6...")
+                    self._pending_command_since = None
+                
+                # Ждём отпускания PTT
+                while self._ptt_active and not self._stop.is_set():
+                    time.sleep(0.05)
+                
+                if self._stop.is_set():
+                    break
+                
+                # PTT отпущен, записываем команду
+                text = self._listen_once_timed("PTT команда")
+                if self._stop.is_set():
+                    break
+                if text:
+                    self.log(f"🎙 Распознано: {text}")
+                    text_clean = self.nlu._strip_wake_word(text.lower()) if hasattr(self.nlu, '_strip_wake_word') else text
+                    if text_clean != text:
+                        self.log(f"🧹 Очищено: {text_clean}")
+                    text = text_clean
+                
+                executed = self._execute_intent_if_valid(text or "") if text else False
+                if executed:
+                    self.continuous_mode = True
+                    self.continuous_mode_until = time.time() + self.continuous_mode_timeout
+                    self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
+                
+                self.armed = False
+                continue
+            
+            # Обычный режим wake-word
             if not self._wake_event.wait(timeout=0.1):
                 continue
 

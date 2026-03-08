@@ -195,6 +195,12 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(device_layout)
         
+        # Результат теста микрофона
+        self.mic_test_result = QLabel("")
+        self.mic_test_result.setStyleSheet("color: #666; font-size: 10px;")
+        self.mic_test_result.setWordWrap(True)
+        layout.addWidget(self.mic_test_result)
+        
         # Параметры ASR
         params_group_label = QLabel("Параметры распознавания:")
         params_font = params_group_label.font()
@@ -493,17 +499,28 @@ class MainWindow(QMainWindow):
             max_percent = (max_amplitude / 32768.0) * 100
             rms_percent = (rms / 32768.0) * 100
             
+            result_msg = ""
             if max_percent < 1:
-                self.append_log("⚠ Очень тихо! Проверь микрофон или увеличь громкость")
+                result_msg = "⚠ Очень тихо! Проверь микрофон или увеличь громкость"
+                self.mic_test_result.setStyleSheet("color: #ff0000; font-size: 10px;")
             elif max_percent < 10:
-                self.append_log("🔉 Уровень низкий. Говори громче или ближе к микрофону")
+                result_msg = "🔉 Уровень низкий. Говори громче или ближе к микрофону"
+                self.mic_test_result.setStyleSheet("color: #ff8800; font-size: 10px;")
             elif max_percent > 90:
-                self.append_log("🔊 Уровень слишком высокий! Уменьши громкость микрофона")
+                result_msg = "🔊 Уровень слишком высокий! Уменьши громкость микрофона"
+                self.mic_test_result.setStyleSheet("color: #ff8800; font-size: 10px;")
             else:
-                self.append_log(f"✅ Микрофон работает (пик: {max_percent:.1f}%, средний: {rms_percent:.1f}%)")
+                result_msg = f"✅ Микрофон работает (пик: {max_percent:.1f}%, средний: {rms_percent:.1f}%)"
+                self.mic_test_result.setStyleSheet("color: #00aa00; font-size: 10px;")
+            
+            self.append_log(result_msg)
+            self.mic_test_result.setText(result_msg)
                 
         except Exception as e:
-            self.append_log(f"❌ Ошибка теста микрофона: {e}")
+            error_msg = f"❌ Ошибка теста микрофона: {e}"
+            self.append_log(error_msg)
+            self.mic_test_result.setText(error_msg)
+            self.mic_test_result.setStyleSheet("color: #ff0000; font-size: 10px;")
 
 
     def save_audio_setting(self, key: str, value):
