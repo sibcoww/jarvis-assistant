@@ -275,6 +275,11 @@ class JarvisEngine:
                 break
             if text:
                 self.log(f"🎙 Распознано: {text}")
+                # Убираем wake-word из команды если он попал в распознавание
+                text_clean = self.nlu._strip_wake_word(text.lower()) if hasattr(self.nlu, '_strip_wake_word') else text
+                if text_clean != text:
+                    self.log(f"🧹 Очищено: {text_clean}")
+                text = text_clean
 
             executed = self._execute_intent_if_valid(text or "") if text else False
             if executed:
@@ -295,6 +300,12 @@ class JarvisEngine:
                     continue
 
                 self.log(f"🎙 Распознано: {next_text}")
+                # Убираем wake-word если попал в continuous режиме
+                next_text_clean = self.nlu._strip_wake_word(next_text.lower()) if hasattr(self.nlu, '_strip_wake_word') else next_text
+                if next_text_clean != next_text:
+                    self.log(f"🧹 Очищено: {next_text_clean}")
+                next_text = next_text_clean
+                
                 if self._execute_intent_if_valid(next_text):
                     self.continuous_mode_until = time.time() + self.continuous_mode_timeout
                     self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
