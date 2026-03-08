@@ -97,7 +97,6 @@ class JarvisEngine:
                 if not self.is_running or self._ptt_pressed:
                     return
                 self._ptt_pressed = True
-                self.log("🎯 PTT: начало записи")
                 self._ptt_active = True
                 self.armed = True
                 self._pending_command_since = time.perf_counter()
@@ -106,8 +105,7 @@ class JarvisEngine:
                 if not self.is_running or not self._ptt_pressed:
                     return
                 self._ptt_pressed = False
-                self.log("🎯 PTT: конец записи")
-                self._ptt_active = False
+                # Флаги сбросятся в _run_porcupine после распознавания
                 self.armed = False
                 self._pending_command_since = None
             
@@ -354,22 +352,21 @@ class JarvisEngine:
         while not self._stop.is_set():
             # Проверка PTT активности
             if self._ptt_active and self.armed:
-                if self._pending_command_since is not None:
-                    delay_ms = (time.perf_counter() - self._pending_command_since) * 1000
-                    self.log(f"⏱ PTT активирован, ждём отпускания F6...")
-                    self._pending_command_since = None
+                # PTT нажат, даём небольшую задержку перед началом записи
+                time.sleep(0.1)
+                self.log("🎙 PTT: слушаю команду...")
                 
-                # Ждём отпускания PTT
-                while self._ptt_active and not self._stop.is_set():
-                    time.sleep(0.05)
-                
-                if self._stop.is_set():
-                    break
-                
-                # PTT отпущен, записываем команду
+                # Записываем пока клавиша зажата или пока не истечёт timeout
                 text = self._listen_once_timed("PTT команда")
+                
                 if self._stop.is_set():
                     break
+                
+                # Сбрасываем флаги
+                self.armed = False
+                self._ptt_active = False
+                self._ptt_pressed = False
+                
                 if text:
                     self.log(f"🎙 Распознано: {text}")
                     text_clean = self.nlu._strip_wake_word(text.lower()) if hasattr(self.nlu, '_strip_wake_word') else text
