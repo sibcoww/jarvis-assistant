@@ -3,10 +3,11 @@ import logging
 import threading
 import re
 import argparse
+from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
-    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle
+    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle, QCheckBox
 )
 
 import sounddevice as sd
@@ -57,6 +58,31 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_buttons)
         self.timer.start(100)
+
+    def _startup_script_path(self) -> Path:
+        startup_dir = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        return startup_dir / "JarvisAssistantAutostart.cmd"
+
+    def _is_autostart_enabled(self) -> bool:
+        return self._startup_script_path().exists()
+
+    def _set_autostart_enabled(self, enabled: bool):
+        script_path = self._startup_script_path()
+
+        if enabled:
+            project_root = Path(__file__).resolve().parents[1]
+            python_executable = Path(sys.executable)
+            script_content = (
+                "@echo off\n"
+                f"cd /d \"{project_root}\"\n"
+                f"\"{python_executable}\" -m gui.app --minimized\n"
+            )
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text(script_content, encoding="utf-8")
+            return
+
+        if script_path.exists():
+            script_path.unlink()
 
     def set_tray(self, tray: QSystemTrayIcon):
         self.tray = tray
@@ -187,6 +213,18 @@ class MainWindow(QMainWindow):
         )
         info_label.setStyleSheet("color: #666; font-size: 10px;")
         layout.addWidget(info_label)
+
+        autostart_layout = QHBoxLayout()
+        self.autostart_checkbox = QCheckBox("Автозапуск Jarvis при входе в Windows (в трее)")
+        self.autostart_checkbox.setToolTip("Запускать приложение автоматически в фоне с предзагрузкой модели")
+        self.autostart_checkbox.stateChanged.connect(self.on_autostart_toggled)
+        autostart_layout.addWidget(self.autostart_checkbox)
+        autostart_layout.addStretch()
+        layout.addLayout(autostart_layout)
+
+        self.autostart_checkbox.blockSignals(True)
+        self.autostart_checkbox.setChecked(self._is_autostart_enabled())
+        self.autostart_checkbox.blockSignals(False)
         
         layout.addStretch()
         self.settings_tab.setLayout(layout)
@@ -276,6 +314,18 @@ class MainWindow(QMainWindow):
             return
 
         self.engine.set_device(device_index)
+
+    def on_autostart_toggled(self, state: int):
+        enabled = state != 0
+        try:
+            self._set_autostart_enabled(enabled)
+            status_text = "включён" if enabled else "выключен"
+            self.append_log(f"⚙ Автозапуск {status_text}")
+        except Exception as error:
+            self.autostart_checkbox.blockSignals(True)
+            self.autostart_checkbox.setChecked(not enabled)
+            self.autostart_checkbox.blockSignals(False)
+            self.append_log(f"❌ Не удалось изменить автозапуск: {error}")
 
 def main():
     # Подавить Qt DPI-related ошибки на Windows
