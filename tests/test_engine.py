@@ -102,6 +102,28 @@ class TestJarvisEngine(unittest.TestCase):
         # Очистим флаг для следующих тестов
         self.engine._stop.clear()
 
+    def test_known_command_stays_offline(self):
+        """Известные команды должны выполняться локально и не вызывать AI fallback."""
+        with patch.object(self.engine.ex, "run") as mock_run, patch.object(
+            self.engine.ex, "handle_unrecognized_command"
+        ) as mock_ai:
+            result = self.engine._execute_intent_if_valid("открой браузер")
+
+        self.assertTrue(result)
+        mock_run.assert_called_once()
+        mock_ai.assert_not_called()
+
+    def test_unknown_command_goes_to_ai_fallback(self):
+        """Неизвестные команды должны уходить в AI fallback."""
+        with patch.object(self.engine.ex, "run") as mock_run, patch.object(
+            self.engine.ex, "handle_unrecognized_command", return_value=True
+        ) as mock_ai:
+            result = self.engine._execute_intent_if_valid("кто ты такой")
+
+        self.assertTrue(result)
+        mock_ai.assert_called_once_with("кто ты такой")
+        mock_run.assert_not_called()
+
 
 class TestJarvisEngineIntegration(unittest.TestCase):
     """Интеграционные тесты для JarvisEngine"""

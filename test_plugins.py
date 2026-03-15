@@ -79,7 +79,7 @@ def test_executor_with_plugins():
     """Тест интеграции плагинов с Executor"""
     print("\n=== Тест 2: Executor с плагинами ===")
     
-    ex = Executor(enable_tts=False)
+    ex = Executor()
     plugin = TestPlugin()
     
     # Загрузим плагин в executor

@@ -34,24 +34,14 @@ DEFAULT_SITE_ALIASES = {
 
 
 class Executor:
-    def __init__(self, config=None, enable_tts=False, log_callback=None):
+    def __init__(self, config=None, log_callback=None):
         self.config = config or self._load_default_config()
-        self.enable_tts = enable_tts
-        self._tts = None
         self.log_callback = log_callback  # Callback для GUI
+        self._ai_client = None
         
         # Инициализируем систему плагинов
         self.plugin_manager = PluginManager()
-        
-        # Инициализируем TTS только если нужно
-        if self.enable_tts:
-            try:
-                from src.jarvis.tts import TextToSpeech
-                self._tts = TextToSpeech()
-                logger.info("TTS инициализирован")
-            except Exception as e:
-                logger.warning(f"TTS недоступен: {e}")
-                self._tts = None
+        self._init_ai_assistant()
     
     def _log(self, message: str):
         """Универсальное логирование - в logger и GUI callback"""
@@ -62,6 +52,51 @@ class Executor:
     def load_config(self):
         """Перезагружает конфигурацию из файла"""
         self.config = self._load_default_config()
+        self._init_ai_assistant()
+
+    def _init_ai_assistant(self):
+        ai_config = self.config.get("ai", {}) if isinstance(self.config, dict) else {}
+        enabled = ai_config.get("enabled", True)
+
+        if not enabled:
+            self._ai_client = None
+            logger.info("AI assistant disabled in config")
+            return
+
+        try:
+            from .ai_client import OpenRouterClient
+
+            self._ai_client = OpenRouterClient(
+                api_key=ai_config.get("api_key", "") or os.getenv("OPENROUTER_API_KEY", ""),
+                model=ai_config.get("model", "openrouter/free"),
+                timeout_seconds=int(ai_config.get("timeout_seconds", 20)),
+                max_tokens=int(ai_config.get("max_tokens", 220)),
+                system_prompt=ai_config.get(
+                    "system_prompt",
+                    "Ты голосовой ассистент Джарвис. Отвечай кратко и по делу на русском языке.",
+                ),
+            )
+            logger.info("AI assistant initialized (OpenRouter)")
+        except Exception as error:
+            logger.warning(f"AI assistant init failed: {error}")
+            self._ai_client = None
+
+    def handle_unrecognized_command(self, source_text: str) -> bool:
+        query = (source_text or "").strip()
+        if not query:
+            self._log("🗣 Оффлайн fallback: не понял команду")
+            return False
+
+        if self._ai_client and self._ai_client.is_enabled():
+            response = self._ai_client.get_response(query)
+            if response:
+                self._log(f"🤖 AI: {response}")
+                return True
+            if getattr(self._ai_client, "last_error", None):
+                self._log(f"⚠ AI недоступен: {self._ai_client.last_error}")
+
+        self._log("🗣 Оффлайн fallback: не понял команду")
+        return False
 
     def _load_default_config(self) -> dict:
         config_path = Path(__file__).with_name("config.json")
@@ -469,10 +504,6 @@ class Executor:
             date_str = f"{now.day} {months_ru[now.month]} {now.year} года"
             
             self._log(f"📅 Дата: {date_str}")
-            
-            # Озвучиваем если TTS включен
-            if self._tts:
-                self._tts.speak(f"Сегодня {date_str}")
         except Exception as e:
             logger.error(f"Ошибка показа даты: {e}")
     
@@ -484,10 +515,6 @@ class Executor:
             time_ru = f"{now.hour} часов {now.minute} минут"
             
             self._log(f"🕐 Время: {time_str}")
-            
-            # Озвучиваем если TTS включен
-            if self._tts:
-                self._tts.speak(f"Текущее время: {time_ru}")
         except Exception as e:
             logger.error(f"Ошибка показа времени: {e}")
     
@@ -554,9 +581,5 @@ class Executor:
             # Показываем последние 5 заметок
             for i, note in enumerate(notes[-5:], 1):
                 self._log(f"  {i}. {note['text']}")
-                
-                # Озвучиваем если TTS включен
-                if self._tts:
-                    self._tts.speak(f"Заметка {i}: {note['text']}")
         except Exception as e:
             logger.error(f"Ошибка чтения заметок: {e}")

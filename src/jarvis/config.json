@@ -6,6 +6,15 @@
     "wake_engine": "porcupine",
     "ptt_hotkey": "f6"
   },
+  "ai": {
+    "enabled": true,
+    "provider": "openrouter",
+    "api_key": "",
+    "model": "openrouter/free",
+    "timeout_seconds": 20,
+    "max_tokens": 220,
+    "system_prompt": "Ты голосовой ассистент Джарвис. Отвечай кратко и по делу на русском языке."
+  },
   "apps": {
     "browser": "C:/Program Files/Google/Chrome/Application/chrome.exe",
     "vscode": "E:/Tools/Microsoft VS Code/Code.exe",

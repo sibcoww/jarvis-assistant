@@ -8,13 +8,12 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .nlu import SimpleNLU
-from .ml_nlu import MLNLU
 from .executor import Executor
 
 logger = logging.getLogger(__name__)
 
 class JarvisEngine:
-    def __init__(self, asr=None, log=None, use_ml_nlu: bool = True, continuous_mode_timeout: float = 10.0):
+    def __init__(self, asr=None, log=None, continuous_mode_timeout: float = 10.0):
         self.asr = asr
         self.log = log or (lambda msg: None)
         self.continuous_mode_timeout = continuous_mode_timeout  # Время ожидания след. команды без wake-word (сек)
@@ -27,22 +26,10 @@ class JarvisEngine:
         self._record_startup_timing("app_start")
         self.log(f"⏱ Запуск приложения: {self._app_started_wall.strftime('%H:%M:%S')}")
         
-        # Initialize NLU: try ML first, fallback to SimpleNLU
-        if use_ml_nlu:
-            try:
-                self.log("🤖 Loading ML-based NLU...")
-                self.nlu = MLNLU()
-                self.nlu_type = "ML"
-                self.log("✅ ML NLU loaded")
-            except Exception as e:
-                logger.warning(f"ML NLU initialization failed: {e}. Falling back to SimpleNLU.")
-                self.nlu = SimpleNLU()
-                self.nlu_type = "Simple"
-        else:
-            self.nlu = SimpleNLU()
-            self.nlu_type = "Simple"
+        self.nlu = SimpleNLU()
+        self.nlu_type = "Simple"
         
-        self.ex = Executor(enable_tts=False, log_callback=self.log)  # Передаём callback в Executor
+        self.ex = Executor(log_callback=self.log)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -362,10 +349,10 @@ class JarvisEngine:
     def _execute_intent_if_valid(self, source_text: str):
         intent = self.nlu.parse(source_text)
         if intent.get("type") == "unknown":
-            self.log("❓ Не понял команду. Повтори.")
-            return False
+            return self.ex.handle_unrecognized_command(source_text)
 
-        if intent.get("confidence", 0.0) < self.min_intent_confidence:
+        confidence = intent.get("confidence")
+        if confidence is not None and confidence < self.min_intent_confidence:
             self.log(f"⚠ Низкая уверенность ({intent.get('confidence', 0):.2f}). Повтори команду.")
             return False
 
@@ -510,7 +497,7 @@ class JarvisEngine:
 
             # Check if text contains both wake word and command
             if self._has_wake_word(t):
-                # Wake word detected - parse with ML NLU which handles wake word stripping
+                # Wake word detected - parse command
                 if hasattr(self.nlu, 'parse_with_wake_word'):
                     intent = self.nlu.parse_with_wake_word(t)
                 else:
@@ -518,7 +505,8 @@ class JarvisEngine:
                     intent = self.nlu.parse(t)
                 
                 if intent.get("type") != "unknown":
-                    if intent.get("confidence", 0.0) < self.min_intent_confidence:
+                    confidence = intent.get("confidence")
+                    if confidence is not None and confidence < self.min_intent_confidence:
                         self.log(f"⚠ Низкая уверенность ({intent.get('confidence', 0):.2f}). Повтори команду.")
                         continue
 
@@ -545,7 +533,8 @@ class JarvisEngine:
             if self.continuous_mode:
                 intent = self.nlu.parse(text)
                 if intent.get("type") != "unknown":
-                    if intent.get("confidence", 0.0) < self.min_intent_confidence:
+                    confidence = intent.get("confidence")
+                    if confidence is not None and confidence < self.min_intent_confidence:
                         self.log(f"⚠ Низкая уверенность ({intent.get('confidence', 0):.2f}). Повтори команду.")
                         continue
 
@@ -558,18 +547,18 @@ class JarvisEngine:
                     self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
                     continue
                 else:
-                    # No valid intent in continuous mode - just log and continue listening
-                    self.log("❓ Не понял команду. Повтори.")
+                    self.ex.handle_unrecognized_command(text)
                     continue
             
             # Check if armed (regular two-step activation)
             if self.armed:
                 intent = self.nlu.parse(text)
                 if intent.get("type") == "unknown":
-                    self.log("❓ Не понял команду. Повтори.")
+                    self.ex.handle_unrecognized_command(text)
                     continue
 
-                if intent.get("confidence", 0.0) < self.min_intent_confidence:
+                confidence = intent.get("confidence")
+                if confidence is not None and confidence < self.min_intent_confidence:
                     self.log(f"⚠ Низкая уверенность ({intent.get('confidence', 0):.2f}). Повтори команду.")
                     continue
 
