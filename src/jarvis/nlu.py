@@ -57,6 +57,10 @@ class SimpleNLU:
     """Очень простой NLU: сопоставляет фразы с интентами.
        Возвращает словарь вида {"type": "...", "slots": {...}}.
     """
+    def load_config(self):
+        """Совместимость с интерфейсом движка; настроек нет."""
+        return None
+
     def parse(self, text: str) -> dict:
         t = text.lower()
 

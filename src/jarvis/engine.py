@@ -9,6 +9,7 @@ from typing import Callable, Optional
 
 from .nlu import SimpleNLU
 from .executor import Executor
+from .key_store import ensure_keys_file
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ class JarvisEngine:
         self._app_started_monotonic = time.perf_counter()
         self._asr_loading_started_monotonic = None
         self._startup_timing_log_path = Path.home() / ".jarvis" / "startup_timing.log"
+        self.audio_config = self._load_audio_config()
 
         self._record_startup_timing("app_start")
         self.log(f"⏱ Запуск приложения: {self._app_started_wall.strftime('%H:%M:%S')}")
@@ -47,7 +49,8 @@ class JarvisEngine:
         self._wake_event = threading.Event()
         self._wake_detected_at: float | None = None
         self._pending_command_since: float | None = None
-        self._porcupine_access_key = os.getenv("PICOVOICE_ACCESS_KEY")
+        keys, _ = ensure_keys_file()
+        self._porcupine_access_key = (keys.get("picovoice_access_key", "") or os.getenv("PICOVOICE_ACCESS_KEY"))
         
         # Push-to-talk
         self._hotkey_manager = None
@@ -188,7 +191,13 @@ class JarvisEngine:
             
             try:
                 from .vosk_asr import VoskASR
-                self.asr = VoskASR(str(model_path), device=self.device, on_progress=on_progress)
+                self.asr = VoskASR(
+                    str(model_path),
+                    device=self.device,
+                    phrase_timeout=float(self.audio_config.get("phrase_timeout", 6.0)),
+                    silence_timeout=float(self.audio_config.get("silence_timeout", 1.2)),
+                    on_progress=on_progress,
+                )
             except Exception as e:
                 self.is_loading = False
                 self.log(f"❌ Ошибка загрузки модели: {e}")
@@ -236,6 +245,7 @@ class JarvisEngine:
             self.log("🔄 Перезагрузка конфигурации...")
             self.nlu.load_config()
             self.ex.load_config()
+            self.audio_config = self._load_audio_config()
             self.log("✅ Конфигурация перезагружена")
         except Exception as e:
             self.log(f"❌ Ошибка при перезагрузке конфигурации: {e}")
@@ -263,6 +273,7 @@ class JarvisEngine:
             self.log("⚠ Неизвестный движок активации. Оставлен текущий.")
             return False
 
+        self._refresh_porcupine_key()
         if not self._porcupine_access_key:
             self.log("⚠ PICOVOICE_ACCESS_KEY не задан. Porcupine недоступен.")
             return False
@@ -288,6 +299,34 @@ class JarvisEngine:
         except Exception as error:
             self.log(f"❌ Ошибка инициализации Porcupine: {error}")
             return False
+
+    def _refresh_porcupine_key(self):
+        try:
+            keys, _ = ensure_keys_file()
+            self._porcupine_access_key = (
+                keys.get("picovoice_access_key", "") or os.getenv("PICOVOICE_ACCESS_KEY", "")
+            )
+        except Exception:
+            self._porcupine_access_key = os.getenv("PICOVOICE_ACCESS_KEY", "")
+
+    @staticmethod
+    def _load_audio_config() -> dict:
+        config_path = Path(__file__).with_name("config.json")
+        defaults = {"phrase_timeout": 6.0, "silence_timeout": 1.2, "wake_engine": "vosk_text"}
+        if not config_path.exists():
+            return defaults
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            audio = data.get("audio", {}) if isinstance(data, dict) else {}
+            result = defaults.copy()
+            result.update({
+                "phrase_timeout": audio.get("phrase_timeout", defaults["phrase_timeout"]),
+                "silence_timeout": audio.get("silence_timeout", defaults["silence_timeout"]),
+                "wake_engine": audio.get("wake_engine", defaults["wake_engine"]),
+            })
+            return result
+        except Exception:
+            return defaults
 
     def start(self):
         if self.is_running:
@@ -328,6 +367,16 @@ class JarvisEngine:
         self.armed = False
         self.continuous_mode = False
         self.log("🔴 Движок остановлен.")
+
+    def reset_chat_history(self, reason: str = "manual") -> bool:
+        try:
+            if hasattr(self.ex, "reset_chat_history"):
+                self.ex.reset_chat_history(reason)
+            self.log("🧹 Контекст очищен")
+            return True
+        except Exception as error:
+            self.log(f"❌ Не удалось очистить контекст: {error}")
+        return False
 
         
     def preload(self):
@@ -521,10 +570,15 @@ class JarvisEngine:
                     self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
                     continue
                 else:
-                    # Wake word found but no command after it - arm and wait for command
-                    self.armed = True
-                    self._pending_command_since = time.perf_counter()
-                    self.log("✅ Активирован. Скажи команду…")
+                    # Wake word found but no known command after it - пробуем AI сразу
+                    handled = self.ex.handle_unrecognized_command(t)
+                    if handled:
+                        self.continuous_mode = True
+                        self.continuous_mode_until = time.time() + self.continuous_mode_timeout
+                    else:
+                        self.armed = True
+                        self._pending_command_since = time.perf_counter()
+                        self.log("✅ Активирован. Скажи команду…")
                     continue
             
             # No wake word detected

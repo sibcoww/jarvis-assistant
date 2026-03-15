@@ -3,9 +3,11 @@ import subprocess
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from ctypes import cast, POINTER
 from datetime import datetime
+from typing import List, Dict
 import webbrowser
 
 try:
@@ -16,6 +18,7 @@ except ImportError:
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
 from .plugin_api import PluginManager
+from .key_store import ensure_keys_file
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +41,95 @@ class Executor:
         self.config = config or self._load_default_config()
         self.log_callback = log_callback  # Callback для GUI
         self._ai_client = None
+        self._chat_history: List[Dict[str, str]] = []
+        self._chat_history_path = Path.home() / ".jarvis" / "chat_history.json"
+        self._chat_history_limit_pairs = 5
+        self._chat_reset_timeout = 300  # сек
+        self._last_ai_at: float | None = None
+        self._reset_phrases = {
+            "очисти контекст",
+            "забудь контекст",
+            "забудь диалог",
+            "сбрось контекст",
+        }
         
         # Инициализируем систему плагинов
         self.plugin_manager = PluginManager()
         self._init_ai_assistant()
+        self._load_chat_history()
     
     def _log(self, message: str):
         """Универсальное логирование - в logger и GUI callback"""
         logger.info(message)
         if self.log_callback:
             self.log_callback(message)
+
+    def _load_chat_history(self):
+        try:
+            if not self._chat_history_path.exists():
+                self._chat_history = []
+                return
+
+            data = json.loads(self._chat_history_path.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                self._chat_history = []
+                return
+
+            normalized: List[Dict[str, str]] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                content = item.get("content")
+                if role not in {"user", "assistant", "system"}:
+                    continue
+                if not isinstance(content, str):
+                    continue
+                content = content.strip()
+                if not content:
+                    continue
+                normalized.append({"role": role, "content": content})
+
+            self._chat_history = normalized
+            self._trim_chat_history()
+            self._log(f"[DEBUG] Загружена история чата: {len(self._chat_history)} сообщений")
+        except Exception as error:
+            logger.warning(f"Не удалось загрузить чат-историю: {error}")
+            self._chat_history = []
+
+    def _save_chat_history(self):
+        try:
+            self._chat_history_path.parent.mkdir(parents=True, exist_ok=True)
+            self._chat_history_path.write_text(
+                json.dumps(self._chat_history, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as error:
+            logger.warning(f"Не удалось сохранить чат-историю: {error}")
+
+    def _trim_chat_history(self):
+        max_messages = self._chat_history_limit_pairs * 2
+        if len(self._chat_history) <= max_messages:
+            return
+        removed = len(self._chat_history) - max_messages
+        self._chat_history = self._chat_history[-max_messages:]
+        self._log(f"[DEBUG] Обрезка чат-истории: -{removed} сообщений, осталось {len(self._chat_history)}")
+
+    def _append_chat_message(self, role: str, content: str):
+        if role not in {"user", "assistant", "system"}:
+            return
+        content = (content or "").strip()
+        if not content:
+            return
+        self._chat_history.append({"role": role, "content": content})
+        self._trim_chat_history()
+
+    def reset_chat_history(self, reason: str = "manual"):
+        if self._chat_history:
+            self._log(f"[DEBUG] Сброс чат-истории: {reason}")
+        self._chat_history = []
+        self._last_ai_at = None
+        self._save_chat_history()
 
     def load_config(self):
         """Перезагружает конфигурацию из файла"""
@@ -58,6 +140,9 @@ class Executor:
         ai_config = self.config.get("ai", {}) if isinstance(self.config, dict) else {}
         enabled = ai_config.get("enabled", True)
 
+        keys, keys_created = ensure_keys_file()
+        key_from_file = keys.get("openrouter_api_key", "").strip()
+
         if not enabled:
             self._ai_client = None
             logger.info("AI assistant disabled in config")
@@ -66,8 +151,19 @@ class Executor:
         try:
             from .ai_client import OpenRouterClient
 
+            api_key = (
+                key_from_file
+                or ai_config.get("api_key", "")
+                or os.getenv("OPENROUTER_API_KEY", "")
+            )
+
+            if keys_created:
+                logger.warning("keys.json создан. Добавь ключ OpenRouter в настройках.")
+            elif not api_key:
+                logger.warning("OPENROUTER_API_KEY отсутствует в keys.json/config/env")
+
             self._ai_client = OpenRouterClient(
-                api_key=ai_config.get("api_key", "") or os.getenv("OPENROUTER_API_KEY", ""),
+                api_key=api_key,
                 model=ai_config.get("model", "openrouter/free"),
                 timeout_seconds=int(ai_config.get("timeout_seconds", 20)),
                 max_tokens=int(ai_config.get("max_tokens", 220)),
@@ -87,13 +183,32 @@ class Executor:
             self._log("🗣 Оффлайн fallback: не понял команду")
             return False
 
+        self._log(f"[DEBUG] Unknown command -> AI, len={len(query)}")
+
+        normalized_query = query.lower().strip(" .,!?")
+        if normalized_query in self._reset_phrases:
+            self.reset_chat_history("голосовая команда")
+            self._log("🤖 Контекст очищен")
+            return True
+
+        now_ts = time.time()
+        if self._last_ai_at and (now_ts - self._last_ai_at) > self._chat_reset_timeout:
+            self.reset_chat_history("долгая пауза")
+
         if self._ai_client and self._ai_client.is_enabled():
-            response = self._ai_client.get_response(query)
+            self._log(f"[DEBUG] AI client present, model={getattr(self._ai_client, 'model', '?')}, history={len(self._chat_history)}")
+            response = self._ai_client.get_response(query, history=self._chat_history)
             if response:
+                self._append_chat_message("user", query)
+                self._append_chat_message("assistant", response)
+                self._save_chat_history()
+                self._last_ai_at = now_ts
                 self._log(f"🤖 AI: {response}")
                 return True
             if getattr(self._ai_client, "last_error", None):
                 self._log(f"⚠ AI недоступен: {self._ai_client.last_error}")
+            else:
+                self._log("⚠ AI недоступен: нет текста и нет last_error")
 
         self._log("🗣 Оффлайн fallback: не понял команду")
         return False

@@ -10,7 +10,7 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
-    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle, QCheckBox
+    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle, QCheckBox, QLineEdit
 )
 
 import sounddevice as sd
@@ -19,6 +19,7 @@ from PySide6.QtGui import QAction, QIcon
 from PySide6.QtCore import Signal, QObject, QTimer, QEvent
 
 from src.jarvis.engine import JarvisEngine
+from src.jarvis.key_store import ensure_keys_file, save_keys
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ class MainWindow(QMainWindow):
         self._ptt_hotkey = "f6"  # По умолчанию F6
         self._recording_key = False  # Флаг записи клавиши
         self._recorded_combo = []  # Комбинация клавиш во время записи
+        self._ai_key_warn_shown = False
+        self._pv_key_warn_shown = False
 
         self.setWindowTitle("Jarvis Assistant")
         self.resize(800, 600)
@@ -295,6 +298,85 @@ class MainWindow(QMainWindow):
         
         ptt_layout.addStretch()
         layout.addLayout(ptt_layout)
+
+        # AI настройки
+        ai_group_label = QLabel("AI ответы:")
+        ai_font = ai_group_label.font()
+        ai_font.setBold(True)
+        ai_group_label.setFont(ai_font)
+        layout.addWidget(ai_group_label)
+
+        ai_enable_layout = QHBoxLayout()
+        self.ai_enabled_checkbox = QCheckBox("Включить AI для неизвестных команд")
+        self.ai_enabled_checkbox.setToolTip("Если команда не распознана локально, вопрос отправляется в OpenRouter")
+        self.ai_enabled_checkbox.stateChanged.connect(self.on_ai_enabled_toggled)
+        ai_enable_layout.addWidget(self.ai_enabled_checkbox)
+        ai_enable_layout.addStretch()
+        layout.addLayout(ai_enable_layout)
+
+        ai_model_layout = QHBoxLayout()
+        ai_model_layout.addWidget(QLabel("Модель AI:"))
+        self.ai_model_combo = QComboBox()
+        self.ai_model_combo.addItem("openrouter/free", "openrouter/free")
+        self.ai_model_combo.addItem("meta-llama/llama-3.2-3b-instruct:free", "meta-llama/llama-3.2-3b-instruct:free")
+        self.ai_model_combo.addItem("google/gemma-3-4b-it:free", "google/gemma-3-4b-it:free")
+        self.ai_model_combo.addItem("qwen/qwen3-4b:free", "qwen/qwen3-4b:free")
+        self.ai_model_combo.currentIndexChanged.connect(self.on_ai_model_changed)
+        ai_model_layout.addWidget(self.ai_model_combo)
+
+        self.ai_test_btn = QPushButton("🤖 Тест AI")
+        self.ai_test_btn.setToolTip("Проверить, что OpenRouter отвечает")
+        self.ai_test_btn.clicked.connect(self.on_test_ai)
+        ai_model_layout.addWidget(self.ai_test_btn)
+        layout.addLayout(ai_model_layout)
+
+        ai_info_label = QLabel(
+            "• Локальные системные команды выполняются без AI\n"
+            "• AI используется только для неизвестных команд и общих вопросов\n"
+            "• Ключи хранятся локально в keys.json (или в переменных окружения)"
+        )
+        ai_info_label.setStyleSheet("color: #666; font-size: 10px;")
+        layout.addWidget(ai_info_label)
+
+        chat_ctx_layout = QHBoxLayout()
+        self.clear_ctx_btn = QPushButton("🧹 Очистить контекст")
+        self.clear_ctx_btn.setToolTip("Очистить историю диалога для AI")
+        self.clear_ctx_btn.clicked.connect(self.on_clear_chat_history)
+        chat_ctx_layout.addWidget(self.clear_ctx_btn)
+        chat_ctx_layout.addStretch()
+        layout.addLayout(chat_ctx_layout)
+
+        ai_key_layout = QHBoxLayout()
+        ai_key_layout.addWidget(QLabel("Ключ OpenRouter:"))
+        self.ai_key_input = QLineEdit()
+        self.ai_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ai_key_input.setPlaceholderText("sk-...")
+        ai_key_layout.addWidget(self.ai_key_input)
+
+        ai_save_btn = QPushButton("💾 Сохранить ключ")
+        ai_save_btn.clicked.connect(self.on_save_ai_key)
+        ai_key_layout.addWidget(ai_save_btn)
+        layout.addLayout(ai_key_layout)
+
+        self.ai_key_warning = QLabel("")
+        self.ai_key_warning.setStyleSheet("color: #cc6600; font-size: 10px;")
+        layout.addWidget(self.ai_key_warning)
+
+        pv_layout = QHBoxLayout()
+        pv_layout.addWidget(QLabel("Ключ Porcupine (Picovoice):"))
+        self.pv_key_input = QLineEdit()
+        self.pv_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pv_key_input.setPlaceholderText("picovoice-...")
+        pv_layout.addWidget(self.pv_key_input)
+
+        pv_save_btn = QPushButton("💾 Сохранить Porcupine")
+        pv_save_btn.clicked.connect(self.on_save_pv_key)
+        pv_layout.addWidget(pv_save_btn)
+        layout.addLayout(pv_layout)
+
+        self.pv_key_warning = QLabel("")
+        self.pv_key_warning.setStyleSheet("color: #cc6600; font-size: 10px;")
+        layout.addWidget(self.pv_key_warning)
         
         # Кнопки управления конфигом
         config_buttons_layout = QHBoxLayout()
@@ -435,6 +517,7 @@ class MainWindow(QMainWindow):
     def on_reload_config(self):
         try:
             self.engine.reload_config()
+            self.load_audio_settings()
             self.append_log("🔄 Конфиг перезагружен")
         except Exception as e:
             self.append_log(f"❌ Ошибка при перезагрузке конфига: {e}")
@@ -444,6 +527,92 @@ class MainWindow(QMainWindow):
 
     def on_silence_timeout_changed(self, value):
         self.save_audio_setting("silence_timeout", value)
+
+    def save_config_section_value(self, section: str, key: str, value):
+        config_path = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as file:
+                config = json.load(file)
+
+            if section not in config or not isinstance(config[section], dict):
+                config[section] = {}
+
+            config[section][key] = value
+
+            with open(config_path, "w", encoding="utf-8") as file:
+                json.dump(config, file, ensure_ascii=False, indent=2)
+        except Exception as error:
+            logger.error(f"Не удалось сохранить {section}.{key}: {error}")
+
+    def on_ai_enabled_toggled(self, state: int):
+        enabled = state != 0
+        self.save_config_section_value("ai", "enabled", enabled)
+        try:
+            self.engine.reload_config()
+            self.append_log(f"🤖 AI {'включён' if enabled else 'отключён'}")
+            self._show_ai_key_warning()
+        except Exception as error:
+            self.append_log(f"❌ Ошибка переключения AI: {error}")
+
+    def on_ai_model_changed(self, _index: int):
+        model = self.ai_model_combo.currentData()
+        if not model:
+            return
+        self.save_config_section_value("ai", "model", model)
+        try:
+            self.engine.reload_config()
+            self.append_log(f"🤖 Модель AI: {model}")
+        except Exception as error:
+            self.append_log(f"❌ Ошибка смены модели AI: {error}")
+
+    def on_test_ai(self):
+        try:
+            ai_client = getattr(self.engine.ex, "_ai_client", None)
+            if ai_client is None or not ai_client.is_enabled():
+                self.append_log("⚠ AI недоступен: проверь OPENROUTER_API_KEY")
+                return
+
+            self.append_log("🤖 Проверяю AI...")
+            response = ai_client.get_response("Кто ты такой? Ответь одним коротким предложением.")
+            if response:
+                self.append_log(f"🤖 AI: {response}")
+            else:
+                last_error = getattr(ai_client, "last_error", "неизвестная ошибка")
+                self.append_log(f"⚠ AI недоступен: {last_error}")
+        except Exception as error:
+            self.append_log(f"❌ Ошибка теста AI: {error}")
+
+    def on_clear_chat_history(self):
+        """Очистить историю диалога для AI."""
+        try:
+            reset = self.engine.reset_chat_history("gui") if hasattr(self.engine, "reset_chat_history") else False
+            if reset:
+                self.append_log("🧹 Контекст диалога очищен")
+            else:
+                self.append_log("⚠ Не удалось очистить контекст")
+        except Exception as error:
+            self.append_log(f"❌ Ошибка очистки контекста: {error}")
+
+    def on_save_ai_key(self):
+        key = (self.ai_key_input.text() or "").strip()
+        try:
+            save_keys({"openrouter_api_key": key})
+            self.append_log("💾 Ключ сохранён в keys.json")
+            self.engine.reload_config()
+            self._show_ai_key_warning()
+        except Exception as error:
+            self.append_log(f"❌ Не удалось сохранить ключ: {error}")
+
+    def on_save_pv_key(self):
+        key = (self.pv_key_input.text() or "").strip()
+        try:
+            save_keys({"picovoice_access_key": key})
+            self.append_log("💾 Porcupine ключ сохранён в keys.json")
+            # Обновляем движок, чтобы подхватить ключ
+            self.engine.set_wakeword_engine(self.engine.wakeword_engine)
+            self._show_pv_key_warning()
+        except Exception as error:
+            self.append_log(f"❌ Не удалось сохранить Porcupine ключ: {error}")
     
     def on_autostart_toggled(self, state: int):
         enabled = state != 0
@@ -692,9 +861,67 @@ class MainWindow(QMainWindow):
             self._ptt_hotkey = ptt_hotkey
             display_name = ptt_hotkey.upper() if len(ptt_hotkey) <= 3 else ptt_hotkey.title()
             self.ptt_key_input.setText(display_name)
+
+            ai_config = config.get("ai", {})
+            self.ai_enabled_checkbox.blockSignals(True)
+            self.ai_enabled_checkbox.setChecked(ai_config.get("enabled", True))
+            self.ai_enabled_checkbox.blockSignals(False)
+
+            ai_model = ai_config.get("model", "openrouter/free")
+            ai_model_index = self.ai_model_combo.findData(ai_model)
+            self.ai_model_combo.blockSignals(True)
+            self.ai_model_combo.setCurrentIndex(ai_model_index if ai_model_index >= 0 else 0)
+            self.ai_model_combo.blockSignals(False)
+
+            self._load_ai_key()
+            self._load_pv_key()
             
         except Exception as e:
             logger.error(f"Не удалось загрузить настройки аудио: {e}")
+
+    def _load_ai_key(self):
+        try:
+            keys, created = ensure_keys_file()
+            key = keys.get("openrouter_api_key", "")
+            self.ai_key_input.setText(key)
+            if created:
+                self.append_log("⚠ keys.json создан. Добавь ключ OpenRouter в настройках.")
+            self._show_ai_key_warning()
+        except Exception as error:
+            self.append_log(f"❌ Не удалось загрузить keys.json: {error}")
+
+    def _load_pv_key(self):
+        try:
+            keys, created = ensure_keys_file()
+            key = keys.get("picovoice_access_key", "")
+            self.pv_key_input.setText(key)
+            if created and not key:
+                self.append_log("⚠ keys.json создан. Добавь Porcupine ключ, если используешь Picovoice.")
+            self._show_pv_key_warning()
+        except Exception as error:
+            self.append_log(f"❌ Не удалось загрузить Porcupine ключ: {error}")
+
+    def _show_ai_key_warning(self):
+        ai_enabled = self.ai_enabled_checkbox.isChecked()
+        key_empty = not (self.ai_key_input.text() or "").strip()
+        if ai_enabled and key_empty:
+            self.ai_key_warning.setText("⚠ AI включён, но ключ пуст. Добавь ключ, иначе будут оффлайн ответы.")
+            if not self._ai_key_warn_shown:
+                self.append_log("⚠ AI включён, но ключ пуст. Добавь ключ в поле выше.")
+                self._ai_key_warn_shown = True
+        else:
+            self.ai_key_warning.setText("")
+
+    def _show_pv_key_warning(self):
+        use_porcupine = getattr(self.engine, "wakeword_engine", "vosk_text") == "porcupine"
+        key_empty = not (self.pv_key_input.text() or "").strip()
+        if use_porcupine and key_empty:
+            self.pv_key_warning.setText("⚠ Porcupine выбран, но ключ пуст. Добавь ключ или переключи движок.")
+            if not self._pv_key_warn_shown:
+                self.append_log("⚠ Porcupine без ключа не работает. Добавь ключ или выбери Vosk.")
+                self._pv_key_warn_shown = True
+        else:
+            self.pv_key_warning.setText("")
 
     def on_wake_engine_changed(self, combo_index: int):
         if combo_index < 0:
@@ -718,6 +945,7 @@ class MainWindow(QMainWindow):
             self.wake_engine_combo.blockSignals(False)
         else:
             self.save_audio_setting("wake_engine", selected_engine)
+        self._show_pv_key_warning()
 
 def main():
     # Подавить Qt DPI-related ошибки на Windows
