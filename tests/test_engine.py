@@ -124,6 +124,75 @@ class TestJarvisEngine(unittest.TestCase):
         mock_ai.assert_called_once_with("кто ты такой")
         mock_run.assert_not_called()
 
+    def test_stop_idempotent_logs_once(self):
+        logs: list[str] = []
+        engine = JarvisEngine(asr=None, log=lambda m: logs.append(m))
+        engine.is_running = True
+
+        engine.stop("first")
+        engine.stop("second")
+
+        stop_logs = [m for m in logs if "Движок остановлен" in m]
+        self.assertEqual(len(stop_logs), 1)
+        self.assertEqual(engine._stop_reason, "first")
+        self.assertTrue(engine._stop.is_set())
+
+    def test_ai_failure_does_not_stop_engine(self):
+        engine = JarvisEngine(asr=None, log=lambda m: None)
+        engine.is_running = True
+        with patch.object(engine.nlu, "parse", return_value={"type": "unknown", "confidence": 1.0}):
+            with patch.object(engine.ex, "handle_unrecognized_command", side_effect=RuntimeError("boom")):
+                handled = engine._execute_intent_if_valid("fail")
+
+        self.assertFalse(handled)
+        self.assertFalse(engine._stop.is_set())
+        self.assertTrue(engine.is_running)
+
+    def test_ai_empty_or_rate_limit_keeps_engine_alive(self):
+        engine = JarvisEngine(asr=None, log=lambda m: None)
+        engine.is_running = True
+        with patch.object(engine.nlu, "parse", return_value={"type": "unknown", "confidence": 1.0}):
+            with patch.object(engine.ex, "handle_unrecognized_command", return_value=False):
+                handled = engine._execute_intent_if_valid("429 scenario")
+
+        self.assertFalse(handled)
+        self.assertFalse(engine._stop.is_set())
+        self.assertTrue(engine.is_running)
+
+    def test_continuous_timeout_does_not_stop_engine(self):
+        logs: list[str] = []
+        engine = JarvisEngine(asr=None, log=lambda m: logs.append(m))
+        engine.continuous_mode = True
+        engine.continuous_mode_until = time.time() - 1
+
+        expired = engine._expire_continuous_if_needed(now=time.time())
+
+        self.assertTrue(expired)
+        self.assertFalse(engine.continuous_mode)
+        self.assertFalse(engine._stop.is_set())
+        self.assertTrue(any("continuous истёк" in msg for msg in logs))
+
+    def test_stop_start_stop_sequence(self):
+        engine = JarvisEngine(asr=None, log=lambda m: None)
+        engine.is_running = True
+        engine.stop("first")
+        self.assertTrue(engine._stop.is_set())
+        self.assertEqual(engine._stop_reason, "first")
+
+        # Stub out bootstrap to avoid heavy init
+        engine._bootstrap_and_run = lambda: None
+        engine.start()
+
+        self.assertFalse(engine._stop.is_set())
+        self.assertIsNone(engine._stop_reason)
+        self.assertFalse(engine.continuous_mode)
+        self.assertFalse(engine.armed)
+
+        engine.is_running = True
+        engine.stop("second")
+        self.assertTrue(engine._stop.is_set())
+        self.assertEqual(engine._stop_reason, "second")
+
 
 class TestJarvisEngineIntegration(unittest.TestCase):
     """Интеграционные тесты для JarvisEngine"""

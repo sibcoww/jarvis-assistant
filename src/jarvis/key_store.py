@@ -4,9 +4,16 @@ from typing import Dict, Tuple
 
 KEYS_PATH = Path.home() / ".jarvis" / "keys.json"
 DEFAULT_KEYS = {
-    "openrouter_api_key": "",
+    "openai_api_key": "",
     "picovoice_access_key": "",
 }
+
+
+def _write_atomic(path: Path, data: Dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def ensure_keys_file() -> Tuple[Dict[str, str], bool]:
@@ -20,7 +27,7 @@ def ensure_keys_file() -> Tuple[Dict[str, str], bool]:
     KEYS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not KEYS_PATH.exists():
-        KEYS_PATH.write_text(json.dumps(DEFAULT_KEYS, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_atomic(KEYS_PATH, DEFAULT_KEYS)
         created = True
 
     try:
@@ -29,7 +36,7 @@ def ensure_keys_file() -> Tuple[Dict[str, str], bool]:
             raise ValueError("keys.json corrupted: expected object")
     except Exception:
         data = DEFAULT_KEYS.copy()
-        KEYS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_atomic(KEYS_PATH, data)
         created = True
 
     # Ensure all defaults exist
@@ -40,9 +47,19 @@ def ensure_keys_file() -> Tuple[Dict[str, str], bool]:
 
 
 def save_keys(keys: Dict[str, str]) -> None:
+    current, _ = ensure_keys_file()
     data = DEFAULT_KEYS.copy()
+    data.update(current)
+
     for k, v in keys.items():
-        if k in data:
-            data[k] = v
-    KEYS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    KEYS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        if k not in data:
+            continue
+        if not isinstance(v, str):
+            continue
+        normalized = v.strip()
+        if not normalized:
+            # защита от затирания существующего ключа пустым значением
+            continue
+        data[k] = normalized
+
+    _write_atomic(KEYS_PATH, data)

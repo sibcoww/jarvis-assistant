@@ -141,7 +141,7 @@ class Executor:
         enabled = ai_config.get("enabled", True)
 
         keys, keys_created = ensure_keys_file()
-        key_from_file = keys.get("openrouter_api_key", "").strip()
+        openai_key_from_file = keys.get("openai_api_key", "").strip()
 
         if not enabled:
             self._ai_client = None
@@ -149,22 +149,22 @@ class Executor:
             return
 
         try:
-            from .ai_client import OpenRouterClient
+            from .openai_client import OpenAIClient
 
             api_key = (
-                key_from_file
+                openai_key_from_file
                 or ai_config.get("api_key", "")
-                or os.getenv("OPENROUTER_API_KEY", "")
+                or os.getenv("OPENAI_API_KEY", "")
             )
 
             if keys_created:
-                logger.warning("keys.json создан. Добавь ключ OpenRouter в настройках.")
+                logger.warning("keys.json создан. Добавь ключ OpenAI в настройках.")
             elif not api_key:
-                logger.warning("OPENROUTER_API_KEY отсутствует в keys.json/config/env")
+                logger.warning("OPENAI_API_KEY отсутствует в keys.json/config/env")
 
-            self._ai_client = OpenRouterClient(
+            self._ai_client = OpenAIClient(
                 api_key=api_key,
-                model=ai_config.get("model", "openrouter/free"),
+                model=ai_config.get("model", "gpt-4o-mini"),
                 timeout_seconds=int(ai_config.get("timeout_seconds", 20)),
                 max_tokens=int(ai_config.get("max_tokens", 220)),
                 system_prompt=ai_config.get(
@@ -172,7 +172,7 @@ class Executor:
                     "Ты голосовой ассистент Джарвис. Отвечай кратко и по делу на русском языке.",
                 ),
             )
-            logger.info("AI assistant initialized (OpenRouter)")
+            logger.info("AI assistant initialized (OpenAI)")
         except Exception as error:
             logger.warning(f"AI assistant init failed: {error}")
             self._ai_client = None
@@ -196,8 +196,30 @@ class Executor:
             self.reset_chat_history("долгая пауза")
 
         if self._ai_client and self._ai_client.is_enabled():
-            self._log(f"[DEBUG] AI client present, model={getattr(self._ai_client, 'model', '?')}, history={len(self._chat_history)}")
-            response = self._ai_client.get_response(query, history=self._chat_history)
+            self._log(
+                f"[DEBUG] AI client present, model={getattr(self._ai_client, 'model', '?')}, history={len(self._chat_history)}"
+            )
+
+            last_error_text = None
+            response = None
+            for attempt in range(2):
+                response = self._ai_client.get_response(query, history=self._chat_history)
+                last_error_text = getattr(self._ai_client, "last_error", None)
+
+                if response:
+                    break
+
+                empty_err = last_error_text and "пуст" in last_error_text.lower()
+                rate_limited = last_error_text and "429" in last_error_text
+
+                if attempt == 0 and empty_err:
+                    self._log("[DEBUG] AI вернул пустой ответ, пробую ещё раз")
+                    continue
+
+                if rate_limited or (attempt == 0 and last_error_text and "ограничил" in last_error_text.lower()):
+                    # Не крутим бесконечно на rate-limit
+                    break
+
             if response:
                 self._append_chat_message("user", query)
                 self._append_chat_message("assistant", response)
@@ -205,8 +227,9 @@ class Executor:
                 self._last_ai_at = now_ts
                 self._log(f"🤖 AI: {response}")
                 return True
-            if getattr(self._ai_client, "last_error", None):
-                self._log(f"⚠ AI недоступен: {self._ai_client.last_error}")
+
+            if last_error_text:
+                self._log(f"⚠ AI недоступен: {last_error_text}")
             else:
                 self._log("⚠ AI недоступен: нет текста и нет last_error")
 

@@ -6,7 +6,9 @@ import argparse
 import json
 import os
 import subprocess
+import html
 from pathlib import Path
+from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
@@ -39,8 +41,9 @@ class MainWindow(QMainWindow):
         self._ptt_hotkey = "f6"  # По умолчанию F6
         self._recording_key = False  # Флаг записи клавиши
         self._recorded_combo = []  # Комбинация клавиш во время записи
-        self._ai_key_warn_shown = False
+        self._openai_key_warn_shown = False
         self._pv_key_warn_shown = False
+        self._runtime_log_path = Path.home() / ".jarvis" / "runtime.log"
 
         self.setWindowTitle("Jarvis Assistant")
         self.resize(800, 600)
@@ -308,7 +311,7 @@ class MainWindow(QMainWindow):
 
         ai_enable_layout = QHBoxLayout()
         self.ai_enabled_checkbox = QCheckBox("Включить AI для неизвестных команд")
-        self.ai_enabled_checkbox.setToolTip("Если команда не распознана локально, вопрос отправляется в OpenRouter")
+        self.ai_enabled_checkbox.setToolTip("Если команда не распознана локально, вопрос отправляется в выбранный AI-провайдер")
         self.ai_enabled_checkbox.stateChanged.connect(self.on_ai_enabled_toggled)
         ai_enable_layout.addWidget(self.ai_enabled_checkbox)
         ai_enable_layout.addStretch()
@@ -317,15 +320,14 @@ class MainWindow(QMainWindow):
         ai_model_layout = QHBoxLayout()
         ai_model_layout.addWidget(QLabel("Модель AI:"))
         self.ai_model_combo = QComboBox()
-        self.ai_model_combo.addItem("openrouter/free", "openrouter/free")
-        self.ai_model_combo.addItem("meta-llama/llama-3.2-3b-instruct:free", "meta-llama/llama-3.2-3b-instruct:free")
-        self.ai_model_combo.addItem("google/gemma-3-4b-it:free", "google/gemma-3-4b-it:free")
-        self.ai_model_combo.addItem("qwen/qwen3-4b:free", "qwen/qwen3-4b:free")
+        self.ai_model_combo.addItem("gpt-4o-mini", "gpt-4o-mini")
+        self.ai_model_combo.addItem("gpt-4.1-mini", "gpt-4.1-mini")
+        self.ai_model_combo.addItem("gpt-4o", "gpt-4o")
         self.ai_model_combo.currentIndexChanged.connect(self.on_ai_model_changed)
         ai_model_layout.addWidget(self.ai_model_combo)
 
         self.ai_test_btn = QPushButton("🤖 Тест AI")
-        self.ai_test_btn.setToolTip("Проверить, что OpenRouter отвечает")
+        self.ai_test_btn.setToolTip("Проверить, что выбранный AI-провайдер отвечает")
         self.ai_test_btn.clicked.connect(self.on_test_ai)
         ai_model_layout.addWidget(self.ai_test_btn)
         layout.addLayout(ai_model_layout)
@@ -346,21 +348,21 @@ class MainWindow(QMainWindow):
         chat_ctx_layout.addStretch()
         layout.addLayout(chat_ctx_layout)
 
-        ai_key_layout = QHBoxLayout()
-        ai_key_layout.addWidget(QLabel("Ключ OpenRouter:"))
-        self.ai_key_input = QLineEdit()
-        self.ai_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.ai_key_input.setPlaceholderText("sk-...")
-        ai_key_layout.addWidget(self.ai_key_input)
+        openai_key_layout = QHBoxLayout()
+        openai_key_layout.addWidget(QLabel("Ключ OpenAI:"))
+        self.openai_key_input = QLineEdit()
+        self.openai_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.openai_key_input.setPlaceholderText("sk-...")
+        openai_key_layout.addWidget(self.openai_key_input)
 
-        ai_save_btn = QPushButton("💾 Сохранить ключ")
-        ai_save_btn.clicked.connect(self.on_save_ai_key)
-        ai_key_layout.addWidget(ai_save_btn)
-        layout.addLayout(ai_key_layout)
+        openai_save_btn = QPushButton("💾 Сохранить OpenAI")
+        openai_save_btn.clicked.connect(self.on_save_openai_key)
+        openai_key_layout.addWidget(openai_save_btn)
+        layout.addLayout(openai_key_layout)
 
-        self.ai_key_warning = QLabel("")
-        self.ai_key_warning.setStyleSheet("color: #cc6600; font-size: 10px;")
-        layout.addWidget(self.ai_key_warning)
+        self.openai_key_warning = QLabel("")
+        self.openai_key_warning.setStyleSheet("color: #cc6600; font-size: 10px;")
+        layout.addWidget(self.openai_key_warning)
 
         pv_layout = QHBoxLayout()
         pv_layout.addWidget(QLabel("Ключ Porcupine (Picovoice):"))
@@ -447,7 +449,18 @@ class MainWindow(QMainWindow):
 
 
     def append_log(self, msg: str):
-        self.log_view.append(msg)
+        formatted = self._format_log_message(msg)
+        color = self._color_for_level(formatted["level"])
+        escaped_text = html.escape(formatted["text"])
+        line_html = (
+            f'<span style="color:{color};">'
+            f'[{formatted["timestamp"]}] [{formatted["level"]}] {escaped_text}'
+            "</span>"
+        )
+        self.log_view.append(line_html)
+        self._append_runtime_log_file(
+            f'[{formatted["timestamp"]}] [{formatted["level"]}] {formatted["text"]}'
+        )
 
         # Привязываем прогресс-бар к реальному прогрессу загрузки из логов:
         # "📊 Загрузка: 50% (1/2)"
@@ -457,6 +470,68 @@ class MainWindow(QMainWindow):
             self._loading_progress_value = max(0, min(100, progress))
             if self.progress_bar.isVisible():
                 self.progress_bar.setValue(self._loading_progress_value)
+
+    @staticmethod
+    def _strip_emoji(text: str) -> str:
+        # Remove common emoji/pictographs while keeping regular text readable.
+        emoji_pattern = re.compile(
+            "["
+            "\U0001F300-\U0001F5FF"
+            "\U0001F600-\U0001F64F"
+            "\U0001F680-\U0001F6FF"
+            "\U0001F700-\U0001F77F"
+            "\U0001F780-\U0001F7FF"
+            "\U0001F800-\U0001F8FF"
+            "\U0001F900-\U0001F9FF"
+            "\U0001FA00-\U0001FA6F"
+            "\U0001FA70-\U0001FAFF"
+            "]+",
+            flags=re.UNICODE,
+        )
+        return emoji_pattern.sub("", text or "")
+
+    @staticmethod
+    def _detect_level(raw_text: str) -> str:
+        text_upper = (raw_text or "").upper()
+        text_lower = (raw_text or "").lower()
+        if "[DEBUG]" in text_upper:
+            return "DEBUG"
+        if "[ERROR]" in text_upper or "ошибка" in text_lower or "не удалось" in text_lower:
+            return "ERROR"
+        if "[WARNING]" in text_upper or "⚠" in raw_text or "warning" in text_lower:
+            return "WARNING"
+        return "INFO"
+
+    def _format_log_message(self, raw_text: str) -> dict:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        level = self._detect_level(raw_text or "")
+
+        text = (raw_text or "").strip()
+        text = re.sub(r"\[(DEBUG|INFO|WARNING|ERROR)\]\s*", "", text, flags=re.IGNORECASE)
+        text = self._strip_emoji(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            text = "-"
+
+        return {"timestamp": timestamp, "level": level, "text": text}
+
+    @staticmethod
+    def _color_for_level(level: str) -> str:
+        palette = {
+            "DEBUG": "#9E9E9E",
+            "INFO": "#FFFFFF",
+            "WARNING": "#FFD54F",
+            "ERROR": "#EF5350",
+        }
+        return palette.get(level, "#FFFFFF")
+
+    def _append_runtime_log_file(self, line: str):
+        try:
+            self._runtime_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._runtime_log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(line + "\n")
+        except Exception as error:
+            logger.error(f"Не удалось записать runtime log: {error}")
 
     def load_devices(self):
         self.device_combo.blockSignals(True)
@@ -550,7 +625,7 @@ class MainWindow(QMainWindow):
         try:
             self.engine.reload_config()
             self.append_log(f"🤖 AI {'включён' if enabled else 'отключён'}")
-            self._show_ai_key_warning()
+            self._show_openai_key_warning()
         except Exception as error:
             self.append_log(f"❌ Ошибка переключения AI: {error}")
 
@@ -569,7 +644,7 @@ class MainWindow(QMainWindow):
         try:
             ai_client = getattr(self.engine.ex, "_ai_client", None)
             if ai_client is None or not ai_client.is_enabled():
-                self.append_log("⚠ AI недоступен: проверь OPENROUTER_API_KEY")
+                self.append_log("⚠ AI недоступен: проверь ключ выбранного провайдера")
                 return
 
             self.append_log("🤖 Проверяю AI...")
@@ -593,18 +668,25 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self.append_log(f"❌ Ошибка очистки контекста: {error}")
 
-    def on_save_ai_key(self):
-        key = (self.ai_key_input.text() or "").strip()
+    def on_save_openai_key(self):
+        key = (self.openai_key_input.text() or "").strip()
+        if not key:
+            self.append_log("⚠ OpenAI ключ пустой — сохранение пропущено")
+            return
         try:
-            save_keys({"openrouter_api_key": key})
-            self.append_log("💾 Ключ сохранён в keys.json")
+            save_keys({"openai_api_key": key})
+            self.save_config_section_value("ai", "provider", "openai")
+            self.append_log("💾 Ключ OpenAI сохранён в keys.json")
             self.engine.reload_config()
-            self._show_ai_key_warning()
+            self._show_openai_key_warning()
         except Exception as error:
-            self.append_log(f"❌ Не удалось сохранить ключ: {error}")
+            self.append_log(f"❌ Не удалось сохранить OpenAI ключ: {error}")
 
     def on_save_pv_key(self):
         key = (self.pv_key_input.text() or "").strip()
+        if not key:
+            self.append_log("⚠ Porcupine ключ пустой — сохранение пропущено")
+            return
         try:
             save_keys({"picovoice_access_key": key})
             self.append_log("💾 Porcupine ключ сохранён в keys.json")
@@ -867,28 +949,26 @@ class MainWindow(QMainWindow):
             self.ai_enabled_checkbox.setChecked(ai_config.get("enabled", True))
             self.ai_enabled_checkbox.blockSignals(False)
 
-            ai_model = ai_config.get("model", "openrouter/free")
+            ai_model = ai_config.get("model", "gpt-4o-mini")
             ai_model_index = self.ai_model_combo.findData(ai_model)
             self.ai_model_combo.blockSignals(True)
             self.ai_model_combo.setCurrentIndex(ai_model_index if ai_model_index >= 0 else 0)
             self.ai_model_combo.blockSignals(False)
 
-            self._load_ai_key()
+            self._load_openai_key()
             self._load_pv_key()
             
         except Exception as e:
             logger.error(f"Не удалось загрузить настройки аудио: {e}")
 
-    def _load_ai_key(self):
+    def _load_openai_key(self):
         try:
-            keys, created = ensure_keys_file()
-            key = keys.get("openrouter_api_key", "")
-            self.ai_key_input.setText(key)
-            if created:
-                self.append_log("⚠ keys.json создан. Добавь ключ OpenRouter в настройках.")
-            self._show_ai_key_warning()
+            keys, _created = ensure_keys_file()
+            key = keys.get("openai_api_key", "")
+            self.openai_key_input.setText(key)
+            self._show_openai_key_warning()
         except Exception as error:
-            self.append_log(f"❌ Не удалось загрузить keys.json: {error}")
+            self.append_log(f"❌ Не удалось загрузить OpenAI ключ: {error}")
 
     def _load_pv_key(self):
         try:
@@ -901,16 +981,16 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self.append_log(f"❌ Не удалось загрузить Porcupine ключ: {error}")
 
-    def _show_ai_key_warning(self):
+    def _show_openai_key_warning(self):
         ai_enabled = self.ai_enabled_checkbox.isChecked()
-        key_empty = not (self.ai_key_input.text() or "").strip()
+        key_empty = not (self.openai_key_input.text() or "").strip()
         if ai_enabled and key_empty:
-            self.ai_key_warning.setText("⚠ AI включён, но ключ пуст. Добавь ключ, иначе будут оффлайн ответы.")
-            if not self._ai_key_warn_shown:
-                self.append_log("⚠ AI включён, но ключ пуст. Добавь ключ в поле выше.")
-                self._ai_key_warn_shown = True
+            self.openai_key_warning.setText("⚠ OpenAI выбран, но ключ пуст. Добавь OPENAI ключ.")
+            if not self._openai_key_warn_shown:
+                self.append_log("⚠ OpenAI выбран, но ключ пуст. Добавь ключ OpenAI.")
+                self._openai_key_warn_shown = True
         else:
-            self.ai_key_warning.setText("")
+            self.openai_key_warning.setText("")
 
     def _show_pv_key_warning(self):
         use_porcupine = getattr(self.engine, "wakeword_engine", "vosk_text") == "porcupine"

@@ -43,3 +43,4 @@ tqdm==4.67.1
 urllib3==2.5.0
 vosk==0.3.45
 websockets==15.0.1
+pytest==8.3.4

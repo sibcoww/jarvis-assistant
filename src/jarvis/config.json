@@ -8,9 +8,9 @@
   },
   "ai": {
     "enabled": true,
-    "provider": "openrouter",
+    "provider": "openai",
     "api_key": "",
-    "model": "openrouter/free",
+    "model": "gpt-4o-mini",
     "timeout_seconds": 20,
     "max_tokens": 220,
     "system_prompt": "Ты голосовой ассистент Джарвис. Отвечай кратко и по делу на русском языке."

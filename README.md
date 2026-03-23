@@ -1,5 +1,13 @@
 # Jarvis PC Assistant
 
+> Быстрая сводка (март 2026):
+> - Ядро: оффлайн ASR (Vosk) + SimpleNLU, неизвестные команды уходят в OpenRouter (text) с fallback на openrouter/free.
+> - GUI: PySide6 с трей-меню, кнопками Старт/Стоп, выбором микрофона и движка активации, полями для ключей AI/Porcupine.
+> - Безопасность/устойчивость: идемпотентный `engine.stop()`, continuous-mode не стопает движок при ошибках AI, key-store сохраняется атомарно и не затирается пустыми значениями.
+> - История чата хранится в `~/.jarvis/chat_history.json`, ключи — в `~/.jarvis/keys.json` (или переменные окружения). 
+> - Актуальные регрессии покрыты тестами: `tests/test_engine.py` (lifecycle, AI fallback), `tests/test_key_store.py` (merge/atomic save), `tests/test_ai_client.py` (OpenRouter parsing/errors).
+> - Ниже сохранено прежнее подробное описание (часть разделов про ML NLU/coverage может быть устаревшей).
+
 Полнофункциональный голосовой ассистент для Windows с поддержкой:
 - 🎤 **Офлайн-распознавания речи** (Vosk + русская модель)
 - 🧠 **ML-based NLU** (spaCy embeddings для понимания намерений)
