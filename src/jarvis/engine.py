@@ -3,6 +3,7 @@ import logging
 import time
 import json
 import os
+import inspect
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -33,6 +34,7 @@ class JarvisEngine:
         
         self.ex = Executor(log_callback=self.log)
         self._stop = threading.Event()
+        self._stop_reason: str | None = None
         self._thread: Optional[threading.Thread] = None
 
         self.armed = False  # ждём ли команду после wake-word
@@ -329,12 +331,19 @@ class JarvisEngine:
             return defaults
 
     def start(self):
-        if self.is_running:
-            return
         if self._thread and self._thread.is_alive():
+            return
+        # Allow restart after stop(): stale is_running may still be True
+        # for a short period until previous loop fully unwinds.
+        if self.is_running and not self._stop.is_set():
             return
 
         self._stop.clear()
+        self._stop_reason = None
+        self.armed = False
+        self.continuous_mode = False
+        self._pending_command_since = None
+        self._wake_event.clear()
         self._thread = threading.Thread(target=self._bootstrap_and_run, daemon=True)
         self._thread.start()
 
@@ -360,13 +369,45 @@ class JarvisEngine:
             self.is_running = False
 
 
-    def stop(self):
-        if not self.is_running and not self.is_loading:
+    def _caller_label(self) -> str:
+        try:
+            frames = inspect.stack()
+            for frame_info in frames[2:6]:  # пропускаем текущий и прямого вызователя
+                module = inspect.getmodule(frame_info.frame)
+                mod_name = module.__name__ if module else "?"
+                return f"{mod_name}.{frame_info.function}"
+        except Exception:
+            return "unknown"
+        return "unknown"
+
+    def stop(self, reason: str | None = None):
+        """Идемпотентная остановка движка с защитой от повторных вызовов."""
+        caller = self._caller_label()
+        if self._stop.is_set():
+            logger.debug("stop ignored: already stopping (reason=%s) caller=%s", self._stop_reason, caller)
             return
+        if not self.is_running and not self.is_loading:
+            logger.debug("stop ignored: engine not running/loading caller=%s", caller)
+            return
+
+        stop_reason = reason or self._stop_reason or "unspecified"
+        first_stop = self._stop_reason is None
+        self._stop_reason = self._stop_reason or stop_reason
+
         self._stop.set()
         self.armed = False
         self.continuous_mode = False
-        self.log("🔴 Движок остановлен.")
+
+        if first_stop:
+            logger.debug("stop accepted by %s reason=%s", caller, stop_reason)
+        else:
+            logger.debug(
+                "stop accepted (already had reason=%s) new_call=%s", self._stop_reason, caller
+            )
+        if reason:
+            self.log(f"🔴 Движок остановлен ({reason}).")
+        else:
+            self.log("🔴 Движок остановлен.")
 
     def reset_chat_history(self, reason: str = "manual") -> bool:
         try:
@@ -396,9 +437,20 @@ class JarvisEngine:
         return text
 
     def _execute_intent_if_valid(self, source_text: str):
-        intent = self.nlu.parse(source_text)
+        try:
+            intent = self.nlu.parse(source_text)
+        except Exception as error:
+            self.log(f"❌ Ошибка распознавания интента: {error}")
+            logger.exception("Intent parse failed")
+            return False
+
         if intent.get("type") == "unknown":
-            return self.ex.handle_unrecognized_command(source_text)
+            try:
+                return self.ex.handle_unrecognized_command(source_text)
+            except Exception as error:
+                self.log(f"❌ Ошибка AI fallback: {error}")
+                logger.exception("AI fallback failed")
+                return False
 
         confidence = intent.get("confidence")
         if confidence is not None and confidence < self.min_intent_confidence:
@@ -406,9 +458,25 @@ class JarvisEngine:
             return False
 
         self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
-        self.ex.run(intent)
+        try:
+            self.ex.run(intent)
+        except Exception as error:
+            self.log(f"❌ Ошибка выполнения команды: {error}")
+            logger.exception("Executor run failed")
+            return False
         self.log("✅ Готово.")
         return True
+
+    def _expire_continuous_if_needed(self, now: float | None = None) -> bool:
+        """Проверяет таймер continuous режима и выключает его без стопа движка."""
+        if not self.continuous_mode:
+            return False
+        now_ts = now if now is not None else time.time()
+        if now_ts > self.continuous_mode_until:
+            self.continuous_mode = False
+            self.log("⏰ Режим continuous истёк. Скажи «Джарвис» для активации.")
+            return True
+        return False
 
     def _run_porcupine(self):
         while not self._stop.is_set():
@@ -480,9 +548,7 @@ class JarvisEngine:
                 self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
 
             while self.continuous_mode and not self._stop.is_set():
-                if time.time() > self.continuous_mode_until:
-                    self.continuous_mode = False
-                    self.log("⏰ Режим continuous истёк. Скажи «Джарвис» для активации.")
+                if self._expire_continuous_if_needed(now=time.time()):
                     break
 
                 next_text = self._listen_once_timed("Команда в continuous")
@@ -536,22 +602,25 @@ class JarvisEngine:
 
             if t in ("exit", "quit", "выход"):
                 self.log("🟡 Команда выхода.")
-                self.stop()
+                self.stop("exit command")
                 break
 
             # Check if continuous mode timed out
-            if self.continuous_mode and time.time() > self.continuous_mode_until:
-                self.continuous_mode = False
-                self.log("⏰ Режим continuous истёк. Скажи «Джарвис» для активации.")
+            self._expire_continuous_if_needed(now=time.time())
 
             # Check if text contains both wake word and command
             if self._has_wake_word(t):
                 # Wake word detected - parse command
-                if hasattr(self.nlu, 'parse_with_wake_word'):
-                    intent = self.nlu.parse_with_wake_word(t)
-                else:
-                    # Fallback: parse after manual wake word removal
-                    intent = self.nlu.parse(t)
+                try:
+                    if hasattr(self.nlu, 'parse_with_wake_word'):
+                        intent = self.nlu.parse_with_wake_word(t)
+                    else:
+                        # Fallback: parse after manual wake word removal
+                        intent = self.nlu.parse(t)
+                except Exception as error:
+                    self.log(f"❌ Ошибка распознавания интента: {error}")
+                    logger.exception("Intent parse failed (wakeword)")
+                    continue
                 
                 if intent.get("type") != "unknown":
                     confidence = intent.get("confidence")
@@ -561,7 +630,12 @@ class JarvisEngine:
 
                     # Got valid intent in same sentence as wake word
                     self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
-                    self.ex.run(intent)
+                    try:
+                        self.ex.run(intent)
+                    except Exception as error:
+                        self.log(f"❌ Ошибка выполнения команды: {error}")
+                        logger.exception("Executor run failed (wakeword)")
+                        continue
                     self.log("✅ Готово.")
                     
                     # Enter continuous mode - wait for next command without wake word
@@ -571,10 +645,17 @@ class JarvisEngine:
                     continue
                 else:
                     # Wake word found but no known command after it - пробуем AI сразу
-                    handled = self.ex.handle_unrecognized_command(t)
+                    self.log("[DEBUG] Wake+unknown -> AI")
+                    try:
+                        handled = self.ex.handle_unrecognized_command(t)
+                    except Exception as error:
+                        self.log(f"❌ Ошибка AI fallback: {error}")
+                        logger.exception("AI fallback failed (wake+unknown)")
+                        handled = False
                     if handled:
                         self.continuous_mode = True
                         self.continuous_mode_until = time.time() + self.continuous_mode_timeout
+                        self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
                     else:
                         self.armed = True
                         self._pending_command_since = time.perf_counter()
@@ -585,7 +666,12 @@ class JarvisEngine:
             
             # Check if we're in continuous mode
             if self.continuous_mode:
-                intent = self.nlu.parse(text)
+                try:
+                    intent = self.nlu.parse(text)
+                except Exception as error:
+                    self.log(f"❌ Ошибка распознавания интента: {error}")
+                    logger.exception("Intent parse failed (continuous)")
+                    continue
                 if intent.get("type") != "unknown":
                     confidence = intent.get("confidence")
                     if confidence is not None and confidence < self.min_intent_confidence:
@@ -593,7 +679,12 @@ class JarvisEngine:
                         continue
 
                     self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
-                    self.ex.run(intent)
+                    try:
+                        self.ex.run(intent)
+                    except Exception as error:
+                        self.log(f"❌ Ошибка выполнения команды: {error}")
+                        logger.exception("Executor run failed (continuous)")
+                        continue
                     self.log("✅ Готово.")
                     
                     # Reset continuous mode timer
@@ -601,14 +692,29 @@ class JarvisEngine:
                     self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
                     continue
                 else:
-                    self.ex.handle_unrecognized_command(text)
+                    self.log("[DEBUG] continuous unknown -> AI")
+                    try:
+                        self.ex.handle_unrecognized_command(text)
+                    except Exception as error:
+                        self.log(f"❌ Ошибка AI fallback: {error}")
+                        logger.exception("AI fallback failed (continuous)")
                     continue
             
             # Check if armed (regular two-step activation)
             if self.armed:
-                intent = self.nlu.parse(text)
+                try:
+                    intent = self.nlu.parse(text)
+                except Exception as error:
+                    self.log(f"❌ Ошибка распознавания интента: {error}")
+                    logger.exception("Intent parse failed (armed)")
+                    continue
                 if intent.get("type") == "unknown":
-                    self.ex.handle_unrecognized_command(text)
+                    self.log("[DEBUG] armed unknown -> AI")
+                    try:
+                        self.ex.handle_unrecognized_command(text)
+                    except Exception as error:
+                        self.log(f"❌ Ошибка AI fallback: {error}")
+                        logger.exception("AI fallback failed (armed)")
                     continue
 
                 confidence = intent.get("confidence")
@@ -617,7 +723,12 @@ class JarvisEngine:
                     continue
 
                 self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
-                self.ex.run(intent)
+                try:
+                    self.ex.run(intent)
+                except Exception as error:
+                    self.log(f"❌ Ошибка выполнения команды: {error}")
+                    logger.exception("Executor run failed (armed)")
+                    continue
                 self.log("✅ Готово.")
 
                 # Enter continuous mode after command execution
