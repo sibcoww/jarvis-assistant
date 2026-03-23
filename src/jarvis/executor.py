@@ -4,6 +4,8 @@ import logging
 import os
 import shutil
 import time
+import re
+from urllib.parse import quote_plus, urlparse
 from pathlib import Path
 from ctypes import cast, POINTER
 from datetime import datetime
@@ -19,21 +21,9 @@ from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
 from .plugin_api import PluginManager
 from .key_store import ensure_keys_file
+from .memory_store import MemoryStore
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_SITE_ALIASES = {
-    "youtube": "www.youtube.com",
-    "you tube": "www.youtube.com",
-    "ютуб": "www.youtube.com",
-    "ютюб": "www.youtube.com",
-    "ютьюб": "www.youtube.com",
-    "яндекс": "yandex.ru",
-    "гугл": "google.com",
-    "google": "google.com",
-    "github": "github.com",
-    "гитхаб": "github.com",
-}
 
 
 class Executor:
@@ -46,6 +36,7 @@ class Executor:
         self._chat_history_limit_pairs = 5
         self._chat_reset_timeout = 300  # сек
         self._last_ai_at: float | None = None
+        self.memory = MemoryStore()
         self._reset_phrases = {
             "очисти контекст",
             "забудь контекст",
@@ -57,6 +48,247 @@ class Executor:
         self.plugin_manager = PluginManager()
         self._init_ai_assistant()
         self._load_chat_history()
+
+    @staticmethod
+    def _should_run_ai_memory_extract(query: str) -> bool:
+        text = (query or "").strip().lower()
+        if len(text) < 8:
+            return False
+        command_like = ("открой ", "запусти ", "сделай ", "включи ", "выключи ", "громкость", "пауза")
+        if any(text.startswith(prefix) for prefix in command_like):
+            return False
+        triggers = (
+            "меня зовут",
+            "мой ник",
+            "мне ",
+            "я учусь",
+            "я работаю",
+            "предпочитаю",
+            "мне нравится",
+            "сейчас",
+            "пишу диплом",
+            "проект",
+        )
+        return any(t in text for t in triggers)
+
+    def _extract_memory_with_ai(self, query: str):
+        if not self._ai_client or not self._ai_client.is_enabled():
+            return
+        if not self._should_run_ai_memory_extract(query):
+            return
+
+        extract_prompt = (
+            "Определи, нужно ли сохранить это сообщение в память ассистента.\n"
+            "Верни строго JSON без пояснений со схемой:\n"
+            "{\"save\":bool,\"layer\":\"core|session\",\"type\":\"profile|preference|fact|project\","
+            "\"key\":\"optional\",\"value\":\"...\",\"importance\":1..5}\n"
+            "Если сохранять не нужно, верни {\"save\":false}.\n"
+            f"Сообщение пользователя: {query}"
+        )
+        raw = self._ai_client.get_response(
+            extract_prompt,
+            history=None,
+            system_prompt=(
+                "Ты memory-classifier. Отвечай только валидным JSON без markdown и без комментариев."
+            ),
+            max_tokens=180,
+            temperature=0.0,
+        )
+        if not raw:
+            return
+
+        try:
+            suggestion = json.loads(raw)
+        except Exception:
+            return
+        self.memory.save_ai_suggestion(suggestion)
+
+    def _interpret_command_with_ai(self, query: str) -> dict | None:
+        if not self._ai_client or not self._ai_client.is_enabled():
+            return None
+        text = (query or "").strip()
+        if not text:
+            return None
+
+        system_prompt = (
+            "Ты интерпретатор команд ассистента. Доступные команды:\n"
+            "- set_volume(value 0..100)\n"
+            "- volume_up(delta 1..100)\n"
+            "- volume_down(delta 1..100)\n"
+            "- browser_navigate — открыть сайт или страницу\n"
+            "- browser_search(query) — общий поиск в браузере (Google), если нельзя дать точный URL\n"
+            "Для browser_navigate ты сам выбираешь ресурс и формат:\n"
+            "- По возможности верни готовый безопасный URL в slots.url (только http или https, полная ссылка).\n"
+            "- Главная страница сайта: slots.url вида https://www.youtube.com/ или https://github.com/\n"
+            "- Поиск внутри сайта (канал на YouTube, репозиторий на GitHub и т.д.): slots.url с корректным "
+            "адресом страницы поиска или результатов на этом сайте (например youtube.com/results?search_query=...).\n"
+            "- Если точный URL сформировать нельзя, можно вернуть slots.site и slots.query (коротко: что за площадка и что искать); "
+            "исполнитель откроет безопасный поиск, не подставляя списки сайтов из кода.\n"
+            "- Не придумывай опасные схемы (file:, javascript:, data: и т.п.).\n"
+            "Пример: 'открой канал MrBeast на YouTube' -> "
+            "{\"mode\":\"command\",\"intent\":\"browser_navigate\","
+            "\"slots\":{\"url\":\"https://www.youtube.com/results?search_query=MrBeast\"}}\n"
+            "Если фраза — команда, верни только JSON:\n"
+            "{\"mode\":\"command\",\"intent\":\"...\",\"slots\":{...}}\n"
+            "Если это не команда, верни:\n"
+            "{\"mode\":\"chat\"}\n"
+            "Никакого текста вне JSON."
+        )
+        raw = self._ai_client.get_response(
+            text,
+            history=None,
+            system_prompt=system_prompt,
+            max_tokens=140,
+            temperature=0.0,
+        )
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        return self._validate_ai_command_payload(payload)
+
+    def _resolve_site_home_url_with_ai(self, site_name: str) -> str | None:
+        """Попросить AI вернуть главную http(s)-ссылку сайта по названию."""
+        if not self._ai_client or not self._ai_client.is_enabled():
+            return None
+        name = (site_name or "").strip()
+        if not name:
+            return None
+        raw = self._ai_client.get_response(
+            f"Название сайта: {name}",
+            history=None,
+            system_prompt=(
+                "Ты URL-resolver. Верни строго JSON: "
+                "{\"url\":\"https://...\"} "
+                "Только главная страница сайта. Только http/https."
+            ),
+            max_tokens=70,
+            temperature=0.0,
+        )
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        url = str(payload.get("url") or "").strip()
+        if not self._is_safe_http_url(url):
+            return None
+        return url
+
+    @staticmethod
+    def _google_search_url(query: str) -> str:
+        """Универсальный поиск без привязки к конкретным доменам в коде."""
+        return f"https://www.google.com/search?q={quote_plus(query.strip())}"
+
+    @staticmethod
+    def _is_safe_http_url(url: str) -> bool:
+        u = (url or "").strip()
+        if not u:
+            return False
+        parsed = urlparse(u)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        if not parsed.netloc:
+            return False
+        lowered = u.lower()
+        if lowered.startswith("javascript:") or lowered.startswith("data:") or lowered.startswith("file:"):
+            return False
+        return True
+
+    @classmethod
+    def _normalize_browser_url_candidate(cls, raw: str) -> str | None:
+        """Добавить https:// к веб-адресу без схемы; только http(s), без file:/javascript:."""
+        s = (raw or "").strip()
+        if not s:
+            return None
+        if s.startswith(("http://", "https://")):
+            return s if cls._is_safe_http_url(s) else None
+        if " " in s or "\n" in s:
+            return None
+        candidate = "https://" + s.lstrip("/")
+        return candidate if cls._is_safe_http_url(candidate) else None
+
+    @staticmethod
+    def _normalized_label(value: str) -> str:
+        return re.sub(r"[^a-z0-9а-яё]+", "", (value or "").strip().lower())
+
+    def _validate_ai_command_payload(self, payload: dict | None) -> dict | None:
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("mode", "")).lower() != "command":
+            return None
+
+        intent = str(payload.get("intent", "")).strip()
+        slots = payload.get("slots", {})
+        if not isinstance(slots, dict):
+            return None
+
+        allowed_intents = {"set_volume", "volume_up", "volume_down", "browser_navigate", "browser_search"}
+        if intent not in allowed_intents:
+            return None
+
+        if intent == "set_volume":
+            try:
+                value = int(slots.get("value"))
+            except Exception:
+                return None
+            if not (0 <= value <= 100):
+                return None
+            return {"type": "set_volume", "slots": {"value": value}}
+
+        if intent in {"volume_up", "volume_down"}:
+            try:
+                delta = int(slots.get("delta"))
+            except Exception:
+                return None
+            if not (1 <= delta <= 100):
+                return None
+            return {"type": intent, "slots": {"delta": delta}}
+
+        if intent == "browser_navigate":
+            url_raw = str(slots.get("url") or "").strip()
+            site = str(slots.get("site") or "").strip()
+            query = str(slots.get("query") or "").strip()
+
+            if url_raw:
+                url = self._normalize_browser_url_candidate(url_raw) or (
+                    url_raw if self._is_safe_http_url(url_raw) else None
+                )
+                if not url:
+                    return None
+                return {"type": "browser_navigate", "slots": {"url": url}}
+
+            if site and query:
+                # "открой сайт X" часто приходит как site+query, где query ~= site.
+                # В этом случае сначала пытаемся открыть главную страницу сайта.
+                if self._normalized_label(site) and self._normalized_label(site) == self._normalized_label(query):
+                    resolved = self._resolve_site_home_url_with_ai(site)
+                    if resolved:
+                        return {"type": "browser_navigate", "slots": {"url": resolved}}
+                combined = f"{site} {query}".strip()
+                url = self._google_search_url(combined)
+                return {"type": "browser_navigate", "slots": {"url": url}}
+
+            if site and not query:
+                url = self._normalize_browser_url_candidate(site)
+                if url:
+                    return {"type": "browser_navigate", "slots": {"url": url}}
+                return None
+
+            return None
+
+        if intent == "browser_search":
+            query = str(slots.get("query") or "").strip()
+            if not query or len(query) > 200:
+                return None
+            return {"type": "browser_search", "slots": {"query": query}}
+
+        return None
     
     def _log(self, message: str):
         """Универсальное логирование - в logger и GUI callback"""
@@ -131,6 +363,13 @@ class Executor:
         self._last_ai_at = None
         self._save_chat_history()
 
+    def reset_user_memory(self):
+        self.memory.clear_all()
+
+    def clear_recent_memory_context(self):
+        self.reset_chat_history("manual")
+        self.memory.clear_recent_context(last_n=10)
+
     def load_config(self):
         """Перезагружает конфигурацию из файла"""
         self.config = self._load_default_config()
@@ -191,19 +430,59 @@ class Executor:
             self._log("🤖 Контекст очищен")
             return True
 
+        if normalized_query in {"очисти память", "сбрось память"}:
+            self.clear_recent_memory_context()
+            self._log("🤖 Очищен недавний контекст (история и последние записи)")
+            return True
+
+        if normalized_query in {"удали всю информацию обо мне", "забудь всё", "забудь все", "забудь всю информацию обо мне"}:
+            self.reset_user_memory()
+            self.reset_chat_history("manual")
+            self._log("🤖 Вся информация о пользователе удалена")
+            return True
+
+        if (
+            normalized_query in {"что ты помнишь", "что ты обо мне помнишь", "что ты знаешь обо мне"}
+            or ("что ты помнишь" in normalized_query and "обо мне" in normalized_query)
+        ):
+            self._log(f"🤖 Память: {self.memory.describe_profile()}")
+            return True
+
         now_ts = time.time()
         if self._last_ai_at and (now_ts - self._last_ai_at) > self._chat_reset_timeout:
             self.reset_chat_history("долгая пауза")
 
         if self._ai_client and self._ai_client.is_enabled():
+            ai_intent = self._interpret_command_with_ai(query)
+            if ai_intent:
+                self._log(f"[DEBUG] AI command intent: {ai_intent['type']}")
+                try:
+                    self.run(ai_intent)
+                    self._log("✅ Готово.")
+                    return True
+                except Exception as error:
+                    self._log(f"❌ Ошибка выполнения AI-команды: {error}")
+                    logger.exception("AI interpreted command failed")
+
             self._log(
                 f"[DEBUG] AI client present, model={getattr(self._ai_client, 'model', '?')}, history={len(self._chat_history)}"
             )
 
             last_error_text = None
             response = None
+            self._extract_memory_with_ai(query)
+            self.memory.learn_from_user_text(query)
+            request_history = list(self._chat_history)
+            memory_context = self.memory.build_context(query, top_k=4)
+            if memory_context:
+                request_history.append(
+                    {
+                        "role": "system",
+                        "content": "Память о пользователе (учитывай при ответе):\n" + memory_context,
+                    }
+                )
             for attempt in range(2):
-                response = self._ai_client.get_response(query, history=self._chat_history)
+                response = self._ai_client.get_response(query, history=request_history)
                 last_error_text = getattr(self._ai_client, "last_error", None)
 
                 if response:
@@ -324,9 +603,11 @@ class Executor:
         return synonyms.get(normalized, normalized)
 
     def _resolve_site_target(self, target: str) -> str:
+        """Только опциональные подсказки из config.json (sites); без встроенного словаря сайтов."""
         normalized = target.strip().lower()
-        site_aliases = DEFAULT_SITE_ALIASES.copy()
-        site_aliases.update(self.config.get("sites", {}))
+        site_aliases = dict(self.config.get("sites", {}))
+        if not isinstance(site_aliases, dict):
+            site_aliases = {}
 
         if normalized in site_aliases:
             return site_aliases[normalized]
@@ -363,7 +644,44 @@ class Executor:
             except Exception as e:
                 logger.error(f"Ошибка запуска приложения {cmd_path}: {e}")
         else:
-            logger.warning(f"Неизвестное приложение: {target}")
+            # Интеллектуальное разрешение сайтов/запросов — через AI; исполнитель только открывает URL.
+            if self._ai_client and self._ai_client.is_enabled():
+                phrase = (
+                    target
+                    if re.match(r"^(открой|запусти|включи)\s+", target.strip().lower())
+                    else f"открой {target}"
+                )
+                ai_intent = self._interpret_command_with_ai(phrase)
+                if ai_intent:
+                    # Если модель решила сделать browser_search для "открой сайт X",
+                    # даём ещё шанс открыть именно главную страницу сайта.
+                    if (
+                        ai_intent.get("type") == "browser_search"
+                        and "сайт" in phrase.lower()
+                    ):
+                        resolved = self._resolve_site_home_url_with_ai(target)
+                        if resolved:
+                            ai_intent = {"type": "browser_navigate", "slots": {"url": resolved}}
+                    try:
+                        self.run(ai_intent)
+                        logger.info("Открыто через AI-интерпретацию (open_app)")
+                        return
+                    except Exception as e:
+                        logger.warning(f"AI-команда open_app не выполнена: {e}")
+
+            resolved_site = self._resolve_site_target(target)
+            if resolved_site != target.strip().lower():
+                self.browser_navigate(resolved_site)
+                logger.info(f"Открываю сайт из config (sites): {resolved_site}")
+                return
+
+            if "." in target and " " not in target:
+                self.browser_navigate(target)
+                logger.info(f"Открываю как URL/домен: {target}")
+                return
+
+            self.browser_search(target)
+            logger.info(f"Поиск в браузере (нет локального соответствия): {target}")
 
     def set_volume(self, value: int):
         try:
@@ -485,7 +803,13 @@ class Executor:
                 return
             
             if t == "add_note":
-                self.add_note(slots.get("text", ""))
+                note_text = slots.get("text", "")
+                lowered_note = (note_text or "").lower()
+                if "информац" in lowered_note and "обо мне" in lowered_note:
+                    # Route "remember about me" phrases into personal memory flow.
+                    if self.handle_unrecognized_command(note_text):
+                        return
+                self.add_note(note_text)
                 return
             
             if t == "read_notes":
@@ -564,25 +888,77 @@ class Executor:
     def browser_navigate(self, url: str):
         """Открыть URL в браузере"""
         try:
-            url = self._resolve_site_target(url)
+            original = (url or "").strip()
+            if original.startswith(("http://", "https://")) or "/" in original or "?" in original:
+                url = original
+            else:
+                url = self._resolve_site_target(original)
+
+            # host/path?query без схемы → https://...
+            if (
+                not url.startswith(("http://", "https://"))
+                and ("/" in url or "?" in url)
+                and " " not in url
+            ):
+                cand = "https://" + url.lstrip("/")
+                if self._is_safe_http_url(cand):
+                    url = cand
+
+            # If phrase doesn't look like a domain/URL, treat as search query.
+            if not self._looks_like_domain_or_url(url):
+                self.browser_search(original)
+                return
 
             # Добавляем https если нет протокола
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
-            
+
+            if self._open_in_preferred_browser(url):
+                logger.info(f"Открываю в предпочтительном браузере: {url}")
+                return
+
             webbrowser.open(url)
-            logger.info(f"Открываю в браузере: {url}")
+            logger.info(f"Открываю в системном браузере: {url}")
         except Exception as e:
             logger.error(f"Ошибка навигации в браузере: {e}")
+
+    @classmethod
+    def _looks_like_domain_or_url(cls, value: str) -> bool:
+        v = (value or "").strip()
+        if not v:
+            return False
+        if v.startswith(("http://", "https://")):
+            return cls._is_safe_http_url(v)
+        if " " in v:
+            return False
+        # Basic domain-like shape: host.tld (без пути — дальше добавим https://)
+        if "." in v and re.match(r"^[a-zA-Z0-9\-\.]+$", v):
+            return True
+        return False
     
     def browser_search(self, query: str):
         """Поиск в Google"""
         try:
             search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+            if self._open_in_preferred_browser(search_url):
+                logger.info(f"Ищу в Google через предпочтительный браузер: {query}")
+                return
             webbrowser.open(search_url)
-            logger.info(f"Ищу в Google: {query}")
+            logger.info(f"Ищу в Google через системный браузер: {query}")
         except Exception as e:
             logger.error(f"Ошибка поиска: {e}")
+
+    def _open_in_preferred_browser(self, url: str) -> bool:
+        apps = self.config.get("apps", {}) if isinstance(self.config, dict) else {}
+        browser_cmd = (apps.get("browser") or "").strip() if isinstance(apps, dict) else ""
+        if not browser_cmd:
+            return False
+        try:
+            subprocess.Popen([browser_cmd, url], shell=False)
+            return True
+        except Exception as error:
+            logger.warning(f"Не удалось открыть предпочтительный браузер '{browser_cmd}': {error}")
+            return False
     
     # ============ Media Commands ============
     def media_play(self):

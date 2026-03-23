@@ -45,7 +45,14 @@ class OpenAIClient:
             normalized.append({"role": role, "content": content})
         return normalized
 
-    def get_response(self, user_text: str, history: Optional[List[Dict]] = None) -> Optional[str]:
+    def get_response(
+        self,
+        user_text: str,
+        history: Optional[List[Dict]] = None,
+        system_prompt: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.5,
+    ) -> Optional[str]:
         self.last_error = None
         if not self.is_enabled():
             self.last_error = "Не задан OPENAI_API_KEY"
@@ -60,15 +67,15 @@ class OpenAIClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        messages = [{"role": "system", "content": self.system_prompt}]
+        messages = [{"role": "system", "content": system_prompt or self.system_prompt}]
         messages.extend(self._normalize_history(history))
         messages.append({"role": "user", "content": prompt})
 
         payload = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": self.max_tokens,
-            "temperature": 0.5,
+            "max_tokens": max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else self.max_tokens,
+            "temperature": temperature,
         }
 
         try:

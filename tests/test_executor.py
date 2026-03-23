@@ -94,17 +94,34 @@ class TestExecutorBrowserCommands(unittest.TestCase):
     def test_browser_navigate(self):
         ex = _make_executor({})
         
-        with patch("src.jarvis.executor.webbrowser.open") as mock_open:
+        with patch("src.jarvis.executor.subprocess.Popen", side_effect=RuntimeError("no browser")), patch(
+            "src.jarvis.executor.webbrowser.open"
+        ) as mock_open:
             ex.browser_navigate("google.com")
             mock_open.assert_called_once()
             called_url = mock_open.call_args.args[0]
             self.assertIn("google.com", called_url)
             self.assertTrue(called_url.startswith("https://"))
+
+    def test_browser_navigate_prefers_configured_browser(self):
+        ex = _make_executor({"apps": {"browser": "C:/Program Files/Google/Chrome/Application/chrome.exe"}})
+
+        with patch("src.jarvis.executor.subprocess.Popen") as mock_popen, patch(
+            "src.jarvis.executor.webbrowser.open"
+        ) as mock_web_open:
+            ex.browser_navigate("google.com")
+            mock_popen.assert_called_once()
+            args = mock_popen.call_args.args[0]
+            self.assertIn("chrome.exe", args[0].lower())
+            self.assertIn("https://google.com", args[1])
+            mock_web_open.assert_not_called()
     
     def test_browser_search(self):
         ex = _make_executor({})
         
-        with patch("src.jarvis.executor.webbrowser.open") as mock_open:
+        with patch("src.jarvis.executor.subprocess.Popen", side_effect=RuntimeError("no browser")), patch(
+            "src.jarvis.executor.webbrowser.open"
+        ) as mock_open:
             ex.browser_search("python")
             mock_open.assert_called_once()
             called_url = mock_open.call_args.args[0]
@@ -114,11 +131,101 @@ class TestExecutorBrowserCommands(unittest.TestCase):
     def test_browser_navigate_resolves_site_alias(self):
         ex = _make_executor({"sites": {"ютуб": "www.youtube.com"}})
 
-        with patch("src.jarvis.executor.webbrowser.open") as mock_open:
+        with patch("src.jarvis.executor.subprocess.Popen", side_effect=RuntimeError("no browser")), patch(
+            "src.jarvis.executor.webbrowser.open"
+        ) as mock_open:
             ex.browser_navigate("включи ютуб")
             mock_open.assert_called_once()
             called_url = mock_open.call_args.args[0]
             self.assertIn("youtube.com", called_url)
+
+    def test_browser_navigate_vk_phrase_falls_back_to_search_without_config(self):
+        ex = _make_executor({})
+        with patch.object(ex, "browser_search") as mock_search:
+            ex.browser_navigate("вконтакте")
+            mock_search.assert_called_once_with("вконтакте")
+
+    def test_browser_navigate_non_domain_phrase_falls_back_to_search(self):
+        ex = _make_executor({})
+        with patch.object(ex, "browser_search") as mock_search:
+            ex.browser_navigate("эпл мьюзик")
+            mock_search.assert_called_once_with("эпл мьюзик")
+
+    def test_open_app_falls_back_to_site_open(self):
+        ex = _make_executor({"sites": {"ютуб": "www.youtube.com"}})
+
+        with patch("src.jarvis.executor.subprocess.Popen", side_effect=RuntimeError("no browser")), patch(
+            "src.jarvis.executor.webbrowser.open"
+        ) as mock_open:
+            ex.run({"type": "open_app", "slots": {"target": "ютуб"}})
+            mock_open.assert_called_once()
+            called_url = mock_open.call_args.args[0]
+            self.assertIn("youtube.com", called_url)
+
+    def test_open_app_parses_youtube_channel_phrase(self):
+        ex = _make_executor({})
+        ex._ai_client = MagicMock()
+        ex._ai_client.is_enabled.return_value = True
+
+        with patch.object(
+            ex,
+            "_interpret_command_with_ai",
+            return_value={
+                "type": "browser_navigate",
+                "slots": {"url": "https://www.youtube.com/results?search_query=mr+beast"},
+            },
+        ), patch("src.jarvis.executor.subprocess.Popen", side_effect=RuntimeError("no browser")), patch(
+            "src.jarvis.executor.webbrowser.open"
+        ) as mock_open:
+            ex.run({"type": "open_app", "slots": {"target": "mr beast youtube"}})
+            mock_open.assert_called_once()
+            called_url = mock_open.call_args.args[0]
+            self.assertIn("youtube.com/results?search_query=", called_url)
+            self.assertIn("mr+beast", called_url)
+
+    def test_open_app_channel_phrase_defaults_to_youtube(self):
+        ex = _make_executor({})
+        ex._ai_client = MagicMock()
+        ex._ai_client.is_enabled.return_value = True
+
+        with patch.object(
+            ex,
+            "_interpret_command_with_ai",
+            return_value={
+                "type": "browser_navigate",
+                "slots": {"url": "https://www.youtube.com/results?search_query=%D0%B4%D0%B8%D0%BC%D1%8B+%D0%BC%D0%B0%D1%81%D0%BB%D0%B5%D0%BD%D0%BD%D0%B8%D0%BA%D0%BE%D0%B2%D0%B0"},
+            },
+        ), patch("src.jarvis.executor.subprocess.Popen", side_effect=RuntimeError("no browser")), patch(
+            "src.jarvis.executor.webbrowser.open"
+        ) as mock_open:
+            ex.run({"type": "open_app", "slots": {"target": "канал димы масленникова"}})
+            mock_open.assert_called_once()
+            called_url = mock_open.call_args.args[0]
+            self.assertIn("youtube.com/results?search_query=", called_url)
+
+    def test_open_app_site_phrase_converts_search_to_main_url(self):
+        ex = _make_executor({})
+        ex._ai_client = MagicMock()
+        ex._ai_client.is_enabled.return_value = True
+        ex._resolve_site_home_url_with_ai = MagicMock(return_value="https://vk.com/")
+
+        with patch.object(
+            ex,
+            "_interpret_command_with_ai",
+            return_value={"type": "browser_search", "slots": {"query": "ВКонтакте"}},
+        ), patch("src.jarvis.executor.subprocess.Popen", side_effect=RuntimeError("no browser")), patch(
+            "src.jarvis.executor.webbrowser.open"
+        ) as mock_open:
+            ex.run({"type": "open_app", "slots": {"target": "сайт ВКонтакте"}})
+            mock_open.assert_called_once()
+            called_url = mock_open.call_args.args[0]
+            self.assertEqual(called_url, "https://vk.com/")
+
+    def test_google_search_url_encodes_cyrillic_query(self):
+        ex = _make_executor({})
+        url = ex._google_search_url("димы масленникова")
+        self.assertIn("google.com/search", url)
+        self.assertNotIn(" ", url)
 
 
 class TestExecutorMediaCommands(unittest.TestCase):
