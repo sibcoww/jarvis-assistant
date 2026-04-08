@@ -124,6 +124,34 @@ class TestJarvisEngine(unittest.TestCase):
         mock_ai.assert_called_once_with("кто ты такой")
         mock_run.assert_not_called()
 
+    def test_risky_intent_requires_confirmation(self):
+        logs = []
+        engine = JarvisEngine(asr=None, log=lambda m: logs.append(m))
+        with patch.object(engine.nlu, "parse", return_value={"type": "delete_file", "slots": {"path": "x.txt"}}), patch.object(
+            engine.ex, "should_require_confirmation", return_value=True
+        ), patch.object(
+            engine.ex, "queue_confirmation", return_value="Подтверди удаление."
+        ), patch.object(
+            engine.ex, "run"
+        ) as mock_run:
+            handled = engine._execute_intent_if_valid("удали файл x.txt")
+        self.assertTrue(handled)
+        mock_run.assert_not_called()
+        self.assertTrue(any("pending_confirmation" in m for m in logs))
+
+    def test_confirmation_phrase_executes_pending_intent(self):
+        logs = []
+        engine = JarvisEngine(asr=None, log=lambda m: logs.append(m))
+        with patch.object(
+            engine.ex,
+            "pending_confirmation_from_text",
+            return_value=(True, {"type": "delete_file", "slots": {"path": "x.txt"}}, "confirm"),
+        ), patch.object(engine.ex, "run") as mock_run:
+            handled = engine._execute_intent_if_valid("подтверждаю")
+        self.assertTrue(handled)
+        mock_run.assert_called_once()
+        self.assertTrue(any("[PIPE]" in m for m in logs))
+
     def test_stop_idempotent_logs_once(self):
         logs: list[str] = []
         engine = JarvisEngine(asr=None, log=lambda m: logs.append(m))

@@ -17,11 +17,22 @@ try:
 except ImportError:
     pyautogui = None
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
 from .plugin_api import PluginManager
 from .key_store import ensure_keys_file
 from .memory_store import MemoryStore
+from .unified_ai_turn import (
+    REPLY_ONLY_AFTER_MISROUTING_PROMPT,
+    looks_like_informational_without_explicit_action,
+    parse_unified_model_output,
+    unified_turn_system_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +44,8 @@ class Executor:
         self._ai_client = None
         self._chat_history: List[Dict[str, str]] = []
         self._chat_history_path = Path.home() / ".jarvis" / "chat_history.json"
+        self._session_summary_path = Path.home() / ".jarvis" / "session_summary.txt"
+        self._session_summary = ""
         self._chat_history_limit_pairs = 5
         self._chat_reset_timeout = 300  # сек
         self._last_ai_at: float | None = None
@@ -43,10 +56,14 @@ class Executor:
             "забудь диалог",
             "сбрось контекст",
         }
+        self._pending_clarification: dict | None = None
+        self._pending_confirmation: dict | None = None
         
         # Инициализируем систему плагинов
         self.plugin_manager = PluginManager()
+        self._apply_context_config()
         self._init_ai_assistant()
+        self._load_session_summary()
         self._load_chat_history()
 
     @staticmethod
@@ -71,8 +88,148 @@ class Executor:
         )
         return any(t in text for t in triggers)
 
+    @staticmethod
+    def _looks_like_reset_context_phrase(query: str) -> bool:
+        """
+        Fuzzy-детект команд очистки контекста для ASR-ошибок
+        (например «очисти сессию» / «очисти со сью»).
+        """
+        q = (query or "").strip().lower()
+        if not q.startswith(("очисти", "сбрось", "забудь")):
+            return False
+        flat = re.sub(r"[^a-zа-яё0-9]+", "", q)
+        markers = (
+            "контекст",
+            "диалог",
+            "истори",
+            "чат",
+            "сесси",
+            "сесию",
+            "сессию",
+            "сосью",
+        )
+        return any(m in flat for m in markers)
+
+    @staticmethod
+    def _extract_quoted_or_tail(raw: str, prefix_pattern: str) -> str:
+        m = re.search(prefix_pattern, raw, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        return (m.group(1) or "").strip(" \"'.,!?")
+
+    def _detect_missing_args(self, query: str) -> tuple[str, str] | None:
+        q = (query or "").strip().lower()
+        if q in {"открой сайт", "открой в браузере", "открой страницу", "открой"}:
+            return ("browser_target", "Какой сайт или страницу открыть?")
+        if q in {"открой программу", "открой приложение", "запусти программу", "запусти приложение"}:
+            return ("app_target", "Какую программу открыть?")
+        if q in {"поставь громкость", "сделай громкость", "установи громкость", "громкость", "звук"}:
+            return ("volume_value", "На какую громкость поставить? (0-100)")
+        if q in {"сделай тише", "убавь громкость"}:
+            return ("volume_down_delta", "На сколько сделать тише? (1-100)")
+        if q in {"сделай громче", "добавь громкость"}:
+            return ("volume_up_delta", "На сколько сделать громче? (1-100)")
+        if q in {"найди в браузере", "найди", "поищи"}:
+            return ("browser_query", "Что именно найти в браузере?")
+        return None
+
+    def _try_consume_pending_clarification(self, query: str) -> str | None:
+        pending = self._pending_clarification
+        if not pending:
+            return None
+        expires_at = float(pending.get("expires_at", 0))
+        if time.time() > expires_at:
+            self._pending_clarification = None
+            return None
+
+        q = (query or "").strip()
+        qn = q.lower()
+        if qn in {"отмена", "не надо", "забудь", "cancel"}:
+            self._pending_clarification = None
+            self._log("🤖 Ок, отменил уточнение.")
+            return ""
+
+        kind = pending.get("kind")
+        self._pending_clarification = None
+        if kind in {"volume_value", "volume_down_delta", "volume_up_delta"}:
+            try:
+                num = int(re.search(r"\d{1,3}", q).group())
+            except Exception:
+                self._log("🤖 Нужна цифра. Повтори значение, например 20.")
+                return ""
+            if kind == "volume_value":
+                num = max(0, min(100, num))
+                self.run({"type": "set_volume", "slots": {"value": num}})
+                self._log("✅ Готово.")
+                return ""
+            if kind == "volume_down_delta":
+                num = max(1, min(100, num))
+                self.run({"type": "volume_down", "slots": {"delta": num}})
+                self._log("✅ Готово.")
+                return ""
+            if kind == "volume_up_delta":
+                num = max(1, min(100, num))
+                self.run({"type": "volume_up", "slots": {"delta": num}})
+                self._log("✅ Готово.")
+                return ""
+        if kind == "browser_target":
+            return f"открой {q} в браузере"
+        if kind == "app_target":
+            return f"открой {q}"
+        if kind == "browser_query":
+            return f"найди в браузере {q}"
+        return q
+
+    def pending_confirmation_from_text(self, source_text: str) -> tuple[bool, dict | None, str | None]:
+        """Обработать ответ пользователя на подтверждение рискованного действия."""
+        pending = self._pending_confirmation
+        if not pending:
+            return (False, None, None)
+        expires_at = float(pending.get("expires_at", 0))
+        if time.time() > expires_at:
+            self._pending_confirmation = None
+            return (False, None, None)
+        t = (source_text or "").strip().lower()
+        if t in {"подтверждаю", "подтверди", "да", "выполняй"}:
+            intent = pending.get("intent")
+            self._pending_confirmation = None
+            return (True, intent if isinstance(intent, dict) else None, "confirm")
+        if t in {"отмена", "нет", "не надо", "cancel"}:
+            self._pending_confirmation = None
+            return (True, None, "cancel")
+        return (False, None, None)
+
+    def should_require_confirmation(self, intent: dict) -> bool:
+        t = str(intent.get("type") or "")
+        if t not in {"delete_file", "move_file"}:
+            return False
+        slots = intent.get("slots") or {}
+        path = str(slots.get("path") or slots.get("source") or "").strip().lower()
+        # Для диплома: подтверждаем любые потенциально разрушающие файловые действия.
+        return bool(path)
+
+    def queue_confirmation(self, intent: dict, ttl_seconds: int = 20) -> str:
+        self._pending_confirmation = {
+            "intent": intent,
+            "expires_at": time.time() + max(5, int(ttl_seconds)),
+        }
+        t = str(intent.get("type") or "")
+        if t == "delete_file":
+            slots = intent.get("slots") or {}
+            p = str(slots.get("path") or "").strip()
+            return f"Подтверди удаление файла: {p}. Скажи «подтверждаю» или «отмена»."
+        if t == "move_file":
+            slots = intent.get("slots") or {}
+            s = str(slots.get("source") or "").strip()
+            d = str(slots.get("destination") or "").strip()
+            return f"Подтверди перемещение файла: {s} -> {d}. Скажи «подтверждаю» или «отмена»."
+        return "Подтверди действие: «подтверждаю» или «отмена»."
+
     def _extract_memory_with_ai(self, query: str):
         if not self._ai_client or not self._ai_client.is_enabled():
+            return
+        query = self.memory.sanitize_user_memory_text(query)
+        if not query:
             return
         if not self._should_run_ai_memory_extract(query):
             return
@@ -81,7 +238,9 @@ class Executor:
             "Определи, нужно ли сохранить это сообщение в память ассистента.\n"
             "Верни строго JSON без пояснений со схемой:\n"
             "{\"save\":bool,\"layer\":\"core|session\",\"type\":\"profile|preference|fact|project\","
-            "\"key\":\"optional\",\"value\":\"...\",\"importance\":1..5}\n"
+            "\"key\":\"optional\",\"value\":\"...\",\"importance\":1..5,\"sensitive\":bool}\n"
+            "Поле sensitive=true, если это личные/секретные данные, которые нельзя подставлять в облачный контекст AI "
+            "(пароли, токены, точный адрес, конфиденциальные факты). Иначе false.\n"
             "Если сохранять не нужно, верни {\"save\":false}.\n"
             f"Сообщение пользователя: {query}"
         )
@@ -103,6 +262,25 @@ class Executor:
             return
         self.memory.save_ai_suggestion(suggestion)
 
+    def _dialog_context_recap_for_command_ai(self, max_messages: int = 6) -> str:
+        """Короткий субтитр диалога, чтобы понимать «это», «оно», «то же самое» при интерпретации команды."""
+        if not self._chat_history:
+            return ""
+        tail = self._chat_history[-max_messages:]
+        lines: List[str] = []
+        for m in tail:
+            role = m.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            label = "Пользователь" if role == "user" else "Ассистент"
+            lines.append(f"{label}: {content[:450]}")
+        if not lines:
+            return ""
+        return "Недавний диалог (учитывай местоимения «это», «оно», «его»):\n" + "\n".join(lines)
+
     def _interpret_command_with_ai(self, query: str) -> dict | None:
         if not self._ai_client or not self._ai_client.is_enabled():
             return None
@@ -110,27 +288,40 @@ class Executor:
         if not text:
             return None
 
+        recap = self._dialog_context_recap_for_command_ai()
+        if recap:
+            text = f"{recap}\n\n---\nТекущая фраза пользователя: {text}"
+
         system_prompt = (
-            "Ты интерпретатор команд ассистента. Доступные команды:\n"
+            "Ты интерпретатор команд ассистента. Ты НЕ ведёшь беседу и НЕ отвечаешь текстом пользователю — "
+            "только один JSON-объект.\n"
+            "Доступные команды:\n"
             "- set_volume(value 0..100)\n"
             "- volume_up(delta 1..100)\n"
             "- volume_down(delta 1..100)\n"
-            "- browser_navigate — открыть сайт или страницу\n"
+            "- browser_navigate — открыть сайт или страницу в браузере пользователя\n"
             "- browser_search(query) — общий поиск в браузере (Google), если нельзя дать точный URL\n"
+            "Любая явная просьба открыть сайт, страницу, поиск, Кинопоиск, YouTube и т.п. — это mode=command, "
+            "НЕ chat. Не отказывайся от «открытия» на уровне интерпретатора.\n"
             "Для browser_navigate ты сам выбираешь ресурс и формат:\n"
             "- По возможности верни готовый безопасный URL в slots.url (только http или https, полная ссылка).\n"
             "- Главная страница сайта: slots.url вида https://www.youtube.com/ или https://github.com/\n"
-            "- Поиск внутри сайта (канал на YouTube, репозиторий на GitHub и т.д.): slots.url с корректным "
-            "адресом страницы поиска или результатов на этом сайте (например youtube.com/results?search_query=...).\n"
+            "- Поиск внутри сайта (канал на YouTube, репозиторий на GitHub, карточка на Кинопоиске и т.д.): slots.url "
+            "с корректным адресом поиска/выдачи на ЭТОМ сайте.\n"
+            "- Кинопоиск: для поиска фильма/аниме используй slots.url вида "
+            "https://www.kinopoisk.ru/index.php?kp_query=<название в URL-кодировке>, "
+            "например запрос «Берсерк»: "
+            "https://www.kinopoisk.ru/index.php?kp_query=%D0%91%D0%B5%D1%80%D1%81%D0%B5%D1%80%D0%BA\n"
+            "- Если в текущей фразе «это/оно» — восстанови предмет по Недавнему диалогу (название, тема) и подставь в URL или query.\n"
             "- Если точный URL сформировать нельзя, можно вернуть slots.site и slots.query (коротко: что за площадка и что искать); "
             "исполнитель откроет безопасный поиск, не подставляя списки сайтов из кода.\n"
             "- Не придумывай опасные схемы (file:, javascript:, data: и т.п.).\n"
             "Пример: 'открой канал MrBeast на YouTube' -> "
             "{\"mode\":\"command\",\"intent\":\"browser_navigate\","
             "\"slots\":{\"url\":\"https://www.youtube.com/results?search_query=MrBeast\"}}\n"
-            "Если фраза — команда, верни только JSON:\n"
+            "Если фраза — команда (включая открытие сайтов), верни только JSON:\n"
             "{\"mode\":\"command\",\"intent\":\"...\",\"slots\":{...}}\n"
-            "Если это не команда, верни:\n"
+            "Только если это действительно нейтральный вопрос без действий (чистая беседа), верни:\n"
             "{\"mode\":\"chat\"}\n"
             "Никакого текста вне JSON."
         )
@@ -138,7 +329,7 @@ class Executor:
             text,
             history=None,
             system_prompt=system_prompt,
-            max_tokens=140,
+            max_tokens=220,
             temperature=0.0,
         )
         if not raw:
@@ -148,6 +339,169 @@ class Executor:
         except Exception:
             return None
         return self._validate_ai_command_payload(payload)
+
+    def _try_unified_ai_turn(self, query: str, now_ts: float) -> bool:
+        """Один AI-вызов: reply (текст) или action (валидированная команда)."""
+        if not self._ai_client or not self._ai_client.is_enabled():
+            return False
+        text = (query or "").strip()
+        if not text:
+            return False
+
+        info_lock = looks_like_informational_without_explicit_action(text)
+        self._log(
+            f"[DEBUG] Unified AI turn, model={getattr(self._ai_client, 'model', '?')}, "
+            f"history_pairs~{len(self._chat_history) // 2}, informational_lock={info_lock}"
+        )
+
+        # Локальные правила памяти остаются включенными, чтобы не терять факты.
+        self.memory.learn_from_user_text(text)
+        memory_context = self.memory.build_context(text, top_k=4, for_cloud=True)
+        request_history = self._build_ai_request_history(memory_context)
+
+        recap = self._dialog_context_recap_for_command_ai()
+        user_payload = text
+        if recap:
+            user_payload = f"{recap}\n\n---\nТекущая фраза пользователя: {text}"
+
+        system_prompt = unified_turn_system_prompt(informational_lock=info_lock)
+        last_error_text = None
+        response = None
+        for attempt in range(2):
+            response = self._ai_client.get_response(
+                user_payload,
+                history=request_history,
+                system_prompt=system_prompt,
+                max_tokens=650,
+                temperature=0.15,
+            )
+            last_error_text = getattr(self._ai_client, "last_error", None)
+
+            if response:
+                break
+
+            empty_err = last_error_text and "пуст" in last_error_text.lower()
+            rate_limited = last_error_text and "429" in last_error_text
+
+            if attempt == 0 and empty_err:
+                self._log("[DEBUG] Unified AI: пустой ответ, повтор")
+                continue
+
+            if rate_limited or (
+                attempt == 0 and last_error_text and "ограничил" in last_error_text.lower()
+            ):
+                break
+
+        if not response:
+            return False
+
+        parsed = parse_unified_model_output(response)
+        if not parsed:
+            parsed = {"mode": "reply", "message": response.strip()}
+
+        if parsed.get("mode") == "action":
+            intent_name = str(parsed.get("intent") or "")
+            if info_lock and intent_name in ("browser_navigate", "browser_search"):
+                self._log("[DEBUG] Unified AI: браузерное действие отклонено (информационный запрос)")
+                response2 = self._ai_client.get_response(
+                    text,
+                    history=request_history,
+                    system_prompt=REPLY_ONLY_AFTER_MISROUTING_PROMPT,
+                    max_tokens=600,
+                    temperature=0.25,
+                )
+                if response2 and response2.strip():
+                    parsed = {"mode": "reply", "message": response2.strip()}
+                else:
+                    parsed = {
+                        "mode": "reply",
+                        "message": "Могу рассказать текстом или открыть сайт — скажи, что нужно.",
+                    }
+
+        if parsed.get("mode") == "action":
+            legacy = {
+                "mode": "command",
+                "intent": parsed.get("intent"),
+                "slots": parsed.get("slots") if isinstance(parsed.get("slots"), dict) else {},
+            }
+            ai_intent = self._validate_ai_command_payload(legacy)
+            if not ai_intent:
+                self._log("[DEBUG] Unified AI: структура действия не прошла валидацию — ответ текстом")
+                fallback = parsed.get("message")
+                if isinstance(fallback, str) and fallback.strip():
+                    parsed = {"mode": "reply", "message": fallback.strip()}
+                else:
+                    response3 = self._ai_client.get_response(
+                        text,
+                        history=request_history,
+                        system_prompt=REPLY_ONLY_AFTER_MISROUTING_PROMPT,
+                        max_tokens=500,
+                        temperature=0.25,
+                    )
+                    if response3 and response3.strip():
+                        parsed = {"mode": "reply", "message": response3.strip()}
+                    else:
+                        return False
+            else:
+                self._log(f"[DEBUG] Unified AI command: {ai_intent['type']}")
+                try:
+                    self.run(ai_intent)
+                    self._log("✅ Готово.")
+                    self._append_chat_message("user", text)
+                    ack = parsed.get("message") if isinstance(parsed.get("message"), str) else None
+                    if not (ack and ack.strip()):
+                        ack = self._brief_ack_for_command(ai_intent, text)
+                    self._append_chat_message("assistant", ack.strip())
+                    self._save_chat_history()
+                    self._last_ai_at = now_ts
+                    return True
+                except Exception as error:
+                    self._log(f"❌ Ошибка выполнения AI-команды: {error}")
+                    logger.exception("Unified AI command failed")
+                    return False
+
+        if parsed.get("mode") == "reply":
+            message = parsed.get("message")
+            if not isinstance(message, str) or not message.strip():
+                return False
+            self._extract_memory_with_ai(text)
+            self._append_chat_message("user", text)
+            self._append_chat_message("assistant", message.strip())
+            self._save_chat_history()
+            self._last_ai_at = now_ts
+            self._log(f"🤖 AI: {message.strip()}")
+            return True
+
+        return False
+
+    def _brief_ack_for_command(self, intent: dict, user_query: str) -> str:
+        """Короткая реплика для истории чата (чтобы следующие фразы вроде «это» ссылались на контекст)."""
+        t = intent.get("type")
+        slots = intent.get("slots") or {}
+        q = (user_query or "").strip()
+        q_short = q[:200] if q else ""
+        if t == "browser_navigate":
+            url = (slots.get("url") or "").strip()
+            if "google.com/search" in url or "google.ru/search" in url:
+                return (
+                    "Открыл поиск в Google. "
+                    f"Запрос пользователя: {q_short}" if q_short else "Открыл поиск в Google."
+                )
+            if "kinopoisk" in url.lower():
+                return "Открыл поиск на Кинопоиске по твоему запросу."
+            return "Открыл страницу в браузере."
+        if t == "browser_search":
+            inner = (slots.get("query") or "").strip()
+            return (
+                f"Открыл поиск в браузере: {inner[:150]}" if inner else "Открыл поиск в браузере."
+            )
+        if t == "set_volume":
+            return f"Громкость установлена на {slots.get('value')}%."
+        if t == "volume_up":
+            return f"Сделал громче на {slots.get('delta', 10)}."
+        if t == "volume_down":
+            return f"Сделал тише на {slots.get('delta', 10)}."
+        return "Выполнил команду."
 
     def _resolve_site_home_url_with_ai(self, site_name: str) -> str | None:
         """Попросить AI вернуть главную http(s)-ссылку сайта по названию."""
@@ -165,6 +519,39 @@ class Executor:
                 "Только главная страница сайта. Только http/https."
             ),
             max_tokens=70,
+            temperature=0.0,
+        )
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        url = str(payload.get("url") or "").strip()
+        if not self._is_safe_http_url(url):
+            return None
+        return url
+
+    def _resolve_site_query_url_with_ai(self, site_name: str, query: str) -> str | None:
+        """Попросить AI вернуть прямую URL-ссылку страницы/канала на указанном сайте."""
+        if not self._ai_client or not self._ai_client.is_enabled():
+            return None
+        site = (site_name or "").strip()
+        q = (query or "").strip()
+        if not site or not q:
+            return None
+        raw = self._ai_client.get_response(
+            f"Сайт: {site}\nЗапрос пользователя: {q}",
+            history=None,
+            system_prompt=(
+                "Ты URL-resolver. Нужно найти наиболее вероятную ПРЯМУЮ ссылку страницы на указанном сайте "
+                "(статья, канал, профиль, карточка). Верни строго JSON: "
+                "{\"url\":\"https://...\"}. Только http/https. Если уверен только в странице поиска на сайте, "
+                "верни URL поиска на этом же сайте. Никакого текста вне JSON."
+            ),
+            max_tokens=100,
             temperature=0.0,
         )
         if not raw:
@@ -270,6 +657,10 @@ class Executor:
                     resolved = self._resolve_site_home_url_with_ai(site)
                     if resolved:
                         return {"type": "browser_navigate", "slots": {"url": resolved}}
+                # URL-first: сначала пробуем получить прямую страницу/канал на нужном сайте.
+                resolved_query_url = self._resolve_site_query_url_with_ai(site, query)
+                if resolved_query_url:
+                    return {"type": "browser_navigate", "slots": {"url": resolved_query_url}}
                 combined = f"{site} {query}".strip()
                 url = self._google_search_url(combined)
                 return {"type": "browser_navigate", "slots": {"url": url}}
@@ -295,6 +686,157 @@ class Executor:
         logger.info(message)
         if self.log_callback:
             self.log_callback(message)
+
+    def _ai_settings(self) -> dict:
+        raw = self.config.get("ai", {})
+        return raw if isinstance(raw, dict) else {}
+
+    def _apply_context_config(self):
+        ai = self._ai_settings()
+        try:
+            self._chat_history_limit_pairs = max(4, int(ai.get("context_max_pairs_disk", 24)))
+        except Exception:
+            self._chat_history_limit_pairs = 24
+
+    def _load_session_summary(self):
+        try:
+            if not self._session_summary_path.exists():
+                self._session_summary = ""
+                return
+            text = self._session_summary_path.read_text(encoding="utf-8").strip()
+            self._session_summary = text
+        except Exception as error:
+            logger.warning(f"Не удалось загрузить session summary: {error}")
+            self._session_summary = ""
+
+    def _save_session_summary(self):
+        try:
+            self._session_summary_path.parent.mkdir(parents=True, exist_ok=True)
+            cap = int(self._ai_settings().get("context_max_chars_session_summary", 1200))
+            body = self._clip_text_for_context(self._session_summary, cap)
+            self._session_summary = body
+            self._session_summary_path.write_text(body, encoding="utf-8")
+        except Exception as error:
+            logger.warning(f"Не удалось сохранить session summary: {error}")
+
+    @staticmethod
+    def _clip_text_for_context(text: str, max_chars: int) -> str:
+        if max_chars <= 0:
+            return ""
+        s = (text or "").strip()
+        if not s:
+            return ""
+        if len(s) <= max_chars:
+            return s
+        return s[: max_chars - 1] + "…"
+
+    @staticmethod
+    def _trim_messages_to_char_budget(messages: List[Dict[str, str]], max_chars: int) -> List[Dict[str, str]]:
+        if max_chars <= 0:
+            return []
+        trimmed = list(messages)
+        while trimmed and sum(len(m.get("content", "")) for m in trimmed) > max_chars:
+            trimmed.pop(0)
+        return trimmed
+
+    def _summarize_dialog_chunk(
+        self, messages: List[Dict[str, str]], prior_summary: str
+    ) -> str | None:
+        if not self._ai_client or not self._ai_client.is_enabled():
+            return None
+        if not messages:
+            return None
+        lines: List[str] = []
+        for item in messages:
+            role = item.get("role")
+            content = (item.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "user":
+                lines.append(f"Пользователь: {content}")
+            elif role == "assistant":
+                lines.append(f"Ассистент: {content}")
+        if not lines:
+            return None
+        block = "\n".join(lines)
+        prior = (prior_summary or "").strip() or "нет."
+        prompt = (
+            "Обнови краткий конспект диалога: 3–6 коротких пунктов на русском "
+            "(только устойчивые факты, решения, открытые вопросы).\n"
+            f"Уже зафиксировано:\n{prior}\n\nНовый фрагмент:\n{block}\n\n"
+            "Ответ только маркированный список (- …), без вступлений."
+        )
+        ai = self._ai_settings()
+        raw = self._ai_client.get_response(
+            prompt,
+            history=None,
+            system_prompt="Ты помощник для сжатия диалога. Будь краток.",
+            max_tokens=int(ai.get("context_summary_max_tokens", 220)),
+            temperature=0.2,
+        )
+        raw = (raw or "").strip()
+        return raw or None
+
+    def _maybe_roll_session_summary(self):
+        if not self._ai_client or not self._ai_client.is_enabled():
+            return
+        ai = self._ai_settings()
+        try:
+            after_pairs = int(ai.get("context_summarize_after_pairs", 5))
+            keep_pairs = int(ai.get("context_recent_pairs", 3))
+        except Exception:
+            after_pairs, keep_pairs = 5, 3
+        if after_pairs < 1 or keep_pairs < 1:
+            return
+        pairs = len(self._chat_history) // 2
+        if pairs <= after_pairs:
+            return
+        keep_msgs = keep_pairs * 2
+        chunk = self._chat_history[:-keep_msgs] if keep_msgs else list(self._chat_history)
+        if not chunk:
+            return
+        new_summary = self._summarize_dialog_chunk(chunk, self._session_summary)
+        if new_summary:
+            cap = int(ai.get("context_max_chars_session_summary", 1200))
+            self._session_summary = self._clip_text_for_context(new_summary, cap)
+            self._save_session_summary()
+            self._log("[DEBUG] Сжат фрагмент диалога в session summary")
+            self._chat_history = self._chat_history[-keep_msgs:] if keep_msgs else []
+            self._save_chat_history()
+        else:
+            logger.warning("Не удалось сжать историю; сохраняю старые реплики без удаления.")
+
+    def _build_ai_request_history(self, memory_context: str) -> List[Dict[str, str]]:
+        """История для chat completions: summary (system) + memory (system) + недавние реплики с бюджетом."""
+        self._maybe_roll_session_summary()
+        ai = self._ai_settings()
+        try:
+            cap_summary = int(ai.get("context_max_chars_session_summary", 1200))
+            cap_memory = int(ai.get("context_max_chars_memory", 2500))
+            cap_history = int(ai.get("context_max_chars_history", 8000))
+        except Exception:
+            cap_summary, cap_memory, cap_history = 1200, 2500, 8000
+
+        prefix: List[Dict[str, str]] = []
+        summary = self._clip_text_for_context(self._session_summary, cap_summary)
+        if summary:
+            prefix.append(
+                {
+                    "role": "system",
+                    "content": "Кратко о прошлом диалоге (для контекста):\n" + summary,
+                }
+            )
+        mem = self._clip_text_for_context(memory_context, cap_memory)
+        if mem:
+            prefix.append(
+                {
+                    "role": "system",
+                    "content": "Память о пользователе (учитывай при ответе):\n" + mem,
+                }
+            )
+
+        core = self._trim_messages_to_char_budget(list(self._chat_history), cap_history)
+        return prefix + core
 
     def _load_chat_history(self):
         try:
@@ -361,6 +903,12 @@ class Executor:
             self._log(f"[DEBUG] Сброс чат-истории: {reason}")
         self._chat_history = []
         self._last_ai_at = None
+        self._session_summary = ""
+        try:
+            if self._session_summary_path.exists():
+                self._session_summary_path.unlink()
+        except Exception as error:
+            logger.debug(f"Не удалось удалить session summary: {error}")
         self._save_chat_history()
 
     def reset_user_memory(self):
@@ -373,6 +921,7 @@ class Executor:
     def load_config(self):
         """Перезагружает конфигурацию из файла"""
         self.config = self._load_default_config()
+        self._apply_context_config()
         self._init_ai_assistant()
 
     def _init_ai_assistant(self):
@@ -408,7 +957,8 @@ class Executor:
                 max_tokens=int(ai_config.get("max_tokens", 220)),
                 system_prompt=ai_config.get(
                     "system_prompt",
-                    "Ты голосовой ассистент Джарвис. Отвечай кратко и по делу на русском языке.",
+                    "Ты голосовой ассистент Джарвис на ПК пользователя; исполнитель открывает браузер по командам. "
+                    "Не утверждай, что не можешь открывать сайты. Отвечай кратко по-русски.",
                 ),
             )
             logger.info("AI assistant initialized (OpenAI)")
@@ -422,11 +972,21 @@ class Executor:
             self._log("🗣 Оффлайн fallback: не понял команду")
             return False
 
+        pending_query = self._try_consume_pending_clarification(query)
+        if pending_query == "":
+            return True
+        if pending_query:
+            query = pending_query
+
         self._log(f"[DEBUG] Unknown command -> AI, len={len(query)}")
 
         normalized_query = query.lower().strip(" .,!?")
         if normalized_query in self._reset_phrases:
             self.reset_chat_history("голосовая команда")
+            self._log("🤖 Контекст очищен")
+            return True
+        if self._looks_like_reset_context_phrase(normalized_query):
+            self.reset_chat_history("голосовая команда (fuzzy)")
             self._log("🤖 Контекст очищен")
             return True
 
@@ -448,69 +1008,92 @@ class Executor:
             self._log(f"🤖 Память: {self.memory.describe_profile()}")
             return True
 
+        if normalized_query in {"покажи факты обо мне", "покажи факты", "какие факты обо мне"}:
+            self._log(f"🤖 Факты:\n{self.memory.describe_profile()}")
+            return True
+
+        if normalized_query in {"покажи историю", "покажи контекст", "что в истории"}:
+            if not self._chat_history:
+                self._log("🤖 История пуста.")
+                return True
+            tail = self._chat_history[-6:]
+            lines: List[str] = []
+            for item in tail:
+                role = item.get("role")
+                content = (item.get("content") or "").strip()
+                if not content or role not in {"user", "assistant"}:
+                    continue
+                label = "Ты" if role == "user" else "Jarvis"
+                lines.append(f"{label}: {content[:180]}")
+            if not lines:
+                self._log("🤖 История пуста.")
+                return True
+            self._log("🤖 Недавняя история:\n" + "\n".join(lines))
+            return True
+
+        if normalized_query in {
+            "забудь это",
+            "забудь последнее",
+            "удали последнее",
+            "удали последнее из памяти",
+        }:
+            forgotten = self.memory.forget_last_entry()
+            if forgotten:
+                self._log(f"🤖 Удалил последнюю запись: {forgotten}")
+            else:
+                self._log("🤖 Удалять нечего — список записей пуст.")
+            return True
+
+        topic_forget = re.match(r"^забудь\s+(?:про|об)\s+(.+)$", normalized_query)
+        if topic_forget:
+            topic = topic_forget.group(1).strip()
+            forgotten = self.memory.forget_matching_substring(topic)
+            if forgotten:
+                self._log(f"🤖 Удалил запись, где встречалось «{topic}»: {forgotten}")
+            else:
+                self._log(f"🤖 Не нашёл запись по фрагменту «{topic}».")
+            return True
+
+        fact_forget = re.match(r"^(?:удали|забудь)\s+факт\s+(.+)$", normalized_query)
+        if fact_forget:
+            topic = fact_forget.group(1).strip()
+            forgotten = self.memory.remove_fact_by_substring(topic)
+            if forgotten:
+                self._log(f"🤖 Удалил факт: {forgotten}")
+            else:
+                self._log(f"🤖 Факт по «{topic}» не найден.")
+            return True
+
+        if normalized_query in {"очисти временную память", "очисти сессионную память"}:
+            self.memory.clear_session_layer()
+            self._log("🤖 Временная память очищена.")
+            return True
+
+        missing = self._detect_missing_args(query)
+        if missing:
+            kind, question = missing
+            self._pending_clarification = {
+                "kind": kind,
+                "expires_at": time.time() + 15,
+            }
+            self._log(f"🤖 {question}")
+            return True
+
         now_ts = time.time()
         if self._last_ai_at and (now_ts - self._last_ai_at) > self._chat_reset_timeout:
             self.reset_chat_history("долгая пауза")
 
         if self._ai_client and self._ai_client.is_enabled():
-            ai_intent = self._interpret_command_with_ai(query)
-            if ai_intent:
-                self._log(f"[DEBUG] AI command intent: {ai_intent['type']}")
-                try:
-                    self.run(ai_intent)
-                    self._log("✅ Готово.")
-                    return True
-                except Exception as error:
-                    self._log(f"❌ Ошибка выполнения AI-команды: {error}")
-                    logger.exception("AI interpreted command failed")
-
-            self._log(
-                f"[DEBUG] AI client present, model={getattr(self._ai_client, 'model', '?')}, history={len(self._chat_history)}"
-            )
-
-            last_error_text = None
-            response = None
-            self._extract_memory_with_ai(query)
-            self.memory.learn_from_user_text(query)
-            request_history = list(self._chat_history)
-            memory_context = self.memory.build_context(query, top_k=4)
-            if memory_context:
-                request_history.append(
-                    {
-                        "role": "system",
-                        "content": "Память о пользователе (учитывай при ответе):\n" + memory_context,
-                    }
-                )
-            for attempt in range(2):
-                response = self._ai_client.get_response(query, history=request_history)
-                last_error_text = getattr(self._ai_client, "last_error", None)
-
-                if response:
-                    break
-
-                empty_err = last_error_text and "пуст" in last_error_text.lower()
-                rate_limited = last_error_text and "429" in last_error_text
-
-                if attempt == 0 and empty_err:
-                    self._log("[DEBUG] AI вернул пустой ответ, пробую ещё раз")
-                    continue
-
-                if rate_limited or (attempt == 0 and last_error_text and "ограничил" in last_error_text.lower()):
-                    # Не крутим бесконечно на rate-limit
-                    break
-
-            if response:
-                self._append_chat_message("user", query)
-                self._append_chat_message("assistant", response)
-                self._save_chat_history()
-                self._last_ai_at = now_ts
-                self._log(f"🤖 AI: {response}")
+            if self._try_unified_ai_turn(query, now_ts):
                 return True
-
+            last_error_text = getattr(self._ai_client, "last_error", None)
             if last_error_text:
                 self._log(f"⚠ AI недоступен: {last_error_text}")
             else:
                 self._log("⚠ AI недоступен: нет текста и нет last_error")
+        else:
+            # Если AI выключен/недоступен — память пополняем только локальными правилами.
+            self.memory.learn_from_user_text(query)
 
         self._log("🗣 Оффлайн fallback: не понял команду")
         return False
@@ -605,6 +1188,20 @@ class Executor:
     def _resolve_site_target(self, target: str) -> str:
         """Только опциональные подсказки из config.json (sites); без встроенного словаря сайтов."""
         normalized = target.strip().lower()
+        builtins = {
+            "microsoft teams": "teams.microsoft.com",
+            "teams": "teams.microsoft.com",
+            "майкрософт тимс": "teams.microsoft.com",
+            "тимс": "teams.microsoft.com",
+            "whatsapp": "web.whatsapp.com",
+            "ватсап": "web.whatsapp.com",
+            "ватсапп": "web.whatsapp.com",
+            "вотсап": "web.whatsapp.com",
+            "вацап": "web.whatsapp.com",
+        }
+        if normalized in builtins:
+            return builtins[normalized]
+
         site_aliases = dict(self.config.get("sites", {}))
         if not isinstance(site_aliases, dict):
             site_aliases = {}
@@ -954,11 +1551,42 @@ class Executor:
         if not browser_cmd:
             return False
         try:
-            subprocess.Popen([browser_cmd, url], shell=False)
+            is_running = self._is_preferred_browser_running(browser_cmd)
+            if is_running and self._supports_new_tab_flag(browser_cmd):
+                subprocess.Popen([browser_cmd, "--new-tab", url], shell=False)
+            else:
+                subprocess.Popen([browser_cmd, url], shell=False)
             return True
         except Exception as error:
             logger.warning(f"Не удалось открыть предпочтительный браузер '{browser_cmd}': {error}")
             return False
+
+    @staticmethod
+    def _supports_new_tab_flag(browser_cmd: str) -> bool:
+        name = Path((browser_cmd or "").strip()).name.lower()
+        return any(x in name for x in ("chrome", "msedge", "edge", "brave", "opera", "vivaldi", "yandex"))
+
+    @staticmethod
+    def _is_preferred_browser_running(browser_cmd: str) -> bool:
+        if psutil is None:
+            return False
+        exe_name = Path((browser_cmd or "").strip()).name.lower()
+        if not exe_name:
+            return False
+        try:
+            for proc in psutil.process_iter(["name", "exe", "cmdline"]):
+                try:
+                    name = (proc.info.get("name") or "").lower()
+                    exe = Path(proc.info.get("exe") or "").name.lower()
+                    cmdline = proc.info.get("cmdline") or []
+                    cmd0 = Path(cmdline[0]).name.lower() if cmdline else ""
+                except Exception:
+                    continue
+                if exe_name in {name, exe, cmd0}:
+                    return True
+        except Exception:
+            return False
+        return False
     
     # ============ Media Commands ============
     def media_play(self):

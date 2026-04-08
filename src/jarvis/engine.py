@@ -437,6 +437,34 @@ class JarvisEngine:
         return text
 
     def _execute_intent_if_valid(self, source_text: str):
+        raw_text = (source_text or "").strip()
+
+        # Шаг подтверждения рискованных действий.
+        try:
+            handled, confirmed_intent, confirm_state = self.ex.pending_confirmation_from_text(raw_text)
+        except Exception:
+            handled, confirmed_intent, confirm_state = (False, None, None)
+        if handled:
+            if confirm_state == "cancel":
+                self.log("🛑 Действие отменено.")
+                self.log(f"[PIPE] text='{raw_text}' -> intent='confirm' -> result='cancelled'")
+                return True
+            if confirmed_intent:
+                try:
+                    self.ex.run(confirmed_intent)
+                    self.log("✅ Подтвержденное действие выполнено.")
+                    self.log(
+                        f"[PIPE] text='{raw_text}' -> intent='{confirmed_intent.get('type')}' -> result='ok' reason='confirmed'"
+                    )
+                    return True
+                except Exception as error:
+                    self.log(f"❌ Ошибка выполнения подтвержденного действия: {error}")
+                    logger.exception("Confirmed executor run failed")
+                    self.log(
+                        f"[PIPE] text='{raw_text}' -> intent='{confirmed_intent.get('type')}' -> result='error'"
+                    )
+                    return False
+
         try:
             intent = self.nlu.parse(source_text)
         except Exception as error:
@@ -446,10 +474,15 @@ class JarvisEngine:
 
         if intent.get("type") == "unknown":
             try:
-                return self.ex.handle_unrecognized_command(source_text)
+                handled = self.ex.handle_unrecognized_command(source_text)
+                self.log(
+                    f"[PIPE] text='{raw_text}' -> intent='unknown' -> result='{'ok' if handled else 'fallback'}'"
+                )
+                return handled
             except Exception as error:
                 self.log(f"❌ Ошибка AI fallback: {error}")
                 logger.exception("AI fallback failed")
+                self.log(f"[PIPE] text='{raw_text}' -> intent='unknown' -> result='error'")
                 return False
 
         confidence = intent.get("confidence")
@@ -458,13 +491,22 @@ class JarvisEngine:
             return False
 
         self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
+        if hasattr(self.ex, "should_require_confirmation") and self.ex.should_require_confirmation(intent):
+            prompt = self.ex.queue_confirmation(intent)
+            self.log(f"⚠ {prompt}")
+            self.log(
+                f"[PIPE] text='{raw_text}' -> intent='{intent.get('type')}' -> result='pending_confirmation'"
+            )
+            return True
         try:
             self.ex.run(intent)
         except Exception as error:
             self.log(f"❌ Ошибка выполнения команды: {error}")
             logger.exception("Executor run failed")
+            self.log(f"[PIPE] text='{raw_text}' -> intent='{intent.get('type')}' -> result='error'")
             return False
         self.log("✅ Готово.")
+        self.log(f"[PIPE] text='{raw_text}' -> intent='{intent.get('type')}' -> result='ok'")
         return True
 
     def _expire_continuous_if_needed(self, now: float | None = None) -> bool:

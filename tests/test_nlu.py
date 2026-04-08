@@ -76,22 +76,37 @@ class TestSimpleNLU(unittest.TestCase):
         intent = self.nlu.parse("открой блокнот")
         self.assertEqual(intent["type"], "open_app")
         self.assertEqual(intent["slots"]["target"], "notepad")
+
+    def test_open_app_target_in_browser_phrase(self):
+        intent = self.nlu.parse("открой ватсап в браузере")
+        self.assertEqual(intent["type"], "open_app")
+        self.assertEqual(intent["slots"]["target"], "whatsapp")
+
+    def test_generic_open_commands_are_unknown_for_clarification(self):
+        intent = self.nlu.parse("открой сайт")
+        self.assertEqual(intent["type"], "unknown")
+        intent = self.nlu.parse("открой программу")
+        self.assertEqual(intent["type"], "unknown")
+        intent = self.nlu.parse("поставь громкость")
+        self.assertEqual(intent["type"], "unknown")
     
     def test_volume_down(self):
         """Распознавание команды уменьшить громкость"""
         intent = self.nlu.parse("сделай тише")
-        self.assertEqual(intent["type"], "volume_down")
-        self.assertIn("delta", intent["slots"])
+        self.assertEqual(intent["type"], "unknown")
         
         intent = self.nlu.parse("убавь громкость на 30")
         self.assertEqual(intent["type"], "volume_down")
         self.assertEqual(intent["slots"]["delta"], 30)
+
+        intent = self.nlu.parse("надо сделать громкость на десять меньше")
+        self.assertEqual(intent["type"], "volume_down")
+        self.assertEqual(intent["slots"]["delta"], 10)
     
     def test_volume_up(self):
         """Распознавание команды увеличить громкость"""
         intent = self.nlu.parse("сделай громче")
-        self.assertEqual(intent["type"], "volume_up")
-        self.assertIn("delta", intent["slots"])
+        self.assertEqual(intent["type"], "unknown")
         
         intent = self.nlu.parse("добавь громкость на 25")
         self.assertEqual(intent["type"], "volume_up")

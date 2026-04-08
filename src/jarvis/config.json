@@ -1,8 +1,8 @@
 {
   "audio": {
     "microphone_name": "1: Microphone (G435 Wireless Gamin",
-    "phrase_timeout": 8.0,
-    "silence_timeout": 1.1,
+    "phrase_timeout": 9.0,
+    "silence_timeout": 1.8,
     "wake_engine": "porcupine",
     "ptt_hotkey": "f6"
   },
@@ -13,7 +13,14 @@
     "model": "gpt-4o-mini",
     "timeout_seconds": 20,
     "max_tokens": 220,
-    "system_prompt": "Ты голосовой ассистент Джарвис. Отвечай кратко и по делу на русском языке."
+    "system_prompt": "Ты голосовой ассистент Джарвис на компьютере пользователя. У тебя есть интеграция с браузером: по голосовым командам исполнитель может открывать сайты и поиск. Никогда не говори, что ты «не можешь открывать сайты» или «у тебя нет доступа в интернет» — если пользователь просит открыть ресурс, кратко соглашайся или предложи переформулировку («открой … на Кинопоиске», «найди … в Google»). Отвечай кратко и по делу на русском.",
+    "context_recent_pairs": 3,
+    "context_summarize_after_pairs": 5,
+    "context_max_pairs_disk": 24,
+    "context_max_chars_history": 8000,
+    "context_max_chars_memory": 2500,
+    "context_max_chars_session_summary": 1200,
+    "context_summary_max_tokens": 220
   },
   "apps": {
     "browser": "C:/Program Files/Google/Chrome/Application/chrome.exe",

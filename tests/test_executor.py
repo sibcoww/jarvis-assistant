@@ -113,8 +113,29 @@ class TestExecutorBrowserCommands(unittest.TestCase):
             mock_popen.assert_called_once()
             args = mock_popen.call_args.args[0]
             self.assertIn("chrome.exe", args[0].lower())
-            self.assertIn("https://google.com", args[1])
+            self.assertIn("https://google.com", args)
             mock_web_open.assert_not_called()
+
+    def test_open_preferred_browser_uses_new_tab_when_running(self):
+        ex = _make_executor({"apps": {"browser": "C:/Program Files/Google/Chrome/Application/chrome.exe"}})
+        with patch.object(ex, "_is_preferred_browser_running", return_value=True), patch(
+            "src.jarvis.executor.subprocess.Popen"
+        ) as mock_popen:
+            ok = ex._open_in_preferred_browser("https://google.com")
+            self.assertTrue(ok)
+            args = mock_popen.call_args.args[0]
+            self.assertEqual(args[1], "--new-tab")
+            self.assertEqual(args[2], "https://google.com")
+
+    def test_open_preferred_browser_launches_when_not_running(self):
+        ex = _make_executor({"apps": {"browser": "C:/Program Files/Google/Chrome/Application/chrome.exe"}})
+        with patch.object(ex, "_is_preferred_browser_running", return_value=False), patch(
+            "src.jarvis.executor.subprocess.Popen"
+        ) as mock_popen:
+            ok = ex._open_in_preferred_browser("https://google.com")
+            self.assertTrue(ok)
+            args = mock_popen.call_args.args[0]
+            self.assertEqual(args[1], "https://google.com")
     
     def test_browser_search(self):
         ex = _make_executor({})
@@ -138,6 +159,18 @@ class TestExecutorBrowserCommands(unittest.TestCase):
             mock_open.assert_called_once()
             called_url = mock_open.call_args.args[0]
             self.assertIn("youtube.com", called_url)
+
+    def test_open_app_builtin_site_alias_teams(self):
+        ex = _make_executor({})
+        ex._ai_client = None  # проверяем локальный fallback без AI
+
+        with patch("src.jarvis.executor.subprocess.Popen", side_effect=RuntimeError("no browser")), patch(
+            "src.jarvis.executor.webbrowser.open"
+        ) as mock_open:
+            ex.run({"type": "open_app", "slots": {"target": "microsoft teams"}})
+            mock_open.assert_called_once()
+            called_url = mock_open.call_args.args[0]
+            self.assertIn("teams.microsoft.com", called_url)
 
     def test_browser_navigate_vk_phrase_falls_back_to_search_without_config(self):
         ex = _make_executor({})

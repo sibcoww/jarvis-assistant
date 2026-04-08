@@ -63,6 +63,18 @@ class SimpleNLU:
 
     def parse(self, text: str) -> dict:
         t = text.lower()
+        t_clean = re.sub(r"\s+", " ", t).strip()
+
+        def _extract_target_before_browser_phrase(raw: str) -> str:
+            m = re.search(r"(?:открой|запусти|включи)\s+(.+?)\s+в\s+браузер[е]?", raw)
+            if not m:
+                return ""
+            candidate = (m.group(1) or "").strip(" .,!?")
+            if candidate in {"ватсап", "ватсапп", "whatsapp", "вотсап", "вацап"}:
+                return "whatsapp"
+            if candidate in {"телеграм", "телеграмм", "телеграмму", "telegram"}:
+                return "telegram"
+            return candidate
 
         # browser commands (проверяем ДО open_app чтобы не было конфликта)
         if "перейди на" in t or "открой сайт" in t:
@@ -90,12 +102,48 @@ class SimpleNLU:
         if any(w in t for w in ("назад", "предыдущая", "предыдущий")):
             return {"type": "media_previous", "slots": {}}
 
+        # volume up/down X (включая разговорные формулировки "на десять меньше/больше")
+        if t_clean in {"поставь громкость", "сделай громкость", "установи громкость", "громкость", "звук"}:
+            return {"type": "unknown", "slots": {"text": text}}
+
+        if "громк" in t or "звук" in t:
+            if any(p in t for p in ("меньше", "понизь", "пониже", "убав")):
+                delta = extract_number(text)
+                if delta is None:
+                    delta = 10
+                delta = max(1, min(100, int(delta)))
+                return {"type": "volume_down", "slots": {"delta": delta}}
+            if any(p in t for p in ("больше", "повысь", "повыше", "добав", "громче")):
+                delta = extract_number(text)
+                if delta is None:
+                    delta = 10
+                delta = max(1, min(100, int(delta)))
+                return {"type": "volume_up", "slots": {"delta": delta}}
+
         # open app
         if any(w in t for w in ("открой", "запусти", "включи")):
+            # Слишком общая команда -> пусть уйдет в AI/уточнение.
+            if t_clean in {
+                "открой сайт",
+                "открой программу",
+                "открой приложение",
+                "запусти программу",
+                "запусти приложение",
+            }:
+                return {"type": "unknown", "slots": {"text": text}}
+
+            # "открой X в браузере" -> X, а не сам browser.
+            if "браузер" in t:
+                extracted = _extract_target_before_browser_phrase(t)
+                if extracted and extracted not in {"браузер", "хром", "chrome"}:
+                    return {"type": "open_app", "slots": {"target": extracted}}
+
             if any(w in t for w in ("браузер", "хром", "chrome")):
                 return {"type": "open_app", "slots": {"target": "browser"}}
             if any(w in t for w in ("телеграм", "телеграмм", "телеграмму", "telegram")):
                 return {"type": "open_app", "slots": {"target": "telegram"}}
+            if any(w in t for w in ("ватсап", "ватсапп", "whatsapp", "вотсап", "вацап")):
+                return {"type": "open_app", "slots": {"target": "whatsapp"}}
             if any(w in t for w in ("vscode", "vs code", "вс код", "визуал студио код", "визу студию код")):
                 return {"type": "open_app", "slots": {"target": "vscode"}}
             if any(w in t for w in ("блокнот", "notepad", "блокноту")):
@@ -104,12 +152,16 @@ class SimpleNLU:
 
         # volume up/down X
         if "сделай тише" in t or "убавь громкость" in t:
-            m = re.search(r"(\d+)", t)
-            delta = int(m.group(1)) if m else 10
+            delta = extract_number(text)
+            if delta is None:
+                return {"type": "unknown", "slots": {"text": text}}
+            delta = int(delta)
             return {"type": "volume_down", "slots": {"delta": delta}}
         if "сделай громче" in t or "добавь громкость" in t:
-            m = re.search(r"(\d+)", t)
-            delta = int(m.group(1)) if m else 10
+            delta = extract_number(text)
+            if delta is None:
+                return {"type": "unknown", "slots": {"text": text}}
+            delta = int(delta)
             return {"type": "volume_up", "slots": {"delta": delta}}
 
         # scenario
@@ -128,6 +180,9 @@ class SimpleNLU:
         # open app (generic pattern)
         if t.startswith(("открой", "запусти")):
             target = t.replace("открой", "").replace("запусти", "").strip()
+            generic_targets = {"сайт", "программу", "программа", "приложение", "приложуху"}
+            if target in generic_targets:
+                return {"type": "unknown", "slots": {"text": text}}
             if target:
                 return {
                     "type": "open_app",

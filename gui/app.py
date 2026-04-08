@@ -12,13 +12,14 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
-    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle, QCheckBox, QLineEdit
+    QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle, QCheckBox, QLineEdit,
+    QListWidget, QListWidgetItem, QAbstractItemView,
 )
 
 import sounddevice as sd
 
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtCore import Signal, QObject, QTimer, QEvent
+from PySide6.QtCore import Signal, QObject, QTimer, QEvent, Qt
 
 from src.jarvis.engine import JarvisEngine
 from src.jarvis.key_store import ensure_keys_file, save_keys
@@ -58,9 +59,15 @@ class MainWindow(QMainWindow):
         # Вкладка 2: Настройки
         self.settings_tab = QWidget()
         self.setup_settings_tab()
+
+        self.memory_tab = QWidget()
+        self.setup_memory_tab()
         
         self.tabs.addTab(self.main_tab, "Основное")
         self.tabs.addTab(self.settings_tab, "Настройки")
+        self.tabs.addTab(self.memory_tab, "Память")
+
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         
         self.setCentralWidget(self.tabs)
 
@@ -181,6 +188,65 @@ class MainWindow(QMainWindow):
         layout.addLayout(button_layout)
         
         self.main_tab.setLayout(layout)
+
+    def setup_memory_tab(self):
+        layout = QVBoxLayout()
+        hint = QLabel(
+            "Локальные записи памяти. Помеченные 🔒 как не для облака: такие строки не подмешиваются "
+            "в запрос к онлайн-AI, но остаются у тебя на диске в ~/.jarvis/."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.memory_list = QListWidget()
+        self.memory_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        layout.addWidget(self.memory_list)
+        row = QHBoxLayout()
+        btn_refresh = QPushButton("Обновить")
+        btn_refresh.clicked.connect(self.refresh_memory_list)
+        btn_delete = QPushButton("Удалить выбранные")
+        btn_delete.clicked.connect(self.delete_selected_memories)
+        btn_clear_session = QPushButton("Очистить session-слой")
+        btn_clear_session.clicked.connect(self.clear_session_memories)
+        row.addWidget(btn_refresh)
+        row.addWidget(btn_delete)
+        row.addWidget(btn_clear_session)
+        layout.addLayout(row)
+        self.memory_tab.setLayout(layout)
+
+    def on_tab_changed(self, index):
+        if self.tabs.widget(index) is self.memory_tab:
+            self.refresh_memory_list()
+
+    def refresh_memory_list(self):
+        self.memory_list.clear()
+        try:
+            rows = self.engine.ex.memory.list_memories_for_ui(100)
+        except Exception as error:
+            self.memory_list.addItem(QListWidgetItem(f"Ошибка загрузки памяти: {error}"))
+            return
+        for row in rows:
+            mid = row.get("id") or ""
+            layer = row.get("layer") or "?"
+            prefix = "🔒 " if row.get("sensitive") else ""
+            text = str(row.get("text") or "")[:400]
+            label = f"{prefix}[{layer}] {text}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, mid)
+            self.memory_list.addItem(item)
+        if self.memory_list.count() == 0:
+            self.memory_list.addItem(QListWidgetItem("(пусто)"))
+
+    def delete_selected_memories(self):
+        store = self.engine.ex.memory
+        for list_item in self.memory_list.selectedItems():
+            mid = list_item.data(Qt.ItemDataRole.UserRole)
+            if mid:
+                store.remove_by_id(mid)
+        self.refresh_memory_list()
+
+    def clear_session_memories(self):
+        self.engine.ex.memory.clear_session_layer()
+        self.refresh_memory_list()
     
     def setup_settings_tab(self):
         """Настройка вкладки настроек"""
