@@ -35,6 +35,23 @@ NUMBERS = {
     "сто": 100
 }
 
+
+def collapse_repeated_stt_words(text: str) -> str:
+    """Схлопывает подряд идущие одинаковые слова из STT."""
+    s = re.sub(r"\s+", " ", (text or "").strip())
+    if not s:
+        return ""
+    words = s.split(" ")
+    out: list[str] = []
+    prev_norm = ""
+    for word in words:
+        norm = re.sub(r"[^\wа-яё]", "", word.lower(), flags=re.IGNORECASE)
+        if norm and norm == prev_norm:
+            continue
+        out.append(word)
+        prev_norm = norm
+    return " ".join(out)
+
 def extract_number(text: str):
     # 1) если есть цифры — берём их
     m = re.search(r"\d{1,3}", text)
@@ -88,6 +105,103 @@ class SimpleNLU:
             if m:
                 query = m.group(1).strip()
                 return {"type": "browser_search", "slots": {"query": query}}
+
+        # action history / repeat
+        if any(
+            p in t
+            for p in (
+                "повтори команду",
+                "повтори последнее",
+                "повтори последнюю команду",
+                "повтори действие",
+            )
+        ):
+            return {"type": "repeat_last_command", "slots": {}}
+        if any(
+            p in t
+            for p in (
+                "что ты сделал",
+                "история действий",
+                "покажи действия",
+                "последние действия",
+            )
+        ):
+            return {"type": "show_action_history", "slots": {}}
+
+        # window management
+        if any(p in t for p in ("сверни окно", "минимизируй окно", "сверни текущее окно")):
+            return {"type": "window_minimize", "slots": {}}
+        if any(p in t for p in ("разверни окно", "максимизируй окно", "на весь экран окно")):
+            return {"type": "window_maximize", "slots": {}}
+        if any(p in t for p in ("закрой окно", "закрой текущее окно")):
+            return {"type": "window_close", "slots": {}}
+        if any(p in t for p in ("переключи окно", "следующее окно", "переключи на другое окно")):
+            return {"type": "window_switch", "slots": {}}
+        if any(
+            p in t
+            for p in (
+                "окно влево",
+                "поставь окно влево",
+                "прижми окно влево",
+            )
+        ):
+            return {"type": "window_snap_left", "slots": {}}
+        if any(
+            p in t
+            for p in (
+                "окно вправо",
+                "поставь окно вправо",
+                "прижми окно вправо",
+            )
+        ):
+            return {"type": "window_snap_right", "slots": {}}
+        if any(p in t for p in ("окно вверх", "окно наверх")):
+            return {"type": "window_snap_up", "slots": {}}
+        if any(p in t for p in ("окно вниз", "окно внизу")):
+            return {"type": "window_snap_down", "slots": {}}
+        if any(
+            p in t
+            for p in (
+                "раздели экран пополам",
+                "два окна рядом",
+                "поставь окна слева и справа",
+                "размести два окна рядом",
+            )
+        ):
+            return {"type": "window_split_two", "slots": {}}
+
+        # presentation commands
+        if (
+            ("слайд" in t and any(w in t for w in ("следующ", "вперед", "далее")))
+            or any(p in t for p in ("следующий слайд", "слайд вперед", "слайд далее"))
+        ):
+            return {"type": "presentation_next_slide", "slots": {}}
+        if (
+            ("слайд" in t and any(w in t for w in ("предыдущ", "назад")))
+            or any(p in t for p in ("предыдущий слайд", "слайд назад"))
+        ):
+            return {"type": "presentation_previous_slide", "slots": {}}
+        if any(
+            p in t
+            for p in (
+                "запусти презентацию",
+                "начни презентацию",
+                "начать презентацию",
+                "начни показ слайдов",
+                "запусти показ слайдов",
+            )
+        ):
+            return {"type": "presentation_start", "slots": {}}
+        if any(
+            p in t
+            for p in (
+                "останови презентацию",
+                "заверши презентацию",
+                "выход из презентации",
+                "закрой презентацию",
+            )
+        ):
+            return {"type": "presentation_end", "slots": {}}
         
         # media commands (проверяем ДО open_app чтобы не было конфликта с "включи")
         if any(w in t for w in ("включи музыку", "включи музик", "запусти музыку")):
@@ -121,7 +235,20 @@ class SimpleNLU:
                 return {"type": "volume_up", "slots": {"delta": delta}}
 
         # open app
-        if any(w in t for w in ("открой", "запусти", "включи")):
+        if any(w in t for w in ("закрой", "закрыть", "выключи", "останови")):
+            if any(w in t for w in ("браузер", "хром", "chrome")):
+                return {"type": "close_app", "slots": {"target": "browser"}}
+            if any(w in t for w in ("телеграм", "телеграмм", "телеграмму", "telegram")):
+                return {"type": "close_app", "slots": {"target": "telegram"}}
+            if any(w in t for w in ("vscode", "vs code", "вс код", "визуал студио код", "визу студию код")):
+                return {"type": "close_app", "slots": {"target": "vscode"}}
+            if any(w in t for w in ("блокнот", "notepad", "блокноту")):
+                return {"type": "close_app", "slots": {"target": "notepad"}}
+            if any(w in t for w in ("ватсап", "ватсапп", "whatsapp", "вотсап", "вацап")):
+                return {"type": "close_app", "slots": {"target": "whatsapp"}}
+
+        # open app
+        if any(w in t for w in ("открой", "открыть", "запусти", "запустить", "включи")):
             # Слишком общая команда -> пусть уйдет в AI/уточнение.
             if t_clean in {
                 "открой сайт",
@@ -153,15 +280,11 @@ class SimpleNLU:
         # volume up/down X
         if "сделай тише" in t or "убавь громкость" in t:
             delta = extract_number(text)
-            if delta is None:
-                return {"type": "unknown", "slots": {"text": text}}
-            delta = int(delta)
+            delta = int(delta) if delta is not None else 10
             return {"type": "volume_down", "slots": {"delta": delta}}
         if "сделай громче" in t or "добавь громкость" in t:
             delta = extract_number(text)
-            if delta is None:
-                return {"type": "unknown", "slots": {"text": text}}
-            delta = int(delta)
+            delta = int(delta) if delta is not None else 10
             return {"type": "volume_up", "slots": {"delta": delta}}
 
         # scenario
@@ -178,8 +301,12 @@ class SimpleNLU:
                 }
 
         # open app (generic pattern)
-        if t.startswith(("открой", "запусти")):
-            target = t.replace("открой", "").replace("запусти", "").strip()
+        if t.startswith(("открой", "открыть", "запусти", "запустить")):
+            target = t
+            for verb in ("открой", "открыть", "запусти", "запустить"):
+                if target.startswith(verb):
+                    target = target.replace(verb, "", 1).strip()
+                    break
             generic_targets = {"сайт", "программу", "программа", "приложение", "приложуху"}
             if target in generic_targets:
                 return {"type": "unknown", "slots": {"text": text}}
@@ -207,12 +334,111 @@ class SimpleNLU:
         
         if any(w in t for w in ("какое время", "текущее время", "который час")):
             return {"type": "show_time", "slots": {}}
+
+        # weather commands
+        m = re.search(r"(?:погода|какая погода|что с погодой)(?:\s+в\s+(.+))?", t)
+        if m:
+            city = (m.group(1) or "").strip()
+            return {"type": "show_weather", "slots": {"city": city}}
+
+        # system actions
+        m = re.search(r"выключи\s+.+\b(комп|компьютер|пк)\b", t)
+        if m:
+            return {"type": "shutdown_pc", "slots": {}}
+        if any(p in t for p in ("выключи компьютер", "выключи пк", "заверши работу", "выруби компьютер")):
+            return {"type": "shutdown_pc", "slots": {}}
+        m = re.search(r"(?:перезагрузи|перезапусти|рестарт)\s+.+\b(комп|компьютер|пк)\b", t)
+        if m:
+            return {"type": "restart_pc", "slots": {}}
+        if any(p in t for p in ("перезагрузи компьютер", "перезагрузи пк", "перезапусти компьютер", "рестарт компьютер")):
+            return {"type": "restart_pc", "slots": {}}
+        if any(p in t for p in ("режим сна", "усыпи компьютер", "в сон")):
+            return {"type": "sleep_pc", "slots": {}}
+        if any(p in t for p in ("заблокируй экран", "блокируй экран", "заблокируй компьютер", "блокировка экрана")):
+            return {"type": "lock_pc", "slots": {}}
         
         if "напоминание" in t or "напомни" in t:
             m = re.search(r"(?:напоминание|напомни)(?:\s+через|\s+на)?\s+(.+)", t)
             if m:
                 reminder = m.group(1).strip()
                 return {"type": "create_reminder", "slots": {"reminder": reminder}}
+
+        # timer commands
+        m = re.search(r"(?:таймер|засеки(?:\s+таймер)?)\s+(?:на\s+)?(.+)", t)
+        if m:
+            payload = m.group(1).strip()
+            mt = re.match(r"(.+?)\s+(секунд[ауы]?|минут[ауы]?|час(?:а|ов)?)\s*(.*)$", payload)
+            if mt:
+                amount_text = mt.group(1).strip()
+                unit = mt.group(2).strip()
+                label = mt.group(3).strip()
+                amount = extract_number(amount_text)
+                if amount is not None and amount > 0:
+                    return {
+                        "type": "start_timer",
+                        "slots": {"amount": amount, "unit": unit, "label": label},
+                    }
+
+        if any(p in t for p in ("сколько осталось", "таймер статус", "статус таймера", "сколько до таймера")):
+            return {"type": "timer_status", "slots": {}}
+
+        if any(p in t for p in ("отмени таймер", "отмена таймера", "удали таймер", "сбрось таймер")):
+            return {"type": "cancel_timer", "slots": {}}
+
+        # todo commands
+        m = re.search(r"(?:добавь|создай|новая)\s+(?:в\s+)?(?:задач[ауи]?|todo)\s+(.+)", t)
+        if m:
+            task_text = m.group(1).strip()
+            if task_text:
+                return {"type": "add_todo", "slots": {"text": task_text}}
+
+        # Естественная форма: "запиши мне в дела купить хлеб"
+        m = re.search(r"(?:запиши|добавь)\s+(?:мне\s+)?(?:в\s+)?дела\s+(.+)", t)
+        if m:
+            task_text = m.group(1).strip()
+            if task_text:
+                return {"type": "add_todo", "slots": {"text": task_text}}
+
+        if any(
+            p in t
+            for p in (
+                "покажи задачи",
+                "покажи задач",
+                "список задач",
+                "мои задачи",
+                "покажи todo",
+            )
+        ):
+            return {"type": "list_todos", "slots": {}}
+
+        m = re.search(
+            r"(?:выполнил[а]?|выполнен[а]?|заверши|закрой|закрыла|отметь)\s+"
+            r"(?:задач[ауеи]?|задат[ьи]|todo)\s+(.+)",
+            t,
+        )
+        if m:
+            ref = m.group(1).strip()
+            if ref:
+                return {"type": "complete_todo", "slots": {"ref": ref}}
+
+        # Естественная/шумная форма: "отметьте как первая задача", "отметь когда первую задач"
+        m = re.search(
+            r"(?:отметь|отметьте|отмети)\s+(?:как|когда)?\s*(.+?)\s+(?:задач[ауеи]?|задат[ьи]|todo)\b",
+            t,
+        )
+        if m:
+            ref = m.group(1).strip()
+            if ref:
+                return {"type": "complete_todo", "slots": {"ref": ref}}
+
+        m = re.search(
+            r"(?:удали|удалить|убери)\s+(?:из\s+)?(?:задач[ауеи]?|задат[ьи]|todo)\s+(.+)",
+            t,
+        )
+        if m:
+            ref = m.group(1).strip()
+            if ref:
+                return {"type": "delete_todo", "slots": {"ref": ref}}
         
         # notes commands
         if "запомни" in t or "запишись" in t:

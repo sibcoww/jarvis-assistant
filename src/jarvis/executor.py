@@ -5,10 +5,12 @@ import os
 import shutil
 import time
 import re
+import threading
 from urllib.parse import quote_plus, urlparse
+from urllib.request import urlopen
 from pathlib import Path
 from ctypes import cast, POINTER
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict
 import webbrowser
 
@@ -26,6 +28,7 @@ from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
 from .plugin_api import PluginManager
 from .key_store import ensure_keys_file
+from .memory_store import MemoryStore
 from .nlu import extract_number
 from .unified_ai_turn import (
     REPLY_ONLY_AFTER_MISROUTING_PROMPT,
@@ -43,9 +46,23 @@ class Executor:
         self._ai_client = None
         self._chat_history: List[Dict[str, str]] = []
         self._chat_history_path = Path.home() / ".jarvis" / "chat_history.json"
-        self._chat_history_limit_pairs = 5
+        self._chat_history_limit_messages = 15
         self._chat_reset_timeout = 300  # сек
         self._last_ai_at: float | None = None
+        self.memory = MemoryStore()
+        self._reminders_lock = threading.Lock()
+        self._timer_lock = threading.Lock()
+        self._active_timer: dict | None = None
+        self._memory_save_markers = (
+            "запомни",
+            "запомни что",
+            "запомни обо мне",
+            "сохрани",
+            "сохрани это",
+            "учти что",
+            "имей в виду",
+            "запиши себе что",
+        )
         self._reset_phrases = {
             "очисти контекст",
             "забудь контекст",
@@ -54,12 +71,25 @@ class Executor:
         }
         self._pending_clarification: dict | None = None
         self._pending_confirmation: dict | None = None
+        self._action_history: List[Dict[str, object]] = []
         
         # Инициализируем систему плагинов
         self.plugin_manager = PluginManager()
         self._apply_context_config()
         self._init_ai_assistant()
         self._load_chat_history()
+
+    def _record_action(self, intent_type: str, slots: dict | None) -> None:
+        if intent_type in {"show_action_history", "repeat_last_command"}:
+            return
+        entry = {
+            "type": str(intent_type or "").strip(),
+            "slots": dict(slots or {}),
+            "ts": datetime.now().isoformat(),
+        }
+        self._action_history.append(entry)
+        if len(self._action_history) > 30:
+            self._action_history = self._action_history[-30:]
 
     @staticmethod
     def _looks_like_reset_context_phrase(query: str) -> bool:
@@ -172,6 +202,8 @@ class Executor:
 
     def should_require_confirmation(self, intent: dict) -> bool:
         t = str(intent.get("type") or "")
+        if t in {"shutdown_pc", "restart_pc", "sleep_pc"}:
+            return True
         if t not in {"delete_file", "move_file"}:
             return False
         slots = intent.get("slots") or {}
@@ -194,6 +226,12 @@ class Executor:
             s = str(slots.get("source") or "").strip()
             d = str(slots.get("destination") or "").strip()
             return f"Подтверди перемещение файла: {s} -> {d}. Скажи «подтверждаю» или «отмена»."
+        if t == "shutdown_pc":
+            return "Подтверди выключение компьютера. Скажи «подтверждаю» или «отмена»."
+        if t == "restart_pc":
+            return "Подтверди перезагрузку компьютера. Скажи «подтверждаю» или «отмена»."
+        if t == "sleep_pc":
+            return "Подтверди перевод компьютера в сон. Скажи «подтверждаю» или «отмена»."
         return "Подтверди действие: «подтверждаю» или «отмена»."
 
     def _dialog_context_recap_for_command_ai(self, max_messages: int = 6) -> str:
@@ -240,6 +278,8 @@ class Executor:
             "Для browser_navigate ты сам выбираешь ресурс и формат:\n"
             "- По возможности верни готовый безопасный URL в slots.url (только http или https, полная ссылка).\n"
             "- Главная страница сайта: slots.url вида https://www.youtube.com/ или https://github.com/\n"
+            "- Если запрос про статью/документацию/гайд — по возможности верни ПРЯМУЮ ссылку на материал, "
+            "а не общий поиск.\n"
             "- Поиск внутри сайта (канал на YouTube, репозиторий на GitHub, карточка на Кинопоиске и т.д.): slots.url "
             "с корректным адресом поиска/выдачи на ЭТОМ сайте.\n"
             "- Кинопоиск: для поиска фильма/аниме используй slots.url вида "
@@ -457,6 +497,32 @@ class Executor:
             return f"Сделал громче на {slots.get('delta', 10)}."
         if t == "volume_down":
             return f"Сделал тише на {slots.get('delta', 10)}."
+        if t == "add_todo":
+            return "Добавил задачу."
+        if t == "list_todos":
+            return "Показал список задач."
+        if t == "complete_todo":
+            return "Отметил задачу выполненной."
+        if t == "delete_todo":
+            return "Удалил задачу."
+        if t == "create_reminder":
+            return "Создал напоминание."
+        if t == "start_timer":
+            return "Запустил таймер."
+        if t == "timer_status":
+            return "Показал статус таймера."
+        if t == "cancel_timer":
+            return "Отменил таймер."
+        if t == "show_weather":
+            return "Показал погоду."
+        if t == "shutdown_pc":
+            return "Выключаю компьютер."
+        if t == "restart_pc":
+            return "Перезагружаю компьютер."
+        if t == "sleep_pc":
+            return "Перевожу компьютер в режим сна."
+        if t == "lock_pc":
+            return "Блокирую экран."
         return "Выполнил команду."
 
     def _resolve_site_home_url_with_ai(self, site_name: str) -> str | None:
@@ -523,10 +589,51 @@ class Executor:
             return None
         return url
 
+    def _resolve_article_url_with_ai(self, query: str, site_name: str = "") -> str | None:
+        """Попробовать найти прямую ссылку на статью/документацию по теме."""
+        if not self._ai_client or not self._ai_client.is_enabled():
+            return None
+        q = (query or "").strip()
+        if not q:
+            return None
+        site = (site_name or "").strip()
+        payload_text = f"Тема: {q}"
+        if site:
+            payload_text += f"\nПредпочтительный сайт: {site}"
+        raw = self._ai_client.get_response(
+            payload_text,
+            history=None,
+            system_prompt=(
+                "Ты URL-resolver. Верни строго JSON: {\"url\":\"https://...\"}. "
+                "Нужно дать прямую ссылку на качественную статью/документацию по теме. "
+                "Если уверенного URL нет, верни {\"url\":\"\"}. Только http/https."
+            ),
+            max_tokens=120,
+            temperature=0.0,
+        )
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        url = str(payload.get("url") or "").strip()
+        if not url:
+            return None
+        if not self._is_safe_http_url(url):
+            return None
+        return url
+
     @staticmethod
     def _google_search_url(query: str) -> str:
         """Универсальный поиск без привязки к конкретным доменам в коде."""
         return f"https://www.google.com/search?q={quote_plus(query.strip())}"
+
+    @staticmethod
+    def _youtube_search_url(query: str) -> str:
+        return f"https://www.youtube.com/results?search_query={quote_plus(query.strip())}"
 
     @staticmethod
     def _is_safe_http_url(url: str) -> bool:
@@ -559,6 +666,108 @@ class Executor:
     @staticmethod
     def _normalized_label(value: str) -> str:
         return re.sub(r"[^a-z0-9а-яё]+", "", (value or "").strip().lower())
+
+    @staticmethod
+    def _is_article_first_query(query: str) -> bool:
+        q = (query or "").lower()
+        markers = (
+            "стать",
+            "документац",
+            "документ",
+            "гайд",
+            "инструкция",
+            "обзор",
+            "tutorial",
+            "manual",
+            "доки",
+            "материал",
+        )
+        return any(m in q for m in markers)
+
+    @staticmethod
+    def _is_video_or_blog_query(query: str) -> bool:
+        q = (query or "").lower()
+        markers = (
+            "видео",
+            "ролик",
+            "трейлер",
+            "ютуб",
+            "youtube",
+            "блог",
+            "влог",
+            "подкаст",
+        )
+        return any(m in q for m in markers)
+
+    @staticmethod
+    def _has_contextual_topic_placeholder(query: str) -> bool:
+        q = (query or "").lower()
+        markers = (
+            "эту тему",
+            "эту статью",
+            "этого",
+            "этой",
+            "это",
+            "на эту тему",
+            "по этой теме",
+        )
+        return any(m in q for m in markers)
+
+    def _extract_recent_topic_for_web(self) -> str:
+        """Вытянуть последнюю содержательную тему из диалога для 'это/эта тема'."""
+        if not self._chat_history:
+            return ""
+        ignore = (
+            "открой",
+            "найди",
+            "запусти",
+            "сохрани",
+            "запомни",
+            "что ты знаешь",
+            "что ты помнишь",
+            "покажи историю",
+        )
+        for item in reversed(self._chat_history):
+            if item.get("role") != "user":
+                continue
+            text = str(item.get("content") or "").strip()
+            low = text.lower()
+            if not text:
+                continue
+            if any(x in low for x in ignore):
+                continue
+            if len(text) < 6:
+                continue
+            return text
+        return ""
+
+    def _expand_article_query_from_context(self, query: str) -> str:
+        q = (query or "").strip()
+        if not q:
+            return ""
+        if not self._has_contextual_topic_placeholder(q):
+            return q
+        topic = self._extract_recent_topic_for_web()
+        if not topic:
+            return q
+        qn = q
+        replacements = (
+            "на эту тему",
+            "по этой теме",
+            "эту тему",
+            "эту статью",
+            "этой библиотеки",
+            "этого",
+            "этой",
+            "это",
+        )
+        for frag in replacements:
+            qn = re.sub(frag, "", qn, flags=re.IGNORECASE).strip()
+        qn = re.sub(r"\s+", " ", qn).strip(" ,.:;!-")
+        if not qn:
+            return topic
+        # Добавляем тему в хвост, чтобы AI-resolver видел конкретику.
+        return f"{qn} {topic}".strip()
 
     def _validate_ai_command_payload(self, payload: dict | None) -> dict | None:
         if not isinstance(payload, dict):
@@ -607,6 +816,10 @@ class Executor:
                 return {"type": "browser_navigate", "slots": {"url": url}}
 
             if site and query:
+                if self._is_article_first_query(query):
+                    article_url = self._resolve_article_url_with_ai(query, site)
+                    if article_url:
+                        return {"type": "browser_navigate", "slots": {"url": article_url}}
                 # "открой сайт X" часто приходит как site+query, где query ~= site.
                 # В этом случае сначала пытаемся открыть главную страницу сайта.
                 if self._normalized_label(site) and self._normalized_label(site) == self._normalized_label(query):
@@ -633,9 +846,192 @@ class Executor:
             query = str(slots.get("query") or "").strip()
             if not query or len(query) > 200:
                 return None
+            if self._is_article_first_query(query):
+                expanded = self._expand_article_query_from_context(query)
+                article_url = self._resolve_article_url_with_ai(expanded)
+                if article_url:
+                    return {"type": "browser_navigate", "slots": {"url": article_url}}
+                return {"type": "browser_search", "slots": {"query": expanded}}
+            if self._is_video_or_blog_query(query):
+                return {"type": "browser_navigate", "slots": {"url": self._youtube_search_url(query)}}
             return {"type": "browser_search", "slots": {"query": query}}
 
         return None
+
+    def _validate_ai_local_action_payload(self, payload: dict | None) -> dict | None:
+        """Строгая валидация AI fallback только для локальных доменов."""
+        if not isinstance(payload, dict):
+            return None
+        mode = str(payload.get("mode", "")).lower()
+        if mode not in {"command", "action"}:
+            return None
+        intent = str(payload.get("intent", "")).strip()
+        slots = payload.get("slots", {})
+        if not isinstance(slots, dict):
+            return None
+
+        allowed = {
+            "add_todo",
+            "list_todos",
+            "complete_todo",
+            "delete_todo",
+            "create_reminder",
+            "start_timer",
+            "timer_status",
+            "cancel_timer",
+            "shutdown_pc",
+            "restart_pc",
+            "sleep_pc",
+            "lock_pc",
+            "show_weather",
+        }
+        if intent not in allowed:
+            return None
+
+        if intent == "add_todo":
+            text = self._normalize_spaces(str(slots.get("text") or ""))
+            if not text or len(text) > 200:
+                return None
+            return {"type": intent, "slots": {"text": text}}
+
+        if intent in {
+            "list_todos",
+            "timer_status",
+            "cancel_timer",
+            "shutdown_pc",
+            "restart_pc",
+            "sleep_pc",
+            "lock_pc",
+        }:
+            return {"type": intent, "slots": {}}
+
+        if intent == "show_weather":
+            city = self._normalize_spaces(str(slots.get("city") or ""))
+            if len(city) > 80:
+                city = city[:80].rstrip()
+            return {"type": intent, "slots": {"city": city}}
+
+        if intent in {"complete_todo", "delete_todo"}:
+            ref = self._normalize_spaces(str(slots.get("ref") or ""))
+            if not ref or len(ref) > 120:
+                return None
+            return {"type": intent, "slots": {"ref": ref}}
+
+        if intent == "create_reminder":
+            reminder = self._normalize_spaces(str(slots.get("reminder") or ""))
+            if not reminder or len(reminder) > 220:
+                return None
+            return {"type": intent, "slots": {"reminder": reminder}}
+
+        if intent == "start_timer":
+            try:
+                amount = int(slots.get("amount"))
+            except Exception:
+                return None
+            if not (1 <= amount <= 1440):
+                return None
+            unit = self._normalize_spaces(str(slots.get("unit") or "")).lower()
+            if not unit:
+                return None
+            if unit.startswith("сек"):
+                unit = "секунд"
+            elif unit.startswith("час"):
+                unit = "часов"
+            else:
+                unit = "минут"
+            label = self._normalize_spaces(str(slots.get("label") or ""))
+            if len(label) > 180:
+                label = label[:180].rstrip()
+            return {
+                "type": intent,
+                "slots": {"amount": amount, "unit": unit, "label": label},
+            }
+        return None
+
+    @staticmethod
+    def _looks_like_local_domain_query(query: str) -> bool:
+        low = (query or "").lower()
+        markers = (
+            "задач",
+            "todo",
+            "дел",
+            "список дел",
+            "в дела",
+            "отмет",
+            "таймер",
+            "напом",
+            "напомин",
+            "через",
+            "сколько осталось",
+            "выключи компьютер",
+            "перезагрузи",
+            "режим сна",
+            "заблокируй экран",
+            "блокир",
+            "погод",
+        )
+        return any(m in low for m in markers)
+
+    def _try_local_domain_ai_fallback(self, query: str, now_ts: float) -> bool:
+        """AI fallback для естественных фраз локальных команд (todo/timer/reminders)."""
+        if not self._ai_client or not self._ai_client.is_enabled():
+            return False
+        text = self._normalize_spaces(query)
+        if not text:
+            return False
+        if not self._looks_like_local_domain_query(text):
+            return False
+        system_prompt = (
+            "Ты интерпретатор локальных команд ассистента. Верни строго один JSON и ничего больше.\n"
+            "Формат: {\"mode\":\"command\",\"intent\":\"...\",\"slots\":{...}}\n"
+            "Разрешённые intent:\n"
+            "- add_todo: slots {\"text\":\"...\"}\n"
+            "- list_todos: slots {}\n"
+            "- complete_todo: slots {\"ref\":\"...\"}\n"
+            "- delete_todo: slots {\"ref\":\"...\"}\n"
+            "- create_reminder: slots {\"reminder\":\"...\"}\n"
+            "- start_timer: slots {\"amount\":<int>,\"unit\":\"секунд|минут|часов\",\"label\":\"...\"}\n"
+            "- timer_status: slots {}\n"
+            "- cancel_timer: slots {}\n"
+            "- shutdown_pc: slots {}\n"
+            "- restart_pc: slots {}\n"
+            "- sleep_pc: slots {}\n"
+            "- lock_pc: slots {}\n"
+            "- show_weather: slots {\"city\":\"...\"} (city может быть пустым)\n"
+            "Если фраза не про эти команды, верни {\"mode\":\"none\"}.\n"
+            "Никакого текста вне JSON."
+        )
+        raw = self._ai_client.get_response(
+            text,
+            history=None,
+            system_prompt=system_prompt,
+            max_tokens=160,
+            temperature=0.0,
+        )
+        if not raw:
+            return False
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return False
+        if str(payload.get("mode", "")).lower() == "none":
+            return False
+        intent = self._validate_ai_local_action_payload(payload)
+        if not intent:
+            return False
+        try:
+            self.run(intent)
+            self._log("✅ Готово.")
+            self._append_chat_message("user", text)
+            self._append_chat_message("assistant", self._brief_ack_for_command(intent, text))
+            self._save_chat_history()
+            self._last_ai_at = now_ts
+            self._log(f"[DEBUG] Local AI fallback command: {intent['type']}")
+            return True
+        except Exception as error:
+            self._log(f"❌ Ошибка выполнения локальной AI-команды: {error}")
+            logger.exception("Local AI fallback command failed")
+            return False
     
     def _log(self, message: str):
         """Универсальное логирование - в logger и GUI callback"""
@@ -660,11 +1056,8 @@ class Executor:
         return out
 
     def _apply_context_config(self):
-        ai = self._ai_settings()
-        try:
-            self._chat_history_limit_pairs = max(4, int(ai.get("context_max_pairs_disk", 24)))
-        except Exception:
-            self._chat_history_limit_pairs = 24
+        # Для памяти в дипломной версии держим только короткий контекст.
+        self._chat_history_limit_messages = 15
 
     @staticmethod
     def _clip_text_for_context(text: str, max_chars: int) -> str:
@@ -678,8 +1071,17 @@ class Executor:
         return s[: max_chars - 1] + "…"
 
     def _build_ai_request_history(self) -> List[Dict[str, str]]:
-        """Короткая история без дополнительных memory-блоков."""
-        return list(self._chat_history)
+        """Короткая история + несколько последних пользовательских фактов."""
+        prefix: List[Dict[str, str]] = []
+        mem = self._clip_text_for_context(self.memory.build_context(top_k=6), 1000)
+        if mem:
+            prefix.append(
+                {
+                    "role": "system",
+                    "content": "Факты о пользователе (учитывай аккуратно, без выдумки):\n" + mem,
+                }
+            )
+        return prefix + list(self._chat_history)
 
     def _load_chat_history(self):
         try:
@@ -725,7 +1127,7 @@ class Executor:
             logger.warning(f"Не удалось сохранить чат-историю: {error}")
 
     def _trim_chat_history(self):
-        max_messages = self._chat_history_limit_pairs * 2
+        max_messages = self._chat_history_limit_messages
         if len(self._chat_history) <= max_messages:
             return
         removed = len(self._chat_history) - max_messages
@@ -747,6 +1149,131 @@ class Executor:
         self._chat_history = []
         self._last_ai_at = None
         self._save_chat_history()
+
+    def _extract_memory_payload(self, text: str) -> str:
+        s = (text or "").strip()
+        low = s.lower()
+        markers = sorted(self._memory_save_markers, key=len, reverse=True)
+        for marker in markers:
+            if low.startswith(marker):
+                return s[len(marker):].strip(" ,.:;-")
+        return s
+
+    def _normalize_memory_fact_with_ai(self, source_text: str) -> str:
+        raw = self._extract_memory_payload(source_text)
+        if not raw:
+            return ""
+        if not (self._ai_client and self._ai_client.is_enabled()):
+            return self.memory.normalize_fact(raw)
+        prompt = (
+            "Выдели из фразы пользователя один устойчивый факт о нём и верни только одну короткую строку "
+            "без JSON, без кавычек, без слов «запомни/сохрани». Если факта нет, верни пусто.\n\n"
+            f"Фраза: {raw}"
+        )
+        response = self._ai_client.get_response(
+            prompt,
+            history=[],
+            system_prompt="Ты нормализуешь факты о пользователе для локальной памяти.",
+            max_tokens=80,
+            temperature=0.0,
+        )
+        if not response or not str(response).strip():
+            return self.memory.normalize_fact(raw)
+        first_line = str(response).strip().splitlines()[0]
+        return self.memory.normalize_fact(first_line)
+
+    def _save_memory_fact(self, source_text: str) -> str:
+        fact = self._normalize_memory_fact_with_ai(source_text)
+        if not fact:
+            return ""
+        return self.memory.add_fact(fact)
+
+    def _is_memory_save_command(self, normalized_query: str) -> bool:
+        q = (normalized_query or "").strip()
+        return any(q.startswith(marker) for marker in self._memory_save_markers)
+
+    @staticmethod
+    def _is_memory_show_command(normalized_query: str) -> bool:
+        q = (normalized_query or "").strip()
+        if q in {"что ты помнишь", "что ты помнишь обо мне", "что ты знаешь обо мне", "напомни, что ты обо мне знаешь"}:
+            return True
+        return ("что ты помнишь" in q and "обо мне" in q)
+
+    @staticmethod
+    def _is_memory_forget_command(normalized_query: str) -> bool:
+        q = (normalized_query or "").strip()
+        return (
+            q in {"забудь всё обо мне", "забудь обо мне", "забудь всё", "забудь все"}
+            or q.startswith("забудь ")
+            or q.startswith("удали это из памяти")
+            or q.startswith("убери это из памяти")
+        )
+
+    def _reply_memory_summary(self, query: str, now_ts: float) -> bool:
+        facts = [row.get("text", "") for row in self.memory.list_facts(12) if row.get("text")]
+        if not facts:
+            self._log("🤖 Пока ничего о тебе не запомнил.")
+            return True
+        facts_block = "\n".join(f"- {item}" for item in facts)
+        if self._ai_client and self._ai_client.is_enabled():
+            prompt = (
+                "Сформируй одно короткое предложение на русском: выбери 2-3 главных факта из списка.\n"
+                "Без списков и без новых фактов.\n\n"
+                f"Факты:\n{facts_block}\n\n"
+                f"Запрос: {query}"
+            )
+            response = self._ai_client.get_response(
+                prompt,
+                history=[],
+                system_prompt="Ты кратко пересказываешь, что ассистент помнит о пользователе.",
+                max_tokens=120,
+                temperature=0.2,
+            )
+            if response and str(response).strip():
+                message = self._shorten_for_voice(str(response).strip(), max_sentences=1, max_chars=180)
+                self._append_chat_message("user", query)
+                self._append_chat_message("assistant", message)
+                self._save_chat_history()
+                self._last_ai_at = now_ts
+                self._log(f"🤖 AI: {message}")
+                return True
+        self._log("🤖 Помню: " + "; ".join(facts[-3:]))
+        return True
+
+    def _forget_memory_from_context(self, query: str) -> str:
+        q = (query or "").strip().lower()
+        if q in {"забудь всё обо мне", "забудь обо мне", "забудь всё", "забудь все"}:
+            self.memory.clear_all()
+            return "ALL"
+        if q.startswith("забудь последнее"):
+            return self.memory.remove_last()
+        generic = (
+            "забудь эту информацию обо мне",
+            "удали это из памяти",
+            "убери это из памяти",
+            "забудь это",
+        )
+        if q in generic:
+            hint = ""
+            for item in reversed(self._chat_history):
+                if item.get("role") == "assistant":
+                    hint = str(item.get("content") or "")
+                    if hint:
+                        break
+            if not hint:
+                for item in reversed(self._chat_history):
+                    if item.get("role") == "user":
+                        hint = str(item.get("content") or "")
+                        if hint:
+                            break
+            removed = self.memory.find_best_match_by_hint(hint)
+            if removed:
+                return removed
+            return self.memory.remove_last()
+        m = re.match(r"^(?:забудь|удали)\s+(?:что\s+)?(.+)$", q)
+        if m:
+            return self.memory.remove_by_substring(m.group(1).strip())
+        return ""
 
     def load_config(self):
         """Перезагружает конфигурацию из файла"""
@@ -818,6 +1345,30 @@ class Executor:
             self._log("🤖 Контекст очищен")
             return True
 
+        if self._is_memory_save_command(normalized_query):
+            saved = self._save_memory_fact(query)
+            if saved:
+                self._log("🤖 Запомнил.")
+            else:
+                self._log("🤖 Не нашёл устойчивый факт для сохранения.")
+            return True
+
+        if self._is_memory_show_command(normalized_query):
+            now_ts = time.time()
+            if self._last_ai_at and (now_ts - self._last_ai_at) > self._chat_reset_timeout:
+                self.reset_chat_history("долгая пауза")
+            return self._reply_memory_summary(query, now_ts)
+
+        if self._is_memory_forget_command(normalized_query):
+            forgotten = self._forget_memory_from_context(query)
+            if forgotten == "ALL":
+                self._log("🤖 Удалил всю информацию о тебе.")
+            elif forgotten:
+                self._log(f"🤖 Удалил из памяти: {forgotten}")
+            else:
+                self._log("🤖 Не нашёл подходящую запись в памяти.")
+            return True
+
         if normalized_query in {"покажи историю", "покажи контекст", "что в истории"}:
             if not self._chat_history:
                 self._log("🤖 История пуста.")
@@ -850,6 +1401,16 @@ class Executor:
         now_ts = time.time()
         if self._last_ai_at and (now_ts - self._last_ai_at) > self._chat_reset_timeout:
             self.reset_chat_history("долгая пауза")
+
+        local_like = self._looks_like_local_domain_query(query)
+        if self._try_local_domain_ai_fallback(query, now_ts):
+            return True
+        if local_like:
+            self._log(
+                "⚠ Не смог разобрать локальную команду (задачи/таймер/напоминание/системное). "
+                "Скажи короче: «добавь задачу ...», «таймер на 10 минут», «напомни через ...»"
+            )
+            return True
 
         if self._ai_client and self._ai_client.is_enabled():
             self._log(f"[DEBUG] Unknown command -> AI, len={len(query)}")
@@ -997,9 +1558,12 @@ class Executor:
 
     def open_app(self, target: str):
         target = self._resolve_target(target)
+        article_target = self._expand_article_query_from_context(target)
         if target == "browser":
             try:
-                webbrowser.open("about:blank", new=1)
+                # На части Windows-систем `about:` может быть не зарегистрирован.
+                # Открываем безопасный http(s) URL, чтобы гарантированно запустить браузер.
+                webbrowser.open("https://www.google.com", new=1)
                 self._log("🌐 Открываю браузер по умолчанию (как в настройках Windows).")
             except Exception as error:
                 self._log(f"⚠ Не удалось открыть браузер по умолчанию: {error}")
@@ -1016,12 +1580,18 @@ class Executor:
             except Exception as e:
                 logger.error(f"Ошибка запуска приложения {cmd_path}: {e}")
         else:
+            if self._is_article_first_query(article_target):
+                article_url = self._resolve_article_url_with_ai(article_target)
+                if article_url:
+                    self.browser_navigate(article_url)
+                    logger.info(f"Article-first direct URL: {article_url}")
+                    return
             # Интеллектуальное разрешение сайтов/запросов — через AI; исполнитель только открывает URL.
             if self._ai_client and self._ai_client.is_enabled():
                 phrase = (
-                    target
-                    if re.match(r"^(открой|запусти|включи)\s+", target.strip().lower())
-                    else f"открой {target}"
+                    article_target
+                    if re.match(r"^(открой|запусти|включи)\s+", article_target.strip().lower())
+                    else f"открой {article_target}"
                 )
                 ai_intent = self._interpret_command_with_ai(phrase)
                 if ai_intent:
@@ -1034,6 +1604,14 @@ class Executor:
                         resolved = self._resolve_site_home_url_with_ai(target)
                         if resolved:
                             ai_intent = {"type": "browser_navigate", "slots": {"url": resolved}}
+                    # Для "статья/документация/гайд" сначала пытаемся открыть прямой материал.
+                    if (
+                        ai_intent.get("type") == "browser_search"
+                        and self._is_article_first_query(phrase)
+                    ):
+                        article_url = self._resolve_article_url_with_ai(article_target)
+                        if article_url:
+                            ai_intent = {"type": "browser_navigate", "slots": {"url": article_url}}
                     try:
                         self.run(ai_intent)
                         logger.info("Открыто через AI-интерпретацию (open_app)")
@@ -1041,19 +1619,25 @@ class Executor:
                     except Exception as e:
                         logger.warning(f"AI-команда open_app не выполнена: {e}")
 
-            resolved_site = self._resolve_site_target(target)
-            if resolved_site != target.strip().lower():
+            resolved_site = self._resolve_site_target(article_target)
+            if resolved_site != article_target.strip().lower():
                 self.browser_navigate(resolved_site)
                 logger.info(f"Открываю сайт из config (sites): {resolved_site}")
                 return
 
-            if "." in target and " " not in target:
-                self.browser_navigate(target)
-                logger.info(f"Открываю как URL/домен: {target}")
+            if "." in article_target and " " not in article_target:
+                self.browser_navigate(article_target)
+                logger.info(f"Открываю как URL/домен: {article_target}")
                 return
 
-            self.browser_search(target)
-            logger.info(f"Поиск в браузере (нет локального соответствия): {target}")
+            if self._is_video_or_blog_query(article_target):
+                yt_url = self._youtube_search_url(article_target)
+                self.browser_navigate(yt_url)
+                logger.info(f"Video/blog fallback to YouTube: {yt_url}")
+                return
+
+            self.browser_search(article_target)
+            logger.info(f"Поиск в браузере (нет локального соответствия): {article_target}")
 
     def close_app(self, target: str):
         resolved = self._resolve_target(target)
@@ -1159,6 +1743,8 @@ class Executor:
             if self.plugin_manager.handle_intent(t, slots):
                 return
 
+            self._record_action(t, slots)
+
             if t == "set_volume":
                 self.set_volume(slots.get("value", 50))
                 return
@@ -1212,6 +1798,60 @@ class Executor:
             if t == "media_previous":
                 self.media_previous()
                 return
+
+            # Presentation commands
+            if t == "presentation_next_slide":
+                self.presentation_next_slide()
+                return
+
+            if t == "presentation_previous_slide":
+                self.presentation_previous_slide()
+                return
+
+            if t == "presentation_start":
+                self.presentation_start()
+                return
+
+            if t == "presentation_end":
+                self.presentation_end()
+                return
+
+            # Window management
+            if t == "window_minimize":
+                self.window_minimize()
+                return
+
+            if t == "window_maximize":
+                self.window_maximize()
+                return
+
+            if t == "window_close":
+                self.window_close()
+                return
+
+            if t == "window_switch":
+                self.window_switch()
+                return
+
+            if t == "window_snap_left":
+                self.window_snap_left()
+                return
+
+            if t == "window_snap_right":
+                self.window_snap_right()
+                return
+
+            if t == "window_snap_up":
+                self.window_snap_up()
+                return
+
+            if t == "window_snap_down":
+                self.window_snap_down()
+                return
+
+            if t == "window_split_two":
+                self.window_split_two()
+                return
             
             # Calendar/Time commands
             if t == "show_date":
@@ -1226,9 +1866,73 @@ class Executor:
             if t == "create_reminder":
                 self.create_reminder(slots.get("reminder", ""))
                 return
+
+            if t == "start_timer":
+                self.start_timer(
+                    slots.get("amount", 0),
+                    slots.get("unit", "минут"),
+                    slots.get("label", ""),
+                )
+                return
+
+            if t == "timer_status":
+                self.timer_status()
+                return
+
+            if t == "cancel_timer":
+                self.cancel_timer()
+                return
+
+            if t == "shutdown_pc":
+                self.shutdown_pc()
+                return
+
+            if t == "restart_pc":
+                self.restart_pc()
+                return
+
+            if t == "sleep_pc":
+                self.sleep_pc()
+                return
+
+            if t == "lock_pc":
+                self.lock_pc()
+                return
+
+            if t == "show_weather":
+                self.show_weather(slots.get("city", ""))
+                return
+
+            if t == "repeat_last_command":
+                self.repeat_last_command()
+                return
+
+            if t == "show_action_history":
+                self.show_action_history()
+                return
+
+            if t == "add_todo":
+                self.add_todo(slots.get("text", ""))
+                return
+
+            if t == "list_todos":
+                self.list_todos()
+                return
+
+            if t == "complete_todo":
+                self.complete_todo(slots.get("ref", ""))
+                return
+
+            if t == "delete_todo":
+                self.delete_todo(slots.get("ref", ""))
+                return
             
             if t == "add_note":
                 note_text = slots.get("text", "")
+                saved = self._save_memory_fact(note_text)
+                if saved:
+                    self._log("🤖 Запомнил.")
+                    return
                 self.add_note(note_text)
                 return
             
@@ -1455,6 +2159,175 @@ class Executor:
             logger.info("Предыдущий трек")
         except Exception as e:
             logger.error(f"Ошибка переключения на предыдущий трек: {e}")
+
+    # ============ Presentation Commands ============
+    def presentation_next_slide(self):
+        try:
+            if pyautogui is None:
+                logger.warning("pyautogui не установлен.")
+                return
+            pyautogui.press("right")
+            self._log("🎞 Следующий слайд.")
+        except Exception as e:
+            logger.error(f"Ошибка переключения на следующий слайд: {e}")
+
+    def presentation_previous_slide(self):
+        try:
+            if pyautogui is None:
+                logger.warning("pyautogui не установлен.")
+                return
+            pyautogui.press("left")
+            self._log("🎞 Предыдущий слайд.")
+        except Exception as e:
+            logger.error(f"Ошибка переключения на предыдущий слайд: {e}")
+
+    def presentation_start(self):
+        try:
+            if pyautogui is None:
+                logger.warning("pyautogui не установлен.")
+                return
+            pyautogui.press("f5")
+            self._log("🎞 Запустил презентацию.")
+        except Exception as e:
+            logger.error(f"Ошибка запуска презентации: {e}")
+
+    def presentation_end(self):
+        try:
+            if pyautogui is None:
+                logger.warning("pyautogui не установлен.")
+                return
+            pyautogui.press("esc")
+            self._log("🎞 Завершил презентацию.")
+        except Exception as e:
+            logger.error(f"Ошибка завершения презентации: {e}")
+
+    # ============ Window Management ============
+    def window_minimize(self):
+        if pyautogui is None:
+            logger.warning("pyautogui не установлен.")
+            return
+        pyautogui.hotkey("winleft", "down")
+        self._log("🪟 Свернул текущее окно.")
+
+    def window_maximize(self):
+        if pyautogui is None:
+            logger.warning("pyautogui не установлен.")
+            return
+        pyautogui.hotkey("winleft", "up")
+        self._log("🪟 Развернул текущее окно.")
+
+    def window_close(self):
+        if pyautogui is None:
+            logger.warning("pyautogui не установлен.")
+            return
+        pyautogui.hotkey("alt", "f4")
+        self._log("🪟 Закрыл текущее окно.")
+
+    def window_switch(self):
+        if pyautogui is None:
+            logger.warning("pyautogui не установлен.")
+            return
+        pyautogui.hotkey("alt", "tab")
+        self._log("🪟 Переключил окно.")
+
+    def window_snap_left(self):
+        if pyautogui is None:
+            logger.warning("pyautogui не установлен.")
+            return
+        pyautogui.hotkey("winleft", "left")
+        self._log("🪟 Окно влево.")
+
+    def window_snap_right(self):
+        if pyautogui is None:
+            logger.warning("pyautogui не установлен.")
+            return
+        pyautogui.hotkey("winleft", "right")
+        self._log("🪟 Окно вправо.")
+
+    def window_snap_up(self):
+        if pyautogui is None:
+            logger.warning("pyautogui не установлен.")
+            return
+        pyautogui.hotkey("winleft", "up")
+        self._log("🪟 Окно вверх.")
+
+    def window_snap_down(self):
+        if pyautogui is None:
+            logger.warning("pyautogui не установлен.")
+            return
+        pyautogui.hotkey("winleft", "down")
+        self._log("🪟 Окно вниз.")
+
+    def window_split_two(self):
+        if pyautogui is None:
+            logger.warning("pyautogui не установлен.")
+            return
+        # Надёжный вариант для Windows Snap:
+        # 1) Прижимаем текущее окно влево
+        # 2) Даём Snap Assist показать список окон справа
+        # Автопереключение Alt+Tab часто возвращает окно назад/ломает раскладку.
+        pyautogui.hotkey("winleft", "left")
+        time.sleep(0.15)
+        self._log("🪟 Окно слева. Выбери второе окно в Snap Assist справа.")
+
+    # ============ Action History ============
+    def repeat_last_command(self):
+        repeatable = {
+            "set_volume",
+            "volume_up",
+            "volume_down",
+            "open_app",
+            "close_app",
+            "create_folder",
+            "browser_navigate",
+            "browser_search",
+            "media_play",
+            "media_pause",
+            "media_next",
+            "media_previous",
+            "show_date",
+            "show_time",
+            "create_reminder",
+            "start_timer",
+            "timer_status",
+            "cancel_timer",
+            "add_todo",
+            "list_todos",
+            "complete_todo",
+            "delete_todo",
+            "show_weather",
+            "lock_pc",
+            "window_minimize",
+            "window_maximize",
+            "window_close",
+            "window_switch",
+            "window_snap_left",
+            "window_snap_right",
+            "window_snap_up",
+            "window_snap_down",
+            "window_split_two",
+            "presentation_next_slide",
+            "presentation_previous_slide",
+            "presentation_start",
+            "presentation_end",
+        }
+        for row in reversed(self._action_history):
+            t = str(row.get("type") or "")
+            if t in repeatable:
+                slots = row.get("slots")
+                self._log(f"🔁 Повторяю: {t}")
+                self.run({"type": t, "slots": slots if isinstance(slots, dict) else {}})
+                return
+        self._log("🔁 Нет команды для повтора.")
+
+    def show_action_history(self):
+        if not self._action_history:
+            self._log("📜 История действий пуста.")
+            return
+        tail = self._action_history[-5:]
+        self._log("📜 Последние действия:")
+        for i, row in enumerate(tail, 1):
+            self._log(f"  {i}. {row.get('type', 'unknown')}")
     
     # ============ Calendar/Time Commands ============
     def show_date(self):
@@ -1484,26 +2357,360 @@ class Executor:
             logger.error(f"Ошибка показа времени: {e}")
     
     # ============ Reminders & Notes ============
+    @staticmethod
+    def _normalize_spaces(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    def _reminders_file(self) -> Path:
+        reminders_file = Path.home() / ".jarvis" / "reminders.json"
+        reminders_file.parent.mkdir(parents=True, exist_ok=True)
+        return reminders_file
+
+    def _load_reminders(self) -> list[dict]:
+        path = self._reminders_file()
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return data if isinstance(data, list) else []
+
+    def _save_reminders(self, reminders: list[dict]) -> None:
+        path = self._reminders_file()
+        path.write_text(json.dumps(reminders, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _parse_reminder_schedule(self, reminder: str) -> tuple[str, datetime | None]:
+        """
+        Поддержка минимального формата:
+        - "через 10 минут <текст>" / "10 минут <текст>"
+        - "через 2 часа <текст>" / "2 часа <текст>"
+        - "в 14:30 <текст>"
+        """
+        raw = self._normalize_spaces(reminder)
+        if not raw:
+            return "", None
+
+        # Относительное время: (через) N минут/часов
+        m_rel = re.match(
+            r"^(?:через\s+)?(.+?)\s+(минут[ауы]?|час(?:а|ов)?)\s+(.+)$",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m_rel:
+            amount_text = self._normalize_spaces(m_rel.group(1))
+            unit = (m_rel.group(2) or "").lower()
+            text = self._normalize_spaces(m_rel.group(3))
+            amount = extract_number(amount_text)
+            if amount is not None and amount > 0 and text:
+                if unit.startswith("минут"):
+                    return text, datetime.now() + timedelta(minutes=amount)
+                return text, datetime.now() + timedelta(hours=amount)
+
+        # Абсолютное время: в HH:MM
+        m_abs = re.match(r"^в\s*(\d{1,2})[:.](\d{2})\s+(.+)$", raw, flags=re.IGNORECASE)
+        if m_abs:
+            hour = int(m_abs.group(1))
+            minute = int(m_abs.group(2))
+            text = self._normalize_spaces(m_abs.group(3))
+            if 0 <= hour <= 23 and 0 <= minute <= 59 and text:
+                now = datetime.now()
+                due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if due <= now:
+                    due = due + timedelta(days=1)
+                return text, due
+
+        return raw, None
+
+    def pop_due_reminders(self) -> list[str]:
+        """Вернуть сработавшие напоминания и пометить их выполненными."""
+        with self._reminders_lock:
+            reminders = self._load_reminders()
+            if not reminders:
+                return []
+            now = datetime.now()
+            fired: list[str] = []
+            changed = False
+            for row in reminders:
+                if not isinstance(row, dict):
+                    continue
+                if bool(row.get("done")):
+                    continue
+                due_raw = str(row.get("due_at") or "").strip()
+                if not due_raw:
+                    continue
+                try:
+                    due_dt = datetime.fromisoformat(due_raw)
+                except Exception:
+                    continue
+                if due_dt <= now:
+                    text = self._normalize_spaces(str(row.get("text") or ""))
+                    if text:
+                        fired.append(text)
+                    row["done"] = True
+                    row["done_at"] = now.isoformat()
+                    changed = True
+            if changed:
+                self._save_reminders(reminders)
+            return fired
+
     def create_reminder(self, reminder: str):
         """Создать напоминание"""
         try:
-            reminders_file = Path.home() / ".jarvis" / "reminders.json"
-            reminders_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            reminders = []
-            if reminders_file.exists():
-                reminders = json.loads(reminders_file.read_text(encoding="utf-8"))
-            
-            reminders.append({
-                "text": reminder,
-                "created": datetime.now().isoformat(),
-                "done": False
-            })
-            
-            reminders_file.write_text(json.dumps(reminders, ensure_ascii=False, indent=2), encoding="utf-8")
-            self._log(f"⏰ Напоминание создано: {reminder}")
+            clean_text, due_at = self._parse_reminder_schedule(reminder)
+            if not clean_text:
+                self._log("⚠ Не удалось создать напоминание: пустой текст.")
+                return
+
+            with self._reminders_lock:
+                reminders = self._load_reminders()
+                payload = {
+                    "text": clean_text,
+                    "created": datetime.now().isoformat(),
+                    "done": False,
+                }
+                if due_at is not None:
+                    payload["due_at"] = due_at.isoformat()
+                reminders.append(payload)
+                self._save_reminders(reminders)
+
+            if due_at is not None:
+                self._log(f"⏰ Напоминание создано на {due_at.strftime('%H:%M')}: {clean_text}")
+            else:
+                self._log(
+                    "⏰ Напоминание сохранено без времени. "
+                    "Скажи: «напомни через 10 минут ...» или «напомни в 19:30 ...»"
+                )
         except Exception as e:
             logger.error(f"Ошибка создания напоминания: {e}")
+
+    # ============ Timer ============
+    @staticmethod
+    def _timer_total_seconds(amount: int, unit: str) -> int:
+        value = max(1, int(amount))
+        u = (unit or "").lower()
+        if u.startswith("сек"):
+            return value
+        if u.startswith("час"):
+            return value * 3600
+        return value * 60
+
+    def start_timer(self, amount: int, unit: str, label: str = ""):
+        try:
+            total = self._timer_total_seconds(int(amount), str(unit))
+        except Exception:
+            self._log("⚠ Не удалось запустить таймер: неверное время.")
+            return
+        now = time.time()
+        with self._timer_lock:
+            self._active_timer = {
+                "created_at": datetime.now().isoformat(),
+                "end_ts": now + total,
+                "seconds": total,
+                "label": self._normalize_spaces(label),
+                "done": False,
+            }
+        if total >= 60:
+            human = f"{total // 60} мин"
+        else:
+            human = f"{total} сек"
+        if label:
+            self._log(f"⏱ Таймер запущен на {human}: {self._normalize_spaces(label)}")
+        else:
+            self._log(f"⏱ Таймер запущен на {human}.")
+
+    def timer_status(self):
+        with self._timer_lock:
+            timer = dict(self._active_timer) if isinstance(self._active_timer, dict) else None
+        if not timer or bool(timer.get("done")):
+            self._log("⏱ Активного таймера нет.")
+            return
+        left = int(round(float(timer.get("end_ts", 0)) - time.time()))
+        if left <= 0:
+            self._log("⏱ Таймер уже срабатывает.")
+            return
+        minutes, seconds = divmod(left, 60)
+        if minutes > 0:
+            self._log(f"⏱ До таймера осталось: {minutes} мин {seconds} сек.")
+        else:
+            self._log(f"⏱ До таймера осталось: {seconds} сек.")
+
+    def cancel_timer(self):
+        with self._timer_lock:
+            existed = isinstance(self._active_timer, dict) and not bool(self._active_timer.get("done"))
+            self._active_timer = None
+        if existed:
+            self._log("⏱ Таймер отменён.")
+        else:
+            self._log("⏱ Активного таймера нет.")
+
+    def pop_due_timers(self) -> list[str]:
+        with self._timer_lock:
+            timer = self._active_timer
+            if not isinstance(timer, dict):
+                return []
+            if bool(timer.get("done")):
+                return []
+            if float(timer.get("end_ts", 0)) > time.time():
+                return []
+            timer["done"] = True
+            self._active_timer = None
+            label = self._normalize_spaces(str(timer.get("label") or ""))
+            return [label] if label else [""]
+
+    # ============ System actions ============
+    def shutdown_pc(self):
+        try:
+            self._log("🛑 Выключаю компьютер...")
+            subprocess.Popen(["shutdown", "/s", "/t", "0"], shell=False)
+        except Exception as e:
+            logger.error(f"Ошибка выключения ПК: {e}")
+
+    def restart_pc(self):
+        try:
+            self._log("🛑 Перезагружаю компьютер...")
+            subprocess.Popen(["shutdown", "/r", "/t", "0"], shell=False)
+        except Exception as e:
+            logger.error(f"Ошибка перезагрузки ПК: {e}")
+
+    def sleep_pc(self):
+        try:
+            self._log("🛑 Перевожу компьютер в сон...")
+            subprocess.Popen(
+                ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+                shell=False,
+            )
+        except Exception as e:
+            logger.error(f"Ошибка перехода в сон: {e}")
+
+    def lock_pc(self):
+        try:
+            self._log("🛑 Блокирую экран...")
+            if os.name == "nt":
+                import ctypes
+
+                ctypes.windll.user32.LockWorkStation()
+                return
+            self._log("⚠ Блокировка экрана поддерживается только в Windows.")
+        except Exception as e:
+            logger.error(f"Ошибка блокировки экрана: {e}")
+
+    def show_weather(self, city: str):
+        """Показать текущую погоду через wttr.in (без API-ключа)."""
+        target_city = self._normalize_spaces(city) or "Astana"
+        try:
+            url = f"https://wttr.in/{quote_plus(target_city)}?format=j1"
+            with urlopen(url, timeout=6) as response:
+                raw = response.read().decode("utf-8", errors="ignore")
+            payload = json.loads(raw)
+            current = (payload.get("current_condition") or [{}])[0]
+            temp = str(current.get("temp_C", "")).strip()
+            desc_items = current.get("weatherDesc") or []
+            desc = ""
+            if isinstance(desc_items, list) and desc_items:
+                desc = str((desc_items[0] or {}).get("value", "")).strip()
+            humidity = str(current.get("humidity", "")).strip()
+            if not temp:
+                self._log(f"⚠ Не удалось получить погоду для: {target_city}")
+                return
+            parts = [f"🌤 Погода в {target_city}: {temp}°C"]
+            if desc:
+                parts.append(desc.lower())
+            if humidity:
+                parts.append(f"влажность {humidity}%")
+            self._log(", ".join(parts) + ".")
+        except Exception as e:
+            logger.error(f"Ошибка получения погоды: {e}")
+            self._log(f"⚠ Не удалось получить погоду для: {target_city}")
+
+    # ============ Todo ============
+    def _todos_file(self) -> Path:
+        todos_file = Path.home() / ".jarvis" / "todos.json"
+        todos_file.parent.mkdir(parents=True, exist_ok=True)
+        return todos_file
+
+    def _load_todos(self) -> list[dict]:
+        path = self._todos_file()
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return data if isinstance(data, list) else []
+
+    def _save_todos(self, todos: list[dict]) -> None:
+        self._todos_file().write_text(
+            json.dumps(todos, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _find_todo_index(todos: list[dict], ref: str) -> int:
+        token = (ref or "").strip()
+        if not token:
+            return -1
+        num = extract_number(token)
+        if num is not None and num > 0:
+            visible = [idx for idx, row in enumerate(todos) if not bool(row.get("done"))]
+            pos = num - 1
+            if 0 <= pos < len(visible):
+                return visible[pos]
+        low = token.lower()
+        for idx, row in enumerate(todos):
+            text = str(row.get("text") or "").lower()
+            if low and low in text and not bool(row.get("done")):
+                return idx
+        return -1
+
+    def add_todo(self, text: str):
+        task = self._normalize_spaces(text)
+        if not task:
+            self._log("⚠ Не удалось добавить задачу: пустой текст.")
+            return
+        todos = self._load_todos()
+        todos.append(
+            {
+                "text": task,
+                "created": datetime.now().isoformat(),
+                "done": False,
+            }
+        )
+        self._save_todos(todos)
+        self._log(f"📌 Задача добавлена: {task}")
+
+    def list_todos(self):
+        todos = self._load_todos()
+        active = [row for row in todos if isinstance(row, dict) and not bool(row.get("done"))]
+        if not active:
+            self._log("📌 Активных задач нет.")
+            return
+        self._log(f"📌 Активных задач: {len(active)}")
+        for i, row in enumerate(active[:10], 1):
+            self._log(f"  {i}. {str(row.get('text') or '').strip()}")
+
+    def complete_todo(self, ref: str):
+        todos = self._load_todos()
+        idx = self._find_todo_index(todos, ref)
+        if idx < 0:
+            self._log("⚠ Задача не найдена.")
+            return
+        todos[idx]["done"] = True
+        todos[idx]["done_at"] = datetime.now().isoformat()
+        text = str(todos[idx].get("text") or "").strip()
+        self._save_todos(todos)
+        self._log(f"✅ Задача выполнена: {text}")
+
+    def delete_todo(self, ref: str):
+        todos = self._load_todos()
+        idx = self._find_todo_index(todos, ref)
+        if idx < 0:
+            self._log("⚠ Задача не найдена.")
+            return
+        text = str(todos[idx].get("text") or "").strip()
+        todos.pop(idx)
+        self._save_todos(todos)
+        self._log(f"🗑 Удалил задачу: {text}")
     
     def add_note(self, text: str):
         """Добавить заметку"""

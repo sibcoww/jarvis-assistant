@@ -60,6 +60,10 @@ class TestSimpleNLU(unittest.TestCase):
         intent = self.nlu.parse("запусти телеграмм")
         self.assertEqual(intent["type"], "open_app")
         self.assertEqual(intent["slots"]["target"], "telegram")
+
+        intent = self.nlu.parse("открыть телеграмм")
+        self.assertEqual(intent["type"], "open_app")
+        self.assertEqual(intent["slots"]["target"], "telegram")
     
     def test_open_app_vscode(self):
         """Распознавание команды открыть VS Code"""
@@ -77,6 +81,19 @@ class TestSimpleNLU(unittest.TestCase):
         self.assertEqual(intent["type"], "open_app")
         self.assertEqual(intent["slots"]["target"], "notepad")
 
+    def test_close_app_commands(self):
+        intent = self.nlu.parse("закрой телеграм")
+        self.assertEqual(intent["type"], "close_app")
+        self.assertEqual(intent["slots"]["target"], "telegram")
+
+        intent = self.nlu.parse("выключи браузер")
+        self.assertEqual(intent["type"], "close_app")
+        self.assertEqual(intent["slots"]["target"], "browser")
+
+        intent = self.nlu.parse("закрыть телеграмм")
+        self.assertEqual(intent["type"], "close_app")
+        self.assertEqual(intent["slots"]["target"], "telegram")
+
     def test_open_app_target_in_browser_phrase(self):
         intent = self.nlu.parse("открой ватсап в браузере")
         self.assertEqual(intent["type"], "open_app")
@@ -93,7 +110,8 @@ class TestSimpleNLU(unittest.TestCase):
     def test_volume_down(self):
         """Распознавание команды уменьшить громкость"""
         intent = self.nlu.parse("сделай тише")
-        self.assertEqual(intent["type"], "unknown")
+        self.assertEqual(intent["type"], "volume_down")
+        self.assertEqual(intent["slots"]["delta"], 10)
         
         intent = self.nlu.parse("убавь громкость на 30")
         self.assertEqual(intent["type"], "volume_down")
@@ -106,7 +124,8 @@ class TestSimpleNLU(unittest.TestCase):
     def test_volume_up(self):
         """Распознавание команды увеличить громкость"""
         intent = self.nlu.parse("сделай громче")
-        self.assertEqual(intent["type"], "unknown")
+        self.assertEqual(intent["type"], "volume_up")
+        self.assertEqual(intent["slots"]["delta"], 10)
         
         intent = self.nlu.parse("добавь громкость на 25")
         self.assertEqual(intent["type"], "volume_up")
@@ -314,6 +333,148 @@ class TestNLUNotesCommands(unittest.TestCase):
         
         intent = self.nlu.parse("прочитай заметки")
         self.assertEqual(intent["type"], "read_notes")
+
+
+class TestNLUTodoCommands(unittest.TestCase):
+    def setUp(self):
+        self.nlu = SimpleNLU()
+
+    def test_add_todo(self):
+        intent = self.nlu.parse("добавь задачу купить молоко")
+        self.assertEqual(intent["type"], "add_todo")
+        self.assertIn("молоко", intent["slots"]["text"])
+        intent = self.nlu.parse("запиши мне в дела купить хлеб на вечер")
+        self.assertEqual(intent["type"], "add_todo")
+        self.assertIn("купить хлеб", intent["slots"]["text"])
+
+    def test_list_todos(self):
+        intent = self.nlu.parse("покажи задачи")
+        self.assertEqual(intent["type"], "list_todos")
+        intent = self.nlu.parse("покажи задач")
+        self.assertEqual(intent["type"], "list_todos")
+
+    def test_complete_todo(self):
+        intent = self.nlu.parse("выполнил задачу 2")
+        self.assertEqual(intent["type"], "complete_todo")
+        self.assertEqual(intent["slots"]["ref"], "2")
+        intent = self.nlu.parse("выполнила задачу один")
+        self.assertEqual(intent["type"], "complete_todo")
+        self.assertEqual(intent["slots"]["ref"], "один")
+        intent = self.nlu.parse("выполнил задать один")
+        self.assertEqual(intent["type"], "complete_todo")
+        self.assertEqual(intent["slots"]["ref"], "один")
+        intent = self.nlu.parse("отметьте как первая задача")
+        self.assertEqual(intent["type"], "complete_todo")
+        self.assertIn("первая", intent["slots"]["ref"])
+        intent = self.nlu.parse("отметь когда первую задач")
+        self.assertEqual(intent["type"], "complete_todo")
+        self.assertIn("первую", intent["slots"]["ref"])
+
+    def test_delete_todo(self):
+        intent = self.nlu.parse("удали задачу купить молоко")
+        self.assertEqual(intent["type"], "delete_todo")
+        self.assertIn("молоко", intent["slots"]["ref"])
+        intent = self.nlu.parse("удали задать один")
+        self.assertEqual(intent["type"], "delete_todo")
+        self.assertEqual(intent["slots"]["ref"], "один")
+
+
+class TestNLUTimerCommands(unittest.TestCase):
+    def setUp(self):
+        self.nlu = SimpleNLU()
+
+    def test_start_timer_minutes(self):
+        intent = self.nlu.parse("таймер на 5 минут чай")
+        self.assertEqual(intent["type"], "start_timer")
+        self.assertEqual(intent["slots"]["amount"], 5)
+        self.assertIn("минут", intent["slots"]["unit"])
+        self.assertIn("чай", intent["slots"]["label"])
+
+    def test_start_timer_seconds(self):
+        intent = self.nlu.parse("таймер 10 секунд")
+        self.assertEqual(intent["type"], "start_timer")
+        self.assertEqual(intent["slots"]["amount"], 10)
+
+    def test_timer_status(self):
+        intent = self.nlu.parse("сколько осталось")
+        self.assertEqual(intent["type"], "timer_status")
+
+    def test_timer_cancel(self):
+        intent = self.nlu.parse("отмени таймер")
+        self.assertEqual(intent["type"], "cancel_timer")
+
+
+class TestNLUPresentationCommands(unittest.TestCase):
+    def setUp(self):
+        self.nlu = SimpleNLU()
+
+    def test_next_slide(self):
+        intent = self.nlu.parse("следующий слайд")
+        self.assertEqual(intent["type"], "presentation_next_slide")
+        intent = self.nlu.parse("слайд вперед")
+        self.assertEqual(intent["type"], "presentation_next_slide")
+
+    def test_previous_slide(self):
+        intent = self.nlu.parse("предыдущий слайд")
+        self.assertEqual(intent["type"], "presentation_previous_slide")
+        intent = self.nlu.parse("слайд назад")
+        self.assertEqual(intent["type"], "presentation_previous_slide")
+
+    def test_presentation_start_end(self):
+        intent = self.nlu.parse("запусти презентацию")
+        self.assertEqual(intent["type"], "presentation_start")
+        intent = self.nlu.parse("останови презентацию")
+        self.assertEqual(intent["type"], "presentation_end")
+
+
+class TestNLUWindowAndHistoryCommands(unittest.TestCase):
+    def setUp(self):
+        self.nlu = SimpleNLU()
+
+    def test_window_snap_commands(self):
+        self.assertEqual(self.nlu.parse("окно влево")["type"], "window_snap_left")
+        self.assertEqual(self.nlu.parse("окно вправо")["type"], "window_snap_right")
+        self.assertEqual(self.nlu.parse("окно вверх")["type"], "window_snap_up")
+        self.assertEqual(self.nlu.parse("окно вниз")["type"], "window_snap_down")
+
+    def test_window_split_two(self):
+        self.assertEqual(self.nlu.parse("раздели экран пополам")["type"], "window_split_two")
+
+    def test_repeat_and_history(self):
+        self.assertEqual(self.nlu.parse("повтори команду")["type"], "repeat_last_command")
+        self.assertEqual(self.nlu.parse("что ты сделал")["type"], "show_action_history")
+
+
+class TestNLUSystemCommands(unittest.TestCase):
+    def setUp(self):
+        self.nlu = SimpleNLU()
+
+    def test_shutdown_pc(self):
+        intent = self.nlu.parse("выключи компьютер")
+        self.assertEqual(intent["type"], "shutdown_pc")
+        intent = self.nlu.parse("выключи нахуй комп")
+        self.assertEqual(intent["type"], "shutdown_pc")
+
+    def test_restart_pc(self):
+        intent = self.nlu.parse("перезагрузи компьютер")
+        self.assertEqual(intent["type"], "restart_pc")
+        intent = self.nlu.parse("перезапусти срочно комп")
+        self.assertEqual(intent["type"], "restart_pc")
+
+    def test_sleep_pc(self):
+        intent = self.nlu.parse("режим сна")
+        self.assertEqual(intent["type"], "sleep_pc")
+
+    def test_lock_pc(self):
+        intent = self.nlu.parse("заблокируй экран")
+        self.assertEqual(intent["type"], "lock_pc")
+
+    def test_show_weather(self):
+        intent = self.nlu.parse("какая погода в астане")
+        self.assertEqual(intent["type"], "show_weather")
+        self.assertIn("астане", intent["slots"]["city"])
+        intent = self.nlu.parse("погода")
+        self.assertEqual(intent["type"], "show_weather")
 
 
 if __name__ == "__main__":

@@ -526,6 +526,23 @@ class MainWindow(QMainWindow):
             f'[{formatted["timestamp"]}] [{formatted["level"]}] {formatted["text"]}'
         )
 
+        if self.tray and str(msg).startswith("⏰ Напоминание:"):
+            body = str(msg).replace("⏰ Напоминание:", "", 1).strip()
+            self.tray.showMessage(
+                "Jarvis — Напоминание",
+                body or "Время напоминания наступило.",
+                QSystemTrayIcon.MessageIcon.Information,
+                6000,
+            )
+        if self.tray and str(msg).startswith("⏱ Таймер: время вышло"):
+            body = str(msg).replace("⏱ Таймер:", "", 1).strip()
+            self.tray.showMessage(
+                "Jarvis — Таймер",
+                body or "Время таймера вышло.",
+                QSystemTrayIcon.MessageIcon.Information,
+                6000,
+            )
+
         # Привязываем прогресс-бар к реальному прогрессу загрузки из логов:
         # "📊 Загрузка: 50% (1/2)"
         match = re.search(r"Загрузка:\s*(\d+)%", msg)

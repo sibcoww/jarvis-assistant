@@ -4,20 +4,37 @@ import time
 import json
 import os
 import inspect
+import re
+import subprocess
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from .nlu import SimpleNLU
+from .nlu import SimpleNLU, collapse_repeated_stt_words
 from .executor import Executor
 from .key_store import ensure_keys_file
 
 logger = logging.getLogger(__name__)
 
+try:
+    import pyttsx3
+except Exception:  # noqa: B902
+    pyttsx3 = None
+
+# Пресеты озвучки (pyttsx3: rate ~100–200+, volume 0–1)
+TTS_PRESETS = {
+    "quiet": {"tts_rate": 158, "tts_volume": 0.55},
+    "normal": {"tts_rate": 182, "tts_volume": 0.95},
+    "clear": {"tts_rate": 202, "tts_volume": 1.0},
+}
+
+
 class JarvisEngine:
     def __init__(self, asr=None, log=None, continuous_mode_timeout: float = 10.0):
         self.asr = asr
-        self.log = log or (lambda msg: None)
+        self._log_sink = log or (lambda msg: None)
+        self.log = self._emit_log
         self.continuous_mode_timeout = continuous_mode_timeout  # Время ожидания след. команды без wake-word (сек)
         self.min_intent_confidence = 0.65
         self._app_started_wall = datetime.now()
@@ -25,6 +42,21 @@ class JarvisEngine:
         self._asr_loading_started_monotonic = None
         self._startup_timing_log_path = Path.home() / ".jarvis" / "startup_timing.log"
         self.audio_config = self._load_audio_config()
+        self._assistant_speaking = threading.Event()
+        self._speech_lock = threading.Lock()
+        self._listen_resume_at = 0.0
+        self._tts_engine = None
+        self._tts_unavailable_logged = False
+        self._tts_enabled = bool(self.audio_config.get("tts_enabled", True))
+        self._on_asr_ready_callback: Optional[Callable[[], None]] = None
+        # Короткие фиксированные реплики для защиты / демо (без «сэр» — естественнее для TTS)
+        self._command_ack_variants = (
+            "Слушаю.",
+            "Готово.",
+            "Не расслышал.",
+            "Открываю.",
+            "Проверь микрофон.",
+        )
 
         self._record_startup_timing("app_start")
         self.log(f"⏱ Запуск приложения: {self._app_started_wall.strftime('%H:%M:%S')}")
@@ -36,6 +68,7 @@ class JarvisEngine:
         self._stop = threading.Event()
         self._stop_reason: str | None = None
         self._thread: Optional[threading.Thread] = None
+        self._reminder_thread: Optional[threading.Thread] = None
 
         self.armed = False  # ждём ли команду после wake-word
         self.continuous_mode = False  # ждём ли команду в continuous режиме
@@ -58,6 +91,175 @@ class JarvisEngine:
         self._hotkey_manager = None
         self._ptt_active = False
         self._ptt_pressed = False  # Флаг для предотвращения повторных срабатываний
+        self._init_tts()
+
+    def _speak_known_command_ack(self, intent_type: str):
+        t = (intent_type or "").strip().lower()
+        if not t or t == "unknown":
+            return
+        phrase = random.choice(self._command_ack_variants)
+        self._speak_async(phrase)
+
+    def _emit_log(self, msg: str):
+        self._log_sink(msg)
+        spoken = self._extract_tts_text(msg)
+        if spoken:
+            self._speak_async(spoken)
+
+    def set_asr_ready_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        """Вызывается после успешной загрузки Vosk (без озвучки — для трея / UI)."""
+        self._on_asr_ready_callback = callback
+
+    def speak_if_logged_phrase(self, msg: str) -> None:
+        """Те же правила озвучки, что у логов движка (для строк только из GUI)."""
+        if not self._tts_enabled:
+            return
+        spoken = self._extract_tts_text(msg)
+        if spoken:
+            self._speak_async(spoken)
+
+    @staticmethod
+    def _clean_for_tts(text: str, max_len: int = 380) -> str:
+        s = (text or "").strip()
+        if not s:
+            return ""
+        s = re.sub(r"https?://\S+", "ссылка", s, flags=re.IGNORECASE)
+        s = re.sub(r"www\.\S+", "ссылка", s, flags=re.IGNORECASE)
+        s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+        s = re.sub(r"`+", "", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        if len(s) > max_len:
+            s = s[: max_len - 1].rstrip() + "…"
+        return s
+
+    @classmethod
+    def _extract_tts_text(cls, msg: str) -> str | None:
+        raw = (msg or "").strip()
+        # VS15/VS16 ломают startswith("✅ ") / ("🤖 AI:") в логах Qt/Windows
+        text = raw.replace("\uFE0F", "").replace("\uFE0E", "")
+        if not text:
+            return None
+        low = text.lower()
+        if "[debug]" in low or "[pipe]" in low:
+            return None
+        if "модель загружена" in low and "микрофон готов" in low:
+            return None
+        if text.startswith("⏱") and "слушаю следующую команду" in low:
+            return "Слушаю."
+        if low.startswith(("⏱", "📊", "📥", "🔊 wake-word")):
+            return None
+        if "загрузка:" in low and "%" in text:
+            return None
+
+        if text.startswith("✅ ") and "активирован" in low and "команду" in low:
+            return "Слушаю."
+        if text.startswith("🎙") and "слушаю команду" in low:
+            return "Слушаю."
+
+        if text.startswith("🤖 AI:"):
+            return cls._clean_for_tts(text.replace("🤖 AI:", "", 1).strip())
+        if text.startswith("🤖 Нужна цифра") or text.startswith("🤖 Ок, отменил"):
+            return cls._clean_for_tts(text.replace("🤖", "", 1).strip())
+
+        speak_prefixes = (
+            "⚠ ",
+            "✅ ",
+            "❌ ",
+            "💡 ",
+            "🔴 ",
+            "🟡 ",
+            "🗣 ",
+            "🤖 ",
+            "🌐 ",
+            "🛑 ",
+            "🔉 ",
+            "🔊 ",
+        )
+        for prefix in speak_prefixes:
+            if text.startswith(prefix):
+                return cls._clean_for_tts(text[len(prefix) :].strip())
+        return None
+
+    def _init_tts(self):
+        if not self._tts_enabled or pyttsx3 is None:
+            return
+        try:
+            self._tts_engine = pyttsx3.init()
+            self._tts_engine.setProperty("rate", int(self.audio_config.get("tts_rate", 182)))
+            self._tts_engine.setProperty("volume", float(self.audio_config.get("tts_volume", 0.95)))
+        except Exception as error:
+            self._tts_engine = None
+            if not self._tts_unavailable_logged:
+                self._log_sink(f"⚠ Озвучка недоступна: {error}")
+                self._tts_unavailable_logged = True
+
+    def _speak_async(self, text: str):
+        if not self._tts_enabled or not text.strip():
+            return
+        if self._tts_engine is None:
+            self._init_tts()
+            if self._tts_engine is None:
+                return
+        threading.Thread(target=self._speak_blocking, args=(text,), daemon=True).start()
+
+    def _speak_blocking(self, text: str):
+        clean = self._clean_for_tts(re.sub(r"\s+", " ", text).strip())
+        if not clean:
+            return
+        with self._speech_lock:
+            com_inited = False
+            try:
+                self._assistant_speaking.set()
+                if os.name == "nt":
+                    try:
+                        import pythoncom
+
+                        pythoncom.CoInitialize()
+                        com_inited = True
+                    except Exception:
+                        pass
+                if self._tts_engine is not None:
+                    self._tts_engine.say(clean)
+                    self._tts_engine.runAndWait()
+                elif os.name == "nt":
+                    self._speak_with_windows_sapi(clean)
+            except Exception as error:
+                self._log_sink(f"⚠ Озвучка не сработала, текст в логе. Причина: {error}")
+                logger.warning("TTS failed: %s", error)
+            finally:
+                if com_inited:
+                    try:
+                        import pythoncom
+
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+                delay = float(self.audio_config.get("post_tts_mic_delay", 0.45))
+                self._listen_resume_at = time.time() + max(0.0, delay)
+                self._assistant_speaking.clear()
+
+    @staticmethod
+    def _speak_with_windows_sapi(text: str):
+        escaped = text.replace("'", "''")
+        script = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            "$speak.Rate = 0; "
+            f"$speak.Speak('{escaped}');"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def _wait_until_not_speaking(self) -> bool:
+        while not self._stop.is_set():
+            if not self._assistant_speaking.is_set() and time.time() >= self._listen_resume_at:
+                return True
+            time.sleep(0.05)
+        return False
 
     def enable_push_to_talk(self, hotkey_str: str = "f6") -> bool:
         """Включает режим push-to-talk с указанной клавишей/комбинацией
@@ -209,6 +411,12 @@ class JarvisEngine:
             self.is_loading = False
             self.is_ready = True
             self.log("✅ Модель загружена, микрофон готов")
+            cb = self._on_asr_ready_callback
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    logger.exception("on_asr_ready callback failed")
 
             asr_load_seconds = None
             if self._asr_loading_started_monotonic is not None:
@@ -248,11 +456,17 @@ class JarvisEngine:
             self.nlu.load_config()
             self.ex.load_config()
             self.audio_config = self._load_audio_config()
+            self._tts_enabled = bool(self.audio_config.get("tts_enabled", True))
+            self._tts_engine = None
+            self._init_tts()
             self.log("✅ Конфигурация перезагружена")
         except Exception as e:
             self.log(f"❌ Ошибка при перезагрузке конфигурации: {e}")
             raise
 
+    def test_tts_utterance(self):
+        """Короткая фраза для кнопки «Тест озвучки» в GUI."""
+        self._speak_async("Тест озвучки. Голос работает.")
 
     def _on_wakeword_detected(self, keyword: str):
         self._wake_detected_at = time.perf_counter()
@@ -314,17 +528,35 @@ class JarvisEngine:
     @staticmethod
     def _load_audio_config() -> dict:
         config_path = Path(__file__).with_name("config.json")
-        defaults = {"phrase_timeout": 6.0, "silence_timeout": 1.2, "wake_engine": "vosk_text"}
+        defaults = {
+            "phrase_timeout": 6.0,
+            "silence_timeout": 1.2,
+            "wake_engine": "vosk_text",
+            "tts_enabled": True,
+            "tts_preset": "normal",
+            "tts_rate": TTS_PRESETS["normal"]["tts_rate"],
+            "tts_volume": TTS_PRESETS["normal"]["tts_volume"],
+            "post_tts_mic_delay": 0.45,
+        }
         if not config_path.exists():
             return defaults
         try:
             data = json.loads(config_path.read_text(encoding="utf-8"))
             audio = data.get("audio", {}) if isinstance(data, dict) else {}
             result = defaults.copy()
+            preset = str(audio.get("tts_preset", "normal")).strip().lower()
+            if preset not in TTS_PRESETS:
+                preset = "normal"
+            pr = TTS_PRESETS[preset]
             result.update({
                 "phrase_timeout": audio.get("phrase_timeout", defaults["phrase_timeout"]),
                 "silence_timeout": audio.get("silence_timeout", defaults["silence_timeout"]),
                 "wake_engine": audio.get("wake_engine", defaults["wake_engine"]),
+                "tts_enabled": audio.get("tts_enabled", defaults["tts_enabled"]),
+                "tts_preset": preset,
+                "tts_rate": int(audio.get("tts_rate", pr["tts_rate"])),
+                "tts_volume": float(audio.get("tts_volume", pr["tts_volume"])),
+                "post_tts_mic_delay": float(audio.get("post_tts_mic_delay", defaults["post_tts_mic_delay"])),
             })
             return result
         except Exception:
@@ -346,6 +578,8 @@ class JarvisEngine:
         self._wake_event.clear()
         self._thread = threading.Thread(target=self._bootstrap_and_run, daemon=True)
         self._thread.start()
+        self._reminder_thread = threading.Thread(target=self._run_reminder_loop, daemon=True)
+        self._reminder_thread.start()
 
 
     def _bootstrap_and_run(self):
@@ -367,6 +601,29 @@ class JarvisEngine:
             if self._wake_detector:
                 self._wake_detector.stop_listening()
             self.is_running = False
+
+    def _run_reminder_loop(self):
+        """Фоновая проверка таймеров напоминаний."""
+        while not self._stop.is_set():
+            try:
+                due_items = self.ex.pop_due_reminders()
+                for text in due_items:
+                    message = f"⏰ Напоминание: {text}"
+                    self.log(message)
+                    self._speak_async(f"Напоминание. {text}")
+                due_timers = self.ex.pop_due_timers() if hasattr(self.ex, "pop_due_timers") else []
+                for label in due_timers:
+                    if label:
+                        message = f"⏱ Таймер: время вышло. {label}"
+                        voice = f"Таймер завершен. {label}"
+                    else:
+                        message = "⏱ Таймер: время вышло."
+                        voice = "Таймер завершен."
+                    self.log(message)
+                    self._speak_async(voice)
+            except Exception as error:
+                logger.debug("Reminder poll failed: %s", error)
+            time.sleep(1.0)
 
 
     def _caller_label(self) -> str:
@@ -429,6 +686,8 @@ class JarvisEngine:
 
 
     def _listen_once_timed(self, stage_label: str) -> str | None:
+        if not self._wait_until_not_speaking():
+            return None
         listen_started_at = time.perf_counter()
         text = self.asr.listen_once()
         listen_elapsed = time.perf_counter() - listen_started_at
@@ -437,7 +696,9 @@ class JarvisEngine:
         return text
 
     def _execute_intent_if_valid(self, source_text: str):
-        raw_text = (source_text or "").strip()
+        raw_text = collapse_repeated_stt_words((source_text or "").strip())
+        def _pipe(intent_name: str, result: str):
+            self.log(f"[PIPE] q='{raw_text}' intent='{intent_name}' action='{intent_name}' result='{result}'")
 
         # Шаг подтверждения рискованных действий.
         try:
@@ -447,26 +708,23 @@ class JarvisEngine:
         if handled:
             if confirm_state == "cancel":
                 self.log("🛑 Действие отменено.")
-                self.log(f"[PIPE] text='{raw_text}' -> intent='confirm' -> result='cancelled'")
+                _pipe("confirm", "cancelled")
                 return True
             if confirmed_intent:
                 try:
+                    self._speak_known_command_ack(confirmed_intent.get("type", ""))
                     self.ex.run(confirmed_intent)
                     self.log("✅ Подтвержденное действие выполнено.")
-                    self.log(
-                        f"[PIPE] text='{raw_text}' -> intent='{confirmed_intent.get('type')}' -> result='ok' reason='confirmed'"
-                    )
+                    _pipe(str(confirmed_intent.get("type") or "unknown"), "ok_confirmed")
                     return True
                 except Exception as error:
                     self.log(f"❌ Ошибка выполнения подтвержденного действия: {error}")
                     logger.exception("Confirmed executor run failed")
-                    self.log(
-                        f"[PIPE] text='{raw_text}' -> intent='{confirmed_intent.get('type')}' -> result='error'"
-                    )
+                    _pipe(str(confirmed_intent.get("type") or "unknown"), "error")
                     return False
 
         try:
-            intent = self.nlu.parse(source_text)
+            intent = self.nlu.parse(raw_text)
         except Exception as error:
             self.log(f"❌ Ошибка распознавания интента: {error}")
             logger.exception("Intent parse failed")
@@ -474,15 +732,13 @@ class JarvisEngine:
 
         if intent.get("type") == "unknown":
             try:
-                handled = self.ex.handle_unrecognized_command(source_text)
-                self.log(
-                    f"[PIPE] text='{raw_text}' -> intent='unknown' -> result='{'ok' if handled else 'fallback'}'"
-                )
+                handled = self.ex.handle_unrecognized_command(raw_text)
+                _pipe("unknown", "ok" if handled else "fallback")
                 return handled
             except Exception as error:
                 self.log(f"❌ Ошибка AI fallback: {error}")
                 logger.exception("AI fallback failed")
-                self.log(f"[PIPE] text='{raw_text}' -> intent='unknown' -> result='error'")
+                _pipe("unknown", "error")
                 return False
 
         confidence = intent.get("confidence")
@@ -494,19 +750,18 @@ class JarvisEngine:
         if hasattr(self.ex, "should_require_confirmation") and self.ex.should_require_confirmation(intent):
             prompt = self.ex.queue_confirmation(intent)
             self.log(f"⚠ {prompt}")
-            self.log(
-                f"[PIPE] text='{raw_text}' -> intent='{intent.get('type')}' -> result='pending_confirmation'"
-            )
+            _pipe(str(intent.get("type") or "unknown"), "pending_confirmation")
             return True
         try:
+            self._speak_known_command_ack(intent.get("type", ""))
             self.ex.run(intent)
         except Exception as error:
             self.log(f"❌ Ошибка выполнения команды: {error}")
             logger.exception("Executor run failed")
-            self.log(f"[PIPE] text='{raw_text}' -> intent='{intent.get('type')}' -> result='error'")
+            _pipe(str(intent.get("type") or "unknown"), "error")
             return False
         self.log("✅ Готово.")
-        self.log(f"[PIPE] text='{raw_text}' -> intent='{intent.get('type')}' -> result='ok'")
+        _pipe(str(intent.get("type") or "unknown"), "ok")
         return True
 
     def _expire_continuous_if_needed(self, now: float | None = None) -> bool:
@@ -545,7 +800,9 @@ class JarvisEngine:
                     if text_clean != text:
                         self.log(f"🧹 Очищено: {text_clean}")
                     text = text_clean
-                
+                else:
+                    self.log("⚠ Не расслышал.")
+
                 executed = self._execute_intent_if_valid(text or "") if text else False
                 if executed:
                     self.continuous_mode = True
@@ -582,6 +839,8 @@ class JarvisEngine:
                 if text_clean != text:
                     self.log(f"🧹 Очищено: {text_clean}")
                 text = text_clean
+            else:
+                self.log("⚠ Не расслышал.")
 
             executed = self._execute_intent_if_valid(text or "") if text else False
             if executed:
@@ -597,6 +856,7 @@ class JarvisEngine:
                 if self._stop.is_set():
                     break
                 if not next_text:
+                    self.log("⚠ Не расслышал.")
                     continue
 
                 self.log(f"🎙 Распознано: {next_text}")
@@ -637,6 +897,8 @@ class JarvisEngine:
             if self._stop.is_set():
                 break
             if not text:
+                if stage != "Ожидание wake-word":
+                    self.log("⚠ Не расслышал.")
                 continue
 
             t = text.strip().lower()
@@ -673,6 +935,7 @@ class JarvisEngine:
                     # Got valid intent in same sentence as wake word
                     self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                     try:
+                        self._speak_known_command_ack(intent.get("type", ""))
                         self.ex.run(intent)
                     except Exception as error:
                         self.log(f"❌ Ошибка выполнения команды: {error}")
@@ -722,6 +985,7 @@ class JarvisEngine:
 
                     self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                     try:
+                        self._speak_known_command_ack(intent.get("type", ""))
                         self.ex.run(intent)
                     except Exception as error:
                         self.log(f"❌ Ошибка выполнения команды: {error}")
@@ -766,6 +1030,7 @@ class JarvisEngine:
 
                 self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                 try:
+                    self._speak_known_command_ack(intent.get("type", ""))
                     self.ex.run(intent)
                 except Exception as error:
                     self.log(f"❌ Ошибка выполнения команды: {error}")

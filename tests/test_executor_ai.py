@@ -348,6 +348,20 @@ def test_ai_site_query_same_words_resolves_home_url(monkeypatch, tmp_path):
     assert out["slots"]["url"] == "https://www.twitch.tv/"
 
 
+def test_browser_search_video_query_routes_to_youtube(monkeypatch, tmp_path):
+    executor = make_executor(monkeypatch, tmp_path)
+    out = executor._validate_ai_command_payload(
+        {
+            "mode": "command",
+            "intent": "browser_search",
+            "slots": {"query": "видео про numpy"},
+        }
+    )
+    assert out is not None
+    assert out["type"] == "browser_navigate"
+    assert "youtube.com/results" in out["slots"]["url"]
+
+
 
 
 def test_interpret_command_includes_dialog_recap(monkeypatch, tmp_path):
@@ -386,3 +400,116 @@ def test_build_ai_request_history_without_memory_prefix(monkeypatch, tmp_path):
     assert any(m.get("role") == "user" and m.get("content") == "last-q" for m in hist)
     mem_blocks = [m for m in hist if m["role"] == "system" and "Память о пользователе" in m["content"]]
     assert mem_blocks == []
+
+
+def test_local_ai_fallback_add_todo(monkeypatch, tmp_path):
+    executor = make_executor(monkeypatch, tmp_path)
+    executor._ai_client = DummyAIClient(
+        responses=['{"mode":"command","intent":"add_todo","slots":{"text":"купить хлеб"}}'],
+        errors=[None],
+    )
+    called = {}
+
+    def fake_run(intent):
+        called["intent"] = intent
+
+    executor.run = fake_run
+    handled = executor.handle_unrecognized_command("напиши мне задачу купить хлеб")
+    assert handled is True
+    assert called["intent"]["type"] == "add_todo"
+    assert called["intent"]["slots"]["text"] == "купить хлеб"
+
+
+def test_local_ai_fallback_start_timer(monkeypatch, tmp_path):
+    executor = make_executor(monkeypatch, tmp_path)
+    executor._ai_client = DummyAIClient(
+        responses=[
+            '{"mode":"command","intent":"start_timer","slots":{"amount":10,"unit":"минут","label":"чай"}}'
+        ],
+        errors=[None],
+    )
+    called = {}
+
+    def fake_run(intent):
+        called["intent"] = intent
+
+    executor.run = fake_run
+    handled = executor.handle_unrecognized_command("поставь таймер на десять минут для чая")
+    assert handled is True
+    assert called["intent"]["type"] == "start_timer"
+    assert called["intent"]["slots"]["amount"] == 10
+    assert called["intent"]["slots"]["unit"] == "минут"
+
+
+def test_local_ai_fallback_todo_phrase_with_dela_marker(monkeypatch, tmp_path):
+    executor = make_executor(monkeypatch, tmp_path)
+    executor._ai_client = DummyAIClient(
+        responses=['{"mode":"command","intent":"add_todo","slots":{"text":"купить хлеб на вечер"}}'],
+        errors=[None],
+    )
+    called = {}
+
+    def fake_run(intent):
+        called["intent"] = intent
+
+    executor.run = fake_run
+    handled = executor.handle_unrecognized_command("запиши мне в дела купить хлеб на вечер")
+    assert handled is True
+    assert called["intent"]["type"] == "add_todo"
+    assert "хлеб" in called["intent"]["slots"]["text"]
+
+
+def test_local_like_query_does_not_fall_back_to_unified_browser_search(monkeypatch, tmp_path):
+    executor = make_executor(monkeypatch, tmp_path)
+    # 1) Local fallback returns payload with unsupported mode -> считается неуспехом.
+    # 2) После фикса такие локальные фразы НЕ должны уходить в unified AI.
+    executor._ai_client = DummyAIClient(
+        responses=['{"mode":"none"}', '{"mode":"action","intent":"browser_search","slots":{"query":"x"}}'],
+        errors=[None, None],
+    )
+    called = {}
+
+    def fake_run(intent):
+        called["intent"] = intent
+
+    executor.run = fake_run
+    handled = executor.handle_unrecognized_command("мне надо в список дел купить хлеб и молоко")
+    assert handled is True
+    assert "intent" not in called
+    # Вызов был только один (локальный fallback), до unified не дошли.
+    assert executor._ai_client.calls == 1
+
+
+def test_local_ai_fallback_system_lock(monkeypatch, tmp_path):
+    executor = make_executor(monkeypatch, tmp_path)
+    executor._ai_client = DummyAIClient(
+        responses=['{"mode":"command","intent":"lock_pc","slots":{}}'],
+        errors=[None],
+    )
+    called = {}
+
+    def fake_run(intent):
+        called["intent"] = intent
+
+    executor.run = fake_run
+    handled = executor.handle_unrecognized_command("сделай блокировку экрана")
+    assert handled is True
+    assert called["intent"]["type"] == "lock_pc"
+
+
+def test_local_ai_fallback_weather(monkeypatch, tmp_path):
+    executor = make_executor(monkeypatch, tmp_path)
+    executor._ai_client = DummyAIClient(
+        responses=['{"mode":"command","intent":"show_weather","slots":{"city":"астана"}}'],
+        errors=[None],
+    )
+    called = {}
+
+    def fake_run(intent):
+        called["intent"] = intent
+
+    executor.run = fake_run
+    handled = executor.handle_unrecognized_command("какая сейчас погода в астане")
+    assert handled is True
+    assert called["intent"]["type"] == "show_weather"
+    assert called["intent"]["slots"]["city"] == "астана"
