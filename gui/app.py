@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
     QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle, QCheckBox, QLineEdit,
-    QListWidget, QListWidgetItem, QAbstractItemView,
 )
 
 import sounddevice as sd
@@ -21,8 +20,9 @@ import sounddevice as sd
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtCore import Signal, QObject, QTimer, QEvent, Qt
 
-from src.jarvis.engine import JarvisEngine
+from src.jarvis.engine import JarvisEngine, TTS_PRESETS
 from src.jarvis.key_store import ensure_keys_file, save_keys
+from src.jarvis.app_scanner import merge_scanned_apps_into_config
 
 logger = logging.getLogger(__name__)
 
@@ -60,18 +60,15 @@ class MainWindow(QMainWindow):
         self.settings_tab = QWidget()
         self.setup_settings_tab()
 
-        self.memory_tab = QWidget()
-        self.setup_memory_tab()
-        
         self.tabs.addTab(self.main_tab, "Основное")
         self.tabs.addTab(self.settings_tab, "Настройки")
-        self.tabs.addTab(self.memory_tab, "Память")
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
         
         self.setCentralWidget(self.tabs)
 
         self.bus.log.connect(self.append_log)
+        self.engine.set_asr_ready_callback(self._schedule_asr_ready_tray_notification)
         self.load_devices()
         self.load_audio_settings()
         
@@ -106,6 +103,21 @@ class MainWindow(QMainWindow):
 
     def set_tray(self, tray: QSystemTrayIcon):
         self.tray = tray
+
+    def _schedule_asr_ready_tray_notification(self):
+        if not self.tray:
+            return
+        QTimer.singleShot(0, self._show_asr_ready_tray_notification)
+
+    def _show_asr_ready_tray_notification(self):
+        if not self.tray:
+            return
+        self.tray.showMessage(
+            "Jarvis Assistant",
+            "Модель распознавания загружена. Можно нажать «Старт».",
+            QSystemTrayIcon.MessageIcon.Information,
+            4500,
+        )
 
     def show_and_raise(self):
         self.showNormal()
@@ -189,64 +201,8 @@ class MainWindow(QMainWindow):
         
         self.main_tab.setLayout(layout)
 
-    def setup_memory_tab(self):
-        layout = QVBoxLayout()
-        hint = QLabel(
-            "Локальные записи памяти. Помеченные 🔒 как не для облака: такие строки не подмешиваются "
-            "в запрос к онлайн-AI, но остаются у тебя на диске в ~/.jarvis/."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        self.memory_list = QListWidget()
-        self.memory_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        layout.addWidget(self.memory_list)
-        row = QHBoxLayout()
-        btn_refresh = QPushButton("Обновить")
-        btn_refresh.clicked.connect(self.refresh_memory_list)
-        btn_delete = QPushButton("Удалить выбранные")
-        btn_delete.clicked.connect(self.delete_selected_memories)
-        btn_clear_session = QPushButton("Очистить session-слой")
-        btn_clear_session.clicked.connect(self.clear_session_memories)
-        row.addWidget(btn_refresh)
-        row.addWidget(btn_delete)
-        row.addWidget(btn_clear_session)
-        layout.addLayout(row)
-        self.memory_tab.setLayout(layout)
-
     def on_tab_changed(self, index):
-        if self.tabs.widget(index) is self.memory_tab:
-            self.refresh_memory_list()
-
-    def refresh_memory_list(self):
-        self.memory_list.clear()
-        try:
-            rows = self.engine.ex.memory.list_memories_for_ui(100)
-        except Exception as error:
-            self.memory_list.addItem(QListWidgetItem(f"Ошибка загрузки памяти: {error}"))
-            return
-        for row in rows:
-            mid = row.get("id") or ""
-            layer = row.get("layer") or "?"
-            prefix = "🔒 " if row.get("sensitive") else ""
-            text = str(row.get("text") or "")[:400]
-            label = f"{prefix}[{layer}] {text}"
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, mid)
-            self.memory_list.addItem(item)
-        if self.memory_list.count() == 0:
-            self.memory_list.addItem(QListWidgetItem("(пусто)"))
-
-    def delete_selected_memories(self):
-        store = self.engine.ex.memory
-        for list_item in self.memory_list.selectedItems():
-            mid = list_item.data(Qt.ItemDataRole.UserRole)
-            if mid:
-                store.remove_by_id(mid)
-        self.refresh_memory_list()
-
-    def clear_session_memories(self):
-        self.engine.ex.memory.clear_session_layer()
-        self.refresh_memory_list()
+        _ = index
     
     def setup_settings_tab(self):
         """Настройка вкладки настроек"""
@@ -328,6 +284,41 @@ class MainWindow(QMainWindow):
         silence_layout.addWidget(self.silence_spinbox)
         silence_layout.addStretch()
         layout.addLayout(silence_layout)
+
+        tts_head = QLabel("Озвучка (TTS, pyttsx3):")
+        tts_bf = tts_head.font()
+        tts_bf.setBold(True)
+        tts_head.setFont(tts_bf)
+        layout.addWidget(tts_head)
+
+        tts_row = QHBoxLayout()
+        self.tts_enabled_checkbox = QCheckBox("Включить озвучку")
+        self.tts_enabled_checkbox.stateChanged.connect(self.on_tts_enabled_changed)
+        tts_row.addWidget(self.tts_enabled_checkbox)
+
+        tts_row.addWidget(QLabel("Пресет:"))
+        self.tts_preset_combo = QComboBox()
+        self.tts_preset_combo.addItem("Тихий", "quiet")
+        self.tts_preset_combo.addItem("Нормальный", "normal")
+        self.tts_preset_combo.addItem("Чёткий", "clear")
+        self.tts_preset_combo.currentIndexChanged.connect(self.on_tts_preset_changed)
+        tts_row.addWidget(self.tts_preset_combo)
+
+        tts_row.addWidget(QLabel("Пауза микрофона после речи (сек):"))
+        self.post_tts_spin = QDoubleSpinBox()
+        self.post_tts_spin.setMinimum(0.1)
+        self.post_tts_spin.setMaximum(2.5)
+        self.post_tts_spin.setSingleStep(0.05)
+        self.post_tts_spin.setDecimals(2)
+        self.post_tts_spin.setToolTip("Чтобы микрофон не ловил собственную озвучку")
+        self.post_tts_spin.valueChanged.connect(self.on_post_tts_delay_changed)
+        tts_row.addWidget(self.post_tts_spin)
+
+        self.btn_test_tts = QPushButton("🔊 Тест озвучки")
+        self.btn_test_tts.clicked.connect(self.on_test_tts)
+        tts_row.addWidget(self.btn_test_tts)
+        tts_row.addStretch()
+        layout.addLayout(tts_row)
         
         # Информация
         info_label = QLabel(
@@ -456,7 +447,14 @@ class MainWindow(QMainWindow):
         reload_config_btn = QPushButton("🔄 Перезагрузить конфиг")
         reload_config_btn.clicked.connect(self.on_reload_config)
         config_buttons_layout.addWidget(reload_config_btn)
-        
+
+        scan_apps_btn = QPushButton("🔎 Найти приложения")
+        scan_apps_btn.setToolTip(
+            "Ищет ~40 типовых программ (браузеры, IDE, мессенджеры, игры, Office…) и дописывает apps в config.json"
+        )
+        scan_apps_btn.clicked.connect(self.on_scan_apps)
+        config_buttons_layout.addWidget(scan_apps_btn)
+
         layout.addLayout(config_buttons_layout)
         
         layout.addStretch()
@@ -663,11 +661,85 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.append_log(f"❌ Ошибка при перезагрузке конфига: {e}")
 
+    def on_scan_apps(self):
+        if sys.platform != "win32":
+            self.append_log("⚠ Автопоиск приложений поддерживается только в Windows.")
+            return
+        config_path = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "config.json"
+        if not config_path.exists():
+            self.append_log(f"❌ Нет файла конфига: {config_path}")
+            return
+        try:
+            result = merge_scanned_apps_into_config(config_path)
+            self.engine.reload_config()
+            updated = result.get("updated") or []
+            syn_add = result.get("synonyms_added") or []
+            discovered = result.get("discovered") or []
+            kept = result.get("skipped_kept_user") or []
+
+            if updated:
+                self.append_log(f"🔎 Добавлено/исправлено в apps: {', '.join(updated)}")
+            if syn_add:
+                self.append_log(f"🔎 Добавлены синонимы ({len(syn_add)}): {', '.join(syn_add[:12])}{'…' if len(syn_add) > 12 else ''}")
+            if not updated and not syn_add:
+                if discovered:
+                    hint = (
+                        f"на диске найдено {len(discovered)} из списка сканера "
+                        f"({', '.join(discovered[:8])}{'…' if len(discovered) > 8 else ''})"
+                    )
+                    if kept:
+                        hint += f"; рабочие пути в config не меняли ({len(kept)}: {', '.join(kept[:6])}{'…' if len(kept) > 6 else ''})"
+                    self.append_log(f"🔎 {hint.capitalize()}.")
+                else:
+                    self.append_log(
+                        "🔎 В стандартных папках не найдено ни одной из ~40 программ из списка сканера. "
+                        "Добавь .exe в apps вручную."
+                    )
+            self.append_log("🔄 Конфиг перезагружен")
+        except Exception as e:
+            self.append_log(f"❌ Ошибка автопоиска приложений: {e}")
+
     def on_phrase_timeout_changed(self, value):
         self.save_audio_setting("phrase_timeout", value)
 
     def on_silence_timeout_changed(self, value):
         self.save_audio_setting("silence_timeout", value)
+
+    def on_tts_enabled_changed(self, state: int):
+        enabled = state != 0
+        self.save_audio_setting("tts_enabled", enabled)
+        try:
+            self.engine.reload_config()
+            self.append_log(f"🔊 Озвучка: {'включена' if enabled else 'выключена'}")
+        except Exception as error:
+            self.append_log(f"❌ Не удалось применить настройки TTS: {error}")
+
+    def on_tts_preset_changed(self, _index: int):
+        preset = self.tts_preset_combo.currentData()
+        if not preset:
+            return
+        pr = TTS_PRESETS.get(preset, TTS_PRESETS["normal"])
+        self.save_audio_setting("tts_preset", preset)
+        self.save_audio_setting("tts_rate", pr["tts_rate"])
+        self.save_audio_setting("tts_volume", pr["tts_volume"])
+        try:
+            self.engine.reload_config()
+            self.append_log(f"🔊 Пресет озвучки: {self.tts_preset_combo.currentText()}")
+        except Exception as error:
+            self.append_log(f"❌ Не удалось применить пресет: {error}")
+
+    def on_post_tts_delay_changed(self, value: float):
+        v = float(value)
+        self.save_audio_setting("post_tts_mic_delay", v)
+        if hasattr(self.engine, "audio_config") and isinstance(self.engine.audio_config, dict):
+            self.engine.audio_config["post_tts_mic_delay"] = v
+
+    def on_test_tts(self):
+        if not getattr(self.engine, "_tts_enabled", True):
+            self.append_log("⚠ Озвучка выключена в настройках.")
+            return
+        self.append_log("🔊 Тест озвучки…")
+        self.engine.test_tts_utterance()
 
     def save_config_section_value(self, section: str, key: str, value):
         config_path = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "config.json"
@@ -950,12 +1022,14 @@ class MainWindow(QMainWindow):
             
             self.append_log(result_msg)
             self.mic_test_result.setText(result_msg)
-                
+            self.engine.speak_if_logged_phrase(result_msg)
+
         except Exception as e:
             error_msg = f"❌ Ошибка теста микрофона: {e}"
             self.append_log(error_msg)
             self.mic_test_result.setText(error_msg)
             self.mic_test_result.setStyleSheet("color: #ff0000; font-size: 10px;")
+            self.engine.speak_if_logged_phrase(error_msg)
 
 
     def save_audio_setting(self, key: str, value):
@@ -995,6 +1069,21 @@ class MainWindow(QMainWindow):
             silence_timeout = audio.get("silence_timeout", 1.2)
             self.timeout_spinbox.setValue(phrase_timeout)
             self.silence_spinbox.setValue(silence_timeout)
+
+            tts_en = bool(audio.get("tts_enabled", True))
+            self.tts_enabled_checkbox.blockSignals(True)
+            self.tts_enabled_checkbox.setChecked(tts_en)
+            self.tts_enabled_checkbox.blockSignals(False)
+
+            preset = str(audio.get("tts_preset", "normal")).strip().lower()
+            pidx = self.tts_preset_combo.findData(preset)
+            self.tts_preset_combo.blockSignals(True)
+            self.tts_preset_combo.setCurrentIndex(pidx if pidx >= 0 else 1)
+            self.tts_preset_combo.blockSignals(False)
+
+            self.post_tts_spin.blockSignals(True)
+            self.post_tts_spin.setValue(float(audio.get("post_tts_mic_delay", 0.45)))
+            self.post_tts_spin.blockSignals(False)
             
             # Загрузка движка wake-word
             wake_engine = audio.get("wake_engine", "vosk_text")

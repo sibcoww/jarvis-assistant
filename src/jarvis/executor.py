@@ -26,7 +26,7 @@ from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
 from .plugin_api import PluginManager
 from .key_store import ensure_keys_file
-from .memory_store import MemoryStore
+from .nlu import extract_number
 from .unified_ai_turn import (
     REPLY_ONLY_AFTER_MISROUTING_PROMPT,
     looks_like_informational_without_explicit_action,
@@ -36,7 +36,6 @@ from .unified_ai_turn import (
 
 logger = logging.getLogger(__name__)
 
-
 class Executor:
     def __init__(self, config=None, log_callback=None):
         self.config = config or self._load_default_config()
@@ -44,12 +43,9 @@ class Executor:
         self._ai_client = None
         self._chat_history: List[Dict[str, str]] = []
         self._chat_history_path = Path.home() / ".jarvis" / "chat_history.json"
-        self._session_summary_path = Path.home() / ".jarvis" / "session_summary.txt"
-        self._session_summary = ""
         self._chat_history_limit_pairs = 5
         self._chat_reset_timeout = 300  # сек
         self._last_ai_at: float | None = None
-        self.memory = MemoryStore()
         self._reset_phrases = {
             "очисти контекст",
             "забудь контекст",
@@ -63,30 +59,7 @@ class Executor:
         self.plugin_manager = PluginManager()
         self._apply_context_config()
         self._init_ai_assistant()
-        self._load_session_summary()
         self._load_chat_history()
-
-    @staticmethod
-    def _should_run_ai_memory_extract(query: str) -> bool:
-        text = (query or "").strip().lower()
-        if len(text) < 8:
-            return False
-        command_like = ("открой ", "запусти ", "сделай ", "включи ", "выключи ", "громкость", "пауза")
-        if any(text.startswith(prefix) for prefix in command_like):
-            return False
-        triggers = (
-            "меня зовут",
-            "мой ник",
-            "мне ",
-            "я учусь",
-            "я работаю",
-            "предпочитаю",
-            "мне нравится",
-            "сейчас",
-            "пишу диплом",
-            "проект",
-        )
-        return any(t in text for t in triggers)
 
     @staticmethod
     def _looks_like_reset_context_phrase(query: str) -> bool:
@@ -125,10 +98,6 @@ class Executor:
             return ("app_target", "Какую программу открыть?")
         if q in {"поставь громкость", "сделай громкость", "установи громкость", "громкость", "звук"}:
             return ("volume_value", "На какую громкость поставить? (0-100)")
-        if q in {"сделай тише", "убавь громкость"}:
-            return ("volume_down_delta", "На сколько сделать тише? (1-100)")
-        if q in {"сделай громче", "добавь громкость"}:
-            return ("volume_up_delta", "На сколько сделать громче? (1-100)")
         if q in {"найди в браузере", "найди", "поищи"}:
             return ("browser_query", "Что именно найти в браузере?")
         return None
@@ -150,13 +119,14 @@ class Executor:
             return ""
 
         kind = pending.get("kind")
-        self._pending_clarification = None
         if kind in {"volume_value", "volume_down_delta", "volume_up_delta"}:
-            try:
-                num = int(re.search(r"\d{1,3}", q).group())
-            except Exception:
-                self._log("🤖 Нужна цифра. Повтори значение, например 20.")
+            num = extract_number(q)
+            if num is None:
+                # Не сбрасываем pending: даём повторить значение.
+                self._pending_clarification = pending
+                self._log("🤖 Нужна цифра или число словами. Например: 20 или двадцать.")
                 return ""
+            self._pending_clarification = None
             if kind == "volume_value":
                 num = max(0, min(100, num))
                 self.run({"type": "set_volume", "slots": {"value": num}})
@@ -172,6 +142,7 @@ class Executor:
                 self.run({"type": "volume_up", "slots": {"delta": num}})
                 self._log("✅ Готово.")
                 return ""
+        self._pending_clarification = None
         if kind == "browser_target":
             return f"открой {q} в браузере"
         if kind == "app_target":
@@ -224,43 +195,6 @@ class Executor:
             d = str(slots.get("destination") or "").strip()
             return f"Подтверди перемещение файла: {s} -> {d}. Скажи «подтверждаю» или «отмена»."
         return "Подтверди действие: «подтверждаю» или «отмена»."
-
-    def _extract_memory_with_ai(self, query: str):
-        if not self._ai_client or not self._ai_client.is_enabled():
-            return
-        query = self.memory.sanitize_user_memory_text(query)
-        if not query:
-            return
-        if not self._should_run_ai_memory_extract(query):
-            return
-
-        extract_prompt = (
-            "Определи, нужно ли сохранить это сообщение в память ассистента.\n"
-            "Верни строго JSON без пояснений со схемой:\n"
-            "{\"save\":bool,\"layer\":\"core|session\",\"type\":\"profile|preference|fact|project\","
-            "\"key\":\"optional\",\"value\":\"...\",\"importance\":1..5,\"sensitive\":bool}\n"
-            "Поле sensitive=true, если это личные/секретные данные, которые нельзя подставлять в облачный контекст AI "
-            "(пароли, токены, точный адрес, конфиденциальные факты). Иначе false.\n"
-            "Если сохранять не нужно, верни {\"save\":false}.\n"
-            f"Сообщение пользователя: {query}"
-        )
-        raw = self._ai_client.get_response(
-            extract_prompt,
-            history=None,
-            system_prompt=(
-                "Ты memory-classifier. Отвечай только валидным JSON без markdown и без комментариев."
-            ),
-            max_tokens=180,
-            temperature=0.0,
-        )
-        if not raw:
-            return
-
-        try:
-            suggestion = json.loads(raw)
-        except Exception:
-            return
-        self.memory.save_ai_suggestion(suggestion)
 
     def _dialog_context_recap_for_command_ai(self, max_messages: int = 6) -> str:
         """Короткий субтитр диалога, чтобы понимать «это», «оно», «то же самое» при интерпретации команды."""
@@ -354,10 +288,7 @@ class Executor:
             f"history_pairs~{len(self._chat_history) // 2}, informational_lock={info_lock}"
         )
 
-        # Локальные правила памяти остаются включенными, чтобы не терять факты.
-        self.memory.learn_from_user_text(text)
-        memory_context = self.memory.build_context(text, top_k=4, for_cloud=True)
-        request_history = self._build_ai_request_history(memory_context)
+        request_history = self._build_ai_request_history()
 
         recap = self._dialog_context_recap_for_command_ai()
         user_payload = text
@@ -365,6 +296,8 @@ class Executor:
             user_payload = f"{recap}\n\n---\nТекущая фраза пользователя: {text}"
 
         system_prompt = unified_turn_system_prompt(informational_lock=info_lock)
+        ai_cfg = self._ai_settings()
+        max_reply_tokens = int(ai_cfg.get("reply_max_tokens", 120))
         last_error_text = None
         response = None
         for attempt in range(2):
@@ -372,7 +305,7 @@ class Executor:
                 user_payload,
                 history=request_history,
                 system_prompt=system_prompt,
-                max_tokens=650,
+                max_tokens=max_reply_tokens,
                 temperature=0.15,
             )
             last_error_text = getattr(self._ai_client, "last_error", None)
@@ -395,6 +328,11 @@ class Executor:
         if not response:
             return False
 
+        raw_preview = (response or "").strip().replace("\r\n", "\n")
+        if len(raw_preview) > 2000:
+            raw_preview = raw_preview[:2000].rstrip() + "…"
+        self._log(f"[DEBUG] Unified AI сырой ответ модели:\n{raw_preview}")
+
         parsed = parse_unified_model_output(response)
         if not parsed:
             parsed = {"mode": "reply", "message": response.strip()}
@@ -411,12 +349,24 @@ class Executor:
                     temperature=0.25,
                 )
                 if response2 and response2.strip():
+                    r2 = response2.strip().replace("\r\n", "\n")
+                    if len(r2) > 2000:
+                        r2 = r2[:2000].rstrip() + "…"
+                    self._log(f"[DEBUG] Unified AI ответ после перепроверки (сырой):\n{r2}")
                     parsed = {"mode": "reply", "message": response2.strip()}
                 else:
                     parsed = {
                         "mode": "reply",
                         "message": "Могу рассказать текстом или открыть сайт — скажи, что нужно.",
                     }
+
+        try:
+            dumped = json.dumps(parsed, ensure_ascii=False)
+            if len(dumped) > 1500:
+                dumped = dumped[:1500].rstrip() + "…"
+            self._log(f"[DEBUG] Unified AI разобранный JSON (объект):\n{dumped}")
+        except (TypeError, ValueError):
+            self._log(f"[DEBUG] Unified AI разобранный объект (repr): {parsed!r}")
 
         if parsed.get("mode") == "action":
             legacy = {
@@ -439,6 +389,10 @@ class Executor:
                         temperature=0.25,
                     )
                     if response3 and response3.strip():
+                        r3 = response3.strip().replace("\r\n", "\n")
+                        if len(r3) > 2000:
+                            r3 = r3[:2000].rstrip() + "…"
+                        self._log(f"[DEBUG] Unified AI ответ после невалидного action (сырой):\n{r3}")
                         parsed = {"mode": "reply", "message": response3.strip()}
                     else:
                         return False
@@ -464,12 +418,14 @@ class Executor:
             message = parsed.get("message")
             if not isinstance(message, str) or not message.strip():
                 return False
-            self._extract_memory_with_ai(text)
+            max_sentences = int(ai_cfg.get("reply_max_sentences", 1))
+            max_chars = int(ai_cfg.get("reply_max_chars", 160))
+            message = self._shorten_for_voice(message, max_sentences=max_sentences, max_chars=max_chars)
             self._append_chat_message("user", text)
-            self._append_chat_message("assistant", message.strip())
+            self._append_chat_message("assistant", message)
             self._save_chat_history()
             self._last_ai_at = now_ts
-            self._log(f"🤖 AI: {message.strip()}")
+            self._log(f"🤖 AI: {message}")
             return True
 
         return False
@@ -691,33 +647,24 @@ class Executor:
         raw = self.config.get("ai", {})
         return raw if isinstance(raw, dict) else {}
 
+    @staticmethod
+    def _shorten_for_voice(text: str, max_sentences: int = 1, max_chars: int = 160) -> str:
+        s = re.sub(r"\s+", " ", (text or "")).strip()
+        if not s:
+            return ""
+        parts = re.split(r"(?<=[.!?])\s+", s)
+        picked = [p.strip() for p in parts if p.strip()][: max(1, int(max_sentences))]
+        out = " ".join(picked).strip()
+        if len(out) > max_chars:
+            out = out[: max_chars - 1].rstrip(" ,;:-") + "…"
+        return out
+
     def _apply_context_config(self):
         ai = self._ai_settings()
         try:
             self._chat_history_limit_pairs = max(4, int(ai.get("context_max_pairs_disk", 24)))
         except Exception:
             self._chat_history_limit_pairs = 24
-
-    def _load_session_summary(self):
-        try:
-            if not self._session_summary_path.exists():
-                self._session_summary = ""
-                return
-            text = self._session_summary_path.read_text(encoding="utf-8").strip()
-            self._session_summary = text
-        except Exception as error:
-            logger.warning(f"Не удалось загрузить session summary: {error}")
-            self._session_summary = ""
-
-    def _save_session_summary(self):
-        try:
-            self._session_summary_path.parent.mkdir(parents=True, exist_ok=True)
-            cap = int(self._ai_settings().get("context_max_chars_session_summary", 1200))
-            body = self._clip_text_for_context(self._session_summary, cap)
-            self._session_summary = body
-            self._session_summary_path.write_text(body, encoding="utf-8")
-        except Exception as error:
-            logger.warning(f"Не удалось сохранить session summary: {error}")
 
     @staticmethod
     def _clip_text_for_context(text: str, max_chars: int) -> str:
@@ -730,113 +677,9 @@ class Executor:
             return s
         return s[: max_chars - 1] + "…"
 
-    @staticmethod
-    def _trim_messages_to_char_budget(messages: List[Dict[str, str]], max_chars: int) -> List[Dict[str, str]]:
-        if max_chars <= 0:
-            return []
-        trimmed = list(messages)
-        while trimmed and sum(len(m.get("content", "")) for m in trimmed) > max_chars:
-            trimmed.pop(0)
-        return trimmed
-
-    def _summarize_dialog_chunk(
-        self, messages: List[Dict[str, str]], prior_summary: str
-    ) -> str | None:
-        if not self._ai_client or not self._ai_client.is_enabled():
-            return None
-        if not messages:
-            return None
-        lines: List[str] = []
-        for item in messages:
-            role = item.get("role")
-            content = (item.get("content") or "").strip()
-            if not content:
-                continue
-            if role == "user":
-                lines.append(f"Пользователь: {content}")
-            elif role == "assistant":
-                lines.append(f"Ассистент: {content}")
-        if not lines:
-            return None
-        block = "\n".join(lines)
-        prior = (prior_summary or "").strip() or "нет."
-        prompt = (
-            "Обнови краткий конспект диалога: 3–6 коротких пунктов на русском "
-            "(только устойчивые факты, решения, открытые вопросы).\n"
-            f"Уже зафиксировано:\n{prior}\n\nНовый фрагмент:\n{block}\n\n"
-            "Ответ только маркированный список (- …), без вступлений."
-        )
-        ai = self._ai_settings()
-        raw = self._ai_client.get_response(
-            prompt,
-            history=None,
-            system_prompt="Ты помощник для сжатия диалога. Будь краток.",
-            max_tokens=int(ai.get("context_summary_max_tokens", 220)),
-            temperature=0.2,
-        )
-        raw = (raw or "").strip()
-        return raw or None
-
-    def _maybe_roll_session_summary(self):
-        if not self._ai_client or not self._ai_client.is_enabled():
-            return
-        ai = self._ai_settings()
-        try:
-            after_pairs = int(ai.get("context_summarize_after_pairs", 5))
-            keep_pairs = int(ai.get("context_recent_pairs", 3))
-        except Exception:
-            after_pairs, keep_pairs = 5, 3
-        if after_pairs < 1 or keep_pairs < 1:
-            return
-        pairs = len(self._chat_history) // 2
-        if pairs <= after_pairs:
-            return
-        keep_msgs = keep_pairs * 2
-        chunk = self._chat_history[:-keep_msgs] if keep_msgs else list(self._chat_history)
-        if not chunk:
-            return
-        new_summary = self._summarize_dialog_chunk(chunk, self._session_summary)
-        if new_summary:
-            cap = int(ai.get("context_max_chars_session_summary", 1200))
-            self._session_summary = self._clip_text_for_context(new_summary, cap)
-            self._save_session_summary()
-            self._log("[DEBUG] Сжат фрагмент диалога в session summary")
-            self._chat_history = self._chat_history[-keep_msgs:] if keep_msgs else []
-            self._save_chat_history()
-        else:
-            logger.warning("Не удалось сжать историю; сохраняю старые реплики без удаления.")
-
-    def _build_ai_request_history(self, memory_context: str) -> List[Dict[str, str]]:
-        """История для chat completions: summary (system) + memory (system) + недавние реплики с бюджетом."""
-        self._maybe_roll_session_summary()
-        ai = self._ai_settings()
-        try:
-            cap_summary = int(ai.get("context_max_chars_session_summary", 1200))
-            cap_memory = int(ai.get("context_max_chars_memory", 2500))
-            cap_history = int(ai.get("context_max_chars_history", 8000))
-        except Exception:
-            cap_summary, cap_memory, cap_history = 1200, 2500, 8000
-
-        prefix: List[Dict[str, str]] = []
-        summary = self._clip_text_for_context(self._session_summary, cap_summary)
-        if summary:
-            prefix.append(
-                {
-                    "role": "system",
-                    "content": "Кратко о прошлом диалоге (для контекста):\n" + summary,
-                }
-            )
-        mem = self._clip_text_for_context(memory_context, cap_memory)
-        if mem:
-            prefix.append(
-                {
-                    "role": "system",
-                    "content": "Память о пользователе (учитывай при ответе):\n" + mem,
-                }
-            )
-
-        core = self._trim_messages_to_char_budget(list(self._chat_history), cap_history)
-        return prefix + core
+    def _build_ai_request_history(self) -> List[Dict[str, str]]:
+        """Короткая история без дополнительных memory-блоков."""
+        return list(self._chat_history)
 
     def _load_chat_history(self):
         try:
@@ -903,20 +746,7 @@ class Executor:
             self._log(f"[DEBUG] Сброс чат-истории: {reason}")
         self._chat_history = []
         self._last_ai_at = None
-        self._session_summary = ""
-        try:
-            if self._session_summary_path.exists():
-                self._session_summary_path.unlink()
-        except Exception as error:
-            logger.debug(f"Не удалось удалить session summary: {error}")
         self._save_chat_history()
-
-    def reset_user_memory(self):
-        self.memory.clear_all()
-
-    def clear_recent_memory_context(self):
-        self.reset_chat_history("manual")
-        self.memory.clear_recent_context(last_n=10)
 
     def load_config(self):
         """Перезагружает конфигурацию из файла"""
@@ -957,8 +787,8 @@ class Executor:
                 max_tokens=int(ai_config.get("max_tokens", 220)),
                 system_prompt=ai_config.get(
                     "system_prompt",
-                    "Ты голосовой ассистент Джарвис на ПК пользователя; исполнитель открывает браузер по командам. "
-                    "Не утверждай, что не можешь открывать сайты. Отвечай кратко по-русски.",
+                    "Ты голосовой ассистент Джарвис на ПК; ответы для озвучки — одно короткое предложение по-русски. "
+                    "Исполнитель открывает браузер по командам; не отрицай доступ к сайтам.",
                 ),
             )
             logger.info("AI assistant initialized (OpenAI)")
@@ -978,8 +808,6 @@ class Executor:
         if pending_query:
             query = pending_query
 
-        self._log(f"[DEBUG] Unknown command -> AI, len={len(query)}")
-
         normalized_query = query.lower().strip(" .,!?")
         if normalized_query in self._reset_phrases:
             self.reset_chat_history("голосовая команда")
@@ -988,28 +816,6 @@ class Executor:
         if self._looks_like_reset_context_phrase(normalized_query):
             self.reset_chat_history("голосовая команда (fuzzy)")
             self._log("🤖 Контекст очищен")
-            return True
-
-        if normalized_query in {"очисти память", "сбрось память"}:
-            self.clear_recent_memory_context()
-            self._log("🤖 Очищен недавний контекст (история и последние записи)")
-            return True
-
-        if normalized_query in {"удали всю информацию обо мне", "забудь всё", "забудь все", "забудь всю информацию обо мне"}:
-            self.reset_user_memory()
-            self.reset_chat_history("manual")
-            self._log("🤖 Вся информация о пользователе удалена")
-            return True
-
-        if (
-            normalized_query in {"что ты помнишь", "что ты обо мне помнишь", "что ты знаешь обо мне"}
-            or ("что ты помнишь" in normalized_query and "обо мне" in normalized_query)
-        ):
-            self._log(f"🤖 Память: {self.memory.describe_profile()}")
-            return True
-
-        if normalized_query in {"покажи факты обо мне", "покажи факты", "какие факты обо мне"}:
-            self._log(f"🤖 Факты:\n{self.memory.describe_profile()}")
             return True
 
         if normalized_query in {"покажи историю", "покажи контекст", "что в истории"}:
@@ -1031,44 +837,6 @@ class Executor:
             self._log("🤖 Недавняя история:\n" + "\n".join(lines))
             return True
 
-        if normalized_query in {
-            "забудь это",
-            "забудь последнее",
-            "удали последнее",
-            "удали последнее из памяти",
-        }:
-            forgotten = self.memory.forget_last_entry()
-            if forgotten:
-                self._log(f"🤖 Удалил последнюю запись: {forgotten}")
-            else:
-                self._log("🤖 Удалять нечего — список записей пуст.")
-            return True
-
-        topic_forget = re.match(r"^забудь\s+(?:про|об)\s+(.+)$", normalized_query)
-        if topic_forget:
-            topic = topic_forget.group(1).strip()
-            forgotten = self.memory.forget_matching_substring(topic)
-            if forgotten:
-                self._log(f"🤖 Удалил запись, где встречалось «{topic}»: {forgotten}")
-            else:
-                self._log(f"🤖 Не нашёл запись по фрагменту «{topic}».")
-            return True
-
-        fact_forget = re.match(r"^(?:удали|забудь)\s+факт\s+(.+)$", normalized_query)
-        if fact_forget:
-            topic = fact_forget.group(1).strip()
-            forgotten = self.memory.remove_fact_by_substring(topic)
-            if forgotten:
-                self._log(f"🤖 Удалил факт: {forgotten}")
-            else:
-                self._log(f"🤖 Факт по «{topic}» не найден.")
-            return True
-
-        if normalized_query in {"очисти временную память", "очисти сессионную память"}:
-            self.memory.clear_session_layer()
-            self._log("🤖 Временная память очищена.")
-            return True
-
         missing = self._detect_missing_args(query)
         if missing:
             kind, question = missing
@@ -1084,6 +852,7 @@ class Executor:
             self.reset_chat_history("долгая пауза")
 
         if self._ai_client and self._ai_client.is_enabled():
+            self._log(f"[DEBUG] Unknown command -> AI, len={len(query)}")
             if self._try_unified_ai_turn(query, now_ts):
                 return True
             last_error_text = getattr(self._ai_client, "last_error", None)
@@ -1091,9 +860,6 @@ class Executor:
                 self._log(f"⚠ AI недоступен: {last_error_text}")
             else:
                 self._log("⚠ AI недоступен: нет текста и нет last_error")
-        else:
-            # Если AI выключен/недоступен — память пополняем только локальными правилами.
-            self.memory.learn_from_user_text(query)
 
         self._log("🗣 Оффлайн fallback: не понял команду")
         return False
@@ -1231,6 +997,15 @@ class Executor:
 
     def open_app(self, target: str):
         target = self._resolve_target(target)
+        if target == "browser":
+            try:
+                webbrowser.open("about:blank", new=1)
+                self._log("🌐 Открываю браузер по умолчанию (как в настройках Windows).")
+            except Exception as error:
+                self._log(f"⚠ Не удалось открыть браузер по умолчанию: {error}")
+                logger.exception("Default browser open failed")
+            return
+
         apps = self.config.get("apps", {})
         if target in apps:
             cmd_path = apps[target]
@@ -1279,6 +1054,55 @@ class Executor:
 
             self.browser_search(target)
             logger.info(f"Поиск в браузере (нет локального соответствия): {target}")
+
+    def close_app(self, target: str):
+        resolved = self._resolve_target(target)
+        apps = self.config.get("apps", {}) if isinstance(self.config, dict) else {}
+        cmd_path = str(apps.get(resolved, "")).strip() if isinstance(apps, dict) else ""
+
+        if psutil is None:
+            self._log("⚠ Закрытие приложений недоступно: не установлен psutil.")
+            return
+
+        friendly_names = {
+            "browser": "браузер",
+            "telegram": "Telegram",
+            "vscode": "VS Code",
+            "notepad": "Блокнот",
+            "whatsapp": "WhatsApp",
+        }
+        self._log(f"🛑 Закрываю: {friendly_names.get(resolved, resolved)}")
+
+        candidates = set()
+        if cmd_path:
+            candidates.add(Path(cmd_path).name.lower())
+        if resolved == "browser":
+            # Частые браузеры для локального target=browser.
+            candidates.update({"chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "firefox.exe"})
+        raw = str(target or "").strip().lower()
+        if raw:
+            candidates.add(raw if raw.endswith(".exe") else f"{raw}.exe")
+
+        terminated = 0
+        for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+            try:
+                pid = int(proc.info.get("pid") or 0)
+                if pid == os.getpid():
+                    continue
+                name = (proc.info.get("name") or "").lower()
+                exe_name = Path(proc.info.get("exe") or "").name.lower()
+                cmdline = proc.info.get("cmdline") or []
+                cmd0 = Path(cmdline[0]).name.lower() if cmdline else ""
+                if {name, exe_name, cmd0} & candidates:
+                    proc.terminate()
+                    terminated += 1
+            except Exception:
+                continue
+
+        if terminated:
+            self._log(f"✅ Готово. Закрыто процессов: {terminated}")
+        else:
+            self._log(f"⚠ Не нашёл запущенный процесс: {friendly_names.get(resolved, resolved)}")
 
     def set_volume(self, value: int):
         try:
@@ -1351,6 +1175,10 @@ class Executor:
                 self.open_app(slots.get("target", ""))
                 return
 
+            if t == "close_app":
+                self.close_app(slots.get("target", ""))
+                return
+
             if t == "run_scenario":
                 self.run_scenario(slots.get("name", ""))
                 return
@@ -1401,11 +1229,6 @@ class Executor:
             
             if t == "add_note":
                 note_text = slots.get("text", "")
-                lowered_note = (note_text or "").lower()
-                if "информац" in lowered_note and "обо мне" in lowered_note:
-                    # Route "remember about me" phrases into personal memory flow.
-                    if self.handle_unrecognized_command(note_text):
-                        return
                 self.add_note(note_text)
                 return
             

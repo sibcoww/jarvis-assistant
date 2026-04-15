@@ -37,24 +37,9 @@ def make_executor(monkeypatch, tmp_path):
 
     executor = Executor(config={"ai": {"enabled": True}})
     executor._chat_history_path = tmp_path / "history.json"
-    executor._session_summary_path = tmp_path / "session_summary.txt"
-    executor._session_summary = ""
     executor._chat_history = []
     executor._save_chat_history = lambda: None
-    executor._save_session_summary = lambda: None
     executor._log = lambda msg: None
-    # Иначе MemoryStore читает реальный ~/.jarvis и тесты недетерминированы.
-    executor.memory.base_dir = tmp_path
-    executor.memory.profile_path = tmp_path / "user_profile.json"
-    executor.memory.memories_path = tmp_path / "memories.jsonl"
-    executor.memory.profile = {
-        "name": "",
-        "nickname": "",
-        "preferences": [],
-        "facts": [],
-        "updated_at": None,
-    }
-    executor.memory.memories = []
     return executor
 
 
@@ -107,35 +92,6 @@ def test_ai_rate_limited_no_history(monkeypatch, tmp_path):
     assert executor._chat_history == []
 
 
-def test_user_memory_commands(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    messages = []
-    executor._log = lambda msg: messages.append(msg)
-    executor._chat_history = [{"role": "user", "content": "x"}] * 6
-    executor.memory._upsert_memory("временный контекст", "temporary", 2, ttl_days=14)
-    executor.memory._upsert_memory("Пользователя зовут Алексей", "profile", 4)
-
-    assert executor.handle_unrecognized_command("очисти память") is True
-    assert any("Очищен недавний контекст" in m for m in messages)
-    assert executor._chat_history == []
-    assert any(m.get("type") == "profile" for m in executor.memory.memories)
-
-    messages.clear()
-    assert executor.handle_unrecognized_command("удали всю информацию обо мне") is True
-    assert any("Вся информация о пользователе удалена" in m for m in messages)
-    assert executor.memory.memories == []
-
-
-def test_memory_phrase_variant_is_handled_locally(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    messages = []
-    executor._log = lambda msg: messages.append(msg)
-
-    handled = executor.handle_unrecognized_command("что ты помнишь обо мне")
-    assert handled is True
-    assert any("Память:" in m for m in messages)
-
-
 def test_fuzzy_reset_session_phrase_is_handled_locally(monkeypatch, tmp_path):
     executor = make_executor(monkeypatch, tmp_path)
     executor._ai_client = DummyAIClient(
@@ -168,112 +124,6 @@ def test_show_history_phrase_variant(monkeypatch, tmp_path):
     assert handled is True
     assert any("Недавняя история" in m for m in messages)
     assert any("первый вопрос" in m for m in messages)
-
-
-def test_memory_management_commands(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    messages = []
-    executor._log = lambda msg: messages.append(msg)
-    executor.memory._upsert_memory("Пользователь учится на IT", "fact", 3, layer="core")
-    executor.memory._upsert_memory("временный контекст", "temporary", 2, layer="session", ttl_days=7)
-
-    assert executor.handle_unrecognized_command("покажи факты обо мне") is True
-    assert any("Факты:" in m for m in messages)
-
-    messages.clear()
-    assert executor.handle_unrecognized_command("удали факт IT") is True
-    assert all("учится на IT" not in m.get("text", "") for m in executor.memory.memories)
-    assert any("Удалил факт" in m for m in messages)
-
-    messages.clear()
-    assert executor.handle_unrecognized_command("очисти временную память") is True
-    assert all(m.get("layer") != "session" for m in executor.memory.memories)
-    assert any("Временная память очищена" in m for m in messages)
-
-
-def test_forget_all_phrase_variant(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    messages = []
-    executor._log = lambda msg: messages.append(msg)
-    executor.memory._upsert_memory("Никнейм пользователя: сибкош", "profile", 4, layer="core")
-
-    handled = executor.handle_unrecognized_command("забудь всю информацию обо мне")
-    assert handled is True
-    assert executor.memory.memories == []
-    assert any("Вся информация о пользователе удалена" in m for m in messages)
-
-
-def test_add_note_personal_info_routes_to_memory(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    executor._ai_client = DummyAIClient(
-        responses=[
-            '{"mode":"reply","message":"Принял."}',
-            '{"save": true, "layer": "core", "type": "fact", "value": "мне двадцать один год", "importance": 3}',
-        ],
-        errors=[None, None],
-    )
-    # Should route to memory path instead of plain note append.
-    executor.run({"type": "add_note", "slots": {"text": "запомни информацию обо мне мне двадцать один год"}})
-    assert any("мне двадцать один год" in m.get("text", "") for m in executor.memory.memories)
-
-
-def test_ai_memory_suggestion_is_applied(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    # first call -> memory extraction JSON, second call -> normal AI answer
-    executor._ai_client = DummyAIClient(
-        responses=[
-            '{"mode":"reply","message":"Отлично, понял."}',
-            '{"save": true, "layer": "core", "type": "profile", "key": "education", "value": "учусь на IT", "importance": 4}',
-        ],
-        errors=[None, None],
-    )
-
-    handled = executor.handle_unrecognized_command("я учусь на IT")
-    assert handled is True
-    assert executor._ai_client.calls >= 2
-    assert any("учится" in m.get("text", "").lower() for m in executor.memory.memories)
-
-
-def test_ai_enabled_also_uses_local_memory_rules(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    executor._ai_client = DummyAIClient(
-        responses=[
-            '{"mode":"reply","message":"Ок."}',
-            '{"save": false}',
-        ],
-        errors=[None, None],
-    )
-    called = {"local": 0}
-    original = executor.memory.learn_from_user_text
-
-    def wrap_local(text):
-        called["local"] += 1
-        return original(text)
-
-    executor.memory.learn_from_user_text = wrap_local
-    handled = executor.handle_unrecognized_command("я работаю преподавателем")
-    assert handled is True
-    assert called["local"] >= 1
-
-
-def test_ai_disabled_uses_local_memory_rules(monkeypatch, tmp_path):
-    monkeypatch.setattr(executor_module, "PluginManager", DummyPluginManager)
-    monkeypatch.setattr(executor_module, "ensure_keys_file", lambda: ({"openai_api_key": ""}, False))
-    executor = Executor(config={"ai": {"enabled": False}})
-    executor._chat_history_path = tmp_path / "history.json"
-    executor._session_summary_path = tmp_path / "session_summary.txt"
-    executor._save_chat_history = lambda: None
-    executor._save_session_summary = lambda: None
-    executor._log = lambda _msg: None
-    executor.memory.base_dir = tmp_path
-    executor.memory.profile_path = tmp_path / "user_profile.json"
-    executor.memory.memories_path = tmp_path / "memories.jsonl"
-    executor.memory.profile = {"name": "", "nickname": "", "preferences": [], "facts": [], "updated_at": None}
-    executor.memory.memories = []
-
-    handled = executor.handle_unrecognized_command("я учусь на IT")
-    assert handled is False
-    assert any("учится" in m.get("text", "").lower() for m in executor.memory.memories)
 
 
 def test_ai_interprets_set_volume_command(monkeypatch, tmp_path):
@@ -350,39 +200,18 @@ def test_pending_args_light_for_set_volume(monkeypatch, tmp_path):
     assert called["intent"]["type"] == "set_volume"
     assert called["intent"]["slots"]["value"] == 35
 
+    assert executor.handle_unrecognized_command("поставь громкость") is True
+    assert executor.handle_unrecognized_command("девяносто") is True
+    assert called["intent"]["type"] == "set_volume"
+    assert called["intent"]["slots"]["value"] == 90
 
-def test_pending_args_light_for_volume_down_delta(monkeypatch, tmp_path):
+
+def test_volume_up_down_phrases_are_not_pending_clarification(monkeypatch, tmp_path):
     executor = make_executor(monkeypatch, tmp_path)
-    logs = []
-    executor._log = lambda msg: logs.append(msg)
-    called = {}
-
-    def fake_run(intent):
-        called["intent"] = intent
-
-    executor.run = fake_run
-    assert executor.handle_unrecognized_command("сделай тише") is True
-    assert any("На сколько сделать тише" in m for m in logs)
-    assert executor.handle_unrecognized_command("12") is True
-    assert called["intent"]["type"] == "volume_down"
-    assert called["intent"]["slots"]["delta"] == 12
-
-
-def test_pending_args_light_for_volume_up_delta(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    logs = []
-    executor._log = lambda msg: logs.append(msg)
-    called = {}
-
-    def fake_run(intent):
-        called["intent"] = intent
-
-    executor.run = fake_run
-    assert executor.handle_unrecognized_command("сделай громче") is True
-    assert any("На сколько сделать громче" in m for m in logs)
-    assert executor.handle_unrecognized_command("8") is True
-    assert called["intent"]["type"] == "volume_up"
-    assert called["intent"]["slots"]["delta"] == 8
+    assert executor._detect_missing_args("сделай тише") is None
+    assert executor._detect_missing_args("убавь громкость") is None
+    assert executor._detect_missing_args("сделай громче") is None
+    assert executor._detect_missing_args("добавь громкость") is None
 
 
 def test_ai_interprets_open_youtube_command(monkeypatch, tmp_path):
@@ -519,55 +348,6 @@ def test_ai_site_query_same_words_resolves_home_url(monkeypatch, tmp_path):
     assert out["slots"]["url"] == "https://www.twitch.tv/"
 
 
-def test_session_summary_roll_keeps_recent(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    executor.config["ai"]["context_summarize_after_pairs"] = 2
-    executor.config["ai"]["context_recent_pairs"] = 1
-    executor._ai_client = DummyAIClient(responses=[], errors=[])
-
-    captured = {}
-
-    def fake_chunk(chunk, prior):
-        captured["len_chunk"] = len(chunk)
-        captured["prior"] = prior
-        return "- пункт один\n- пункт два"
-
-    executor._summarize_dialog_chunk = fake_chunk
-    executor._chat_history = [
-        {"role": "user", "content": "a1"},
-        {"role": "assistant", "content": "b1"},
-        {"role": "user", "content": "a2"},
-        {"role": "assistant", "content": "b2"},
-        {"role": "user", "content": "a3"},
-        {"role": "assistant", "content": "b3"},
-    ]
-    executor._maybe_roll_session_summary()
-    assert len(executor._chat_history) == 2
-    assert executor._chat_history[-2]["content"] == "a3"
-    assert "пункт" in executor._session_summary
-    assert captured["len_chunk"] == 4
-
-
-def test_session_summary_roll_preserves_history_on_summary_failure(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    executor.config["ai"]["context_summarize_after_pairs"] = 2
-    executor.config["ai"]["context_recent_pairs"] = 1
-    executor._ai_client = DummyAIClient(responses=[], errors=[])
-    executor._summarize_dialog_chunk = lambda _chunk, _prior: None
-    original = [
-        {"role": "user", "content": "a1"},
-        {"role": "assistant", "content": "b1"},
-        {"role": "user", "content": "a2"},
-        {"role": "assistant", "content": "b2"},
-        {"role": "user", "content": "a3"},
-        {"role": "assistant", "content": "b3"},
-    ]
-    executor._chat_history = list(original)
-
-    executor._maybe_roll_session_summary()
-
-    assert executor._chat_history == original
-    assert executor._session_summary == ""
 
 
 def test_interpret_command_includes_dialog_recap(monkeypatch, tmp_path):
@@ -594,45 +374,15 @@ def test_interpret_command_includes_dialog_recap(monkeypatch, tmp_path):
     assert "\u041a\u0438\u043d\u043e\u043f\u043e\u0438\u0441\u043a" in prompt
 
 
-def test_forget_last_phrase_via_executor(monkeypatch, tmp_path):
+def test_build_ai_request_history_without_memory_prefix(monkeypatch, tmp_path):
     executor = make_executor(monkeypatch, tmp_path)
-    messages = []
-    executor._log = lambda msg: messages.append(msg)
-    executor.memory._upsert_memory("временный контекст", "temporary", 2, layer="session")
-    executor.memory._upsert_memory("ещё одна", "fact", 2, layer="core")
-
-    assert executor.handle_unrecognized_command("забудь это") is True
-    assert executor.memory.memories[-1].get("text") == "временный контекст"
-    assert any("Удалил последнюю" in m for m in messages)
-
-
-def test_forget_about_substring_via_executor(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    messages = []
-    executor._log = lambda msg: messages.append(msg)
-    executor.memory._upsert_memory("prefers black tea", "preference", 3, layer="core")
-    # Команда на кириллице + фрагмент темы латиницей (устойчиво к кодировке файла).
-    forget_cmd = "\u0437\u0430\u0431\u0443\u0434\u044c \u043f\u0440\u043e tea"
-
-    assert executor.handle_unrecognized_command(forget_cmd) is True
-    assert executor.memory.memories == []
-    assert any("Удалил запись" in m for m in messages)
-
-
-def test_build_ai_request_history_clips_memory_and_history(monkeypatch, tmp_path):
-    executor = make_executor(monkeypatch, tmp_path)
-    executor.config["ai"]["context_max_chars_history"] = 18
-    executor.config["ai"]["context_max_chars_memory"] = 35
-    executor.config["ai"]["context_max_chars_session_summary"] = 12
-    executor._session_summary = "длинное" * 20
     executor._chat_history = [
         {"role": "user", "content": "uuuuuu"},
         {"role": "assistant", "content": "aaaaaa"},
         {"role": "user", "content": "last-q"},
         {"role": "assistant", "content": "last-a"},
     ]
-    mem = "fact-" * 30
-    hist = executor._build_ai_request_history(mem)
+    hist = executor._build_ai_request_history()
     assert any(m.get("role") == "user" and m.get("content") == "last-q" for m in hist)
     mem_blocks = [m for m in hist if m["role"] == "system" and "Память о пользователе" in m["content"]]
-    assert mem_blocks and len(mem_blocks[0]["content"]) <= 80
+    assert mem_blocks == []
