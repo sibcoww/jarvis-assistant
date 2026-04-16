@@ -954,7 +954,6 @@ class Executor:
         markers = (
             "задач",
             "todo",
-            "дел",
             "список дел",
             "в дела",
             "отмет",
@@ -2622,6 +2621,7 @@ class Executor:
         except Exception as e:
             logger.error(f"Ошибка получения погоды: {e}")
             self._log(f"⚠ Не удалось получить погоду для: {target_city}")
+
 
     # ============ Todo ============
     def _todos_file(self) -> Path:

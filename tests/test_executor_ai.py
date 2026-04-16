@@ -480,6 +480,18 @@ def test_local_like_query_does_not_fall_back_to_unified_browser_search(monkeypat
     assert executor._ai_client.calls == 1
 
 
+def test_non_local_phrase_kak_dela_goes_to_unified_reply(monkeypatch, tmp_path):
+    executor = make_executor(monkeypatch, tmp_path)
+    executor._ai_client = DummyAIClient(
+        responses=['{"mode":"reply","message":"Все хорошо, работаю."}'],
+        errors=[None],
+    )
+    handled = executor.handle_unrecognized_command("как твои дела")
+    assert handled is True
+    assert executor._ai_client.calls == 1
+    assert executor._chat_history[-1]["role"] == "assistant"
+
+
 def test_local_ai_fallback_system_lock(monkeypatch, tmp_path):
     executor = make_executor(monkeypatch, tmp_path)
     executor._ai_client = DummyAIClient(

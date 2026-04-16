@@ -13,12 +13,14 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton,
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
     QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle, QCheckBox, QLineEdit,
+    QFrame, QGraphicsDropShadowEffect, QGroupBox, QFormLayout, QToolButton, QSizePolicy, QToolTip,
+    QScrollArea,
 )
 
 import sounddevice as sd
 
-from PySide6.QtGui import QAction, QIcon
-from PySide6.QtCore import Signal, QObject, QTimer, QEvent, Qt
+from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QCursor
+from PySide6.QtCore import Signal, QObject, QTimer, QEvent, Qt, QPropertyAnimation, QEasingCurve
 
 from src.jarvis.engine import JarvisEngine, TTS_PRESETS
 from src.jarvis.key_store import ensure_keys_file, save_keys
@@ -29,6 +31,61 @@ logger = logging.getLogger(__name__)
 
 class LogBus(QObject):
     log = Signal(str)
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """SpinBox, который не меняет значение колесом мыши."""
+
+    def wheelEvent(self, event):  # noqa: N802 (Qt naming)
+        event.ignore()
+
+
+class OverlayStepperDoubleSpinBox(NoWheelDoubleSpinBox):
+    """
+    QDoubleSpinBox с оверлей-кнопками ▲/▼ внутри поля.
+    Это обход Qt/Windows проблемы, когда нативные стрелки выглядят как "точки"
+    или QSS-иконки не рендерятся стабильно.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        # резервируем место справа под кнопки, чтобы текст не залезал под них
+        le = self.lineEdit()
+        if le is not None:
+            le.setTextMargins(0, 0, 20, 0)
+        else:
+            # на всякий случай: если lineEdit() недоступен
+            self.setStyleSheet("padding-right: 20px;")
+
+        self._btn_up = QToolButton(self)
+        self._btn_up.setObjectName("spinStepUp")
+        self._btn_up.setText("▴")
+        self._btn_up.setCursor(Qt.CursorShape.ArrowCursor)
+        self._btn_up.clicked.connect(self.stepUp)
+
+        self._btn_down = QToolButton(self)
+        self._btn_down.setObjectName("spinStepDown")
+        self._btn_down.setText("▾")
+        self._btn_down.setCursor(Qt.CursorShape.ArrowCursor)
+        self._btn_down.clicked.connect(self.stepDown)
+
+    def resizeEvent(self, event):  # noqa: N802 (Qt naming)
+        super().resizeEvent(event)
+        bw = 18
+        pad = 2
+        x = max(0, self.width() - bw - pad)
+        h = max(10, self.height())
+        half = max(8, (h - 2) // 2)
+        self._btn_up.setGeometry(x, 1, bw, half)
+        self._btn_down.setGeometry(x, 1 + half, bw, max(8, h - 2 - half))
+
+
+class NoWheelComboBox(QComboBox):
+    """ComboBox, который не меняет выбор колесом мыши."""
+
+    def wheelEvent(self, event):  # noqa: N802 (Qt naming)
+        event.ignore()
 
 
 class MainWindow(QMainWindow):
@@ -45,9 +102,21 @@ class MainWindow(QMainWindow):
         self._openai_key_warn_shown = False
         self._pv_key_warn_shown = False
         self._runtime_log_path = Path.home() / ".jarvis" / "runtime.log"
+        self._avatar_pulse_timer = QTimer(self)
+        self._avatar_pulse_timer.setSingleShot(True)
+        self._avatar_pulse_timer.timeout.connect(self._stop_avatar_animation)
+        self._log_collapsed = False
+        self._avatar_size_normal = 170
+        self._avatar_inner_normal = 152
+        self._avatar_size_focus_min = 260
+        self._avatar_size_focus_max = 430
 
         self.setWindowTitle("Jarvis Assistant")
-        self.resize(800, 600)
+        self.resize(900, 700)
+        # Фиксированный размер окна: основная вкладка "выжимается" в этот размер,
+        # а в "Настройках" используется скролл.
+        self.setFixedSize(self.size())
+        self._apply_light_theme()
 
         # Вкладки для навигации
         self.tabs = QTabWidget()
@@ -175,17 +244,65 @@ class MainWindow(QMainWindow):
         info_layout.addWidget(self.mode_label)
         info_layout.addStretch()
         layout.addLayout(info_layout)
+
+        # Центральный визуальный блок ассистента
+        avatar_wrap = QFrame()
+        avatar_wrap.setObjectName("avatarWrap")
+        avatar_wrap.setSizePolicy(
+            avatar_wrap.sizePolicy().horizontalPolicy(),
+            avatar_wrap.sizePolicy().Policy.Expanding,
+        )
+        avatar_wrap_layout = QVBoxLayout(avatar_wrap)
+        avatar_wrap_layout.setContentsMargins(0, 8, 0, 8)
+        avatar_wrap_layout.setSpacing(8)
+
+        self.avatar_label = QLabel()
+        self.avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._apply_avatar_size(self._avatar_size_normal, self._avatar_inner_normal)
+        self.avatar_shadow = QGraphicsDropShadowEffect(self.avatar_label)
+        self.avatar_shadow.setBlurRadius(20)
+        self.avatar_shadow.setColor(QColor(104, 150, 255, 80))
+        self.avatar_shadow.setOffset(0, 0)
+        self.avatar_label.setGraphicsEffect(self.avatar_shadow)
+
+        self.avatar_pulse_anim = QPropertyAnimation(self.avatar_shadow, b"blurRadius", self)
+        self.avatar_pulse_anim.setDuration(760)
+        self.avatar_pulse_anim.setStartValue(20)
+        self.avatar_pulse_anim.setKeyValueAt(0.5, 68)
+        self.avatar_pulse_anim.setEndValue(20)
+        self.avatar_pulse_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self.avatar_pulse_anim.setLoopCount(-1)
+
+        self.user_text_label = QLabel("Скажи «Джарвис», затем команду.")
+        self.user_text_label.setObjectName("heardText")
+        self.user_text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.user_text_label.setWordWrap(True)
+        self.user_text_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.user_text_label.setFixedHeight(42)
+
+        avatar_wrap_layout.addWidget(self.avatar_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        avatar_wrap_layout.addWidget(self.user_text_label)
+        layout.addWidget(avatar_wrap)
         
         # Логирование
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        layout.addWidget(QLabel("Лог:"))
+        self.log_view.setObjectName("logView")
+        log_header = QHBoxLayout()
+        log_header.addWidget(QLabel("Лог:"))
+        log_header.addStretch()
+        self.btn_toggle_log = QPushButton("▾")
+        self.btn_toggle_log.setToolTip("Свернуть/развернуть лог")
+        self.btn_toggle_log.setFixedWidth(34)
+        self.btn_toggle_log.clicked.connect(self.on_toggle_log)
+        log_header.addWidget(self.btn_toggle_log)
+        layout.addLayout(log_header)
         layout.addWidget(self.log_view)
         
         # Кнопка очистки лога
-        clear_log_btn = QPushButton("🗑 Очистить лог")
-        clear_log_btn.clicked.connect(self.on_clear_log)
-        layout.addWidget(clear_log_btn)
+        self.clear_log_btn = QPushButton("🗑 Очистить лог")
+        self.clear_log_btn.clicked.connect(self.on_clear_log)
+        layout.addWidget(self.clear_log_btn)
         
         # Кнопки управления
         button_layout = QHBoxLayout()
@@ -200,54 +317,283 @@ class MainWindow(QMainWindow):
         layout.addLayout(button_layout)
         
         self.main_tab.setLayout(layout)
+        self._update_avatar_for_state()
+
+    def _apply_avatar_size(self, size: int, inner_size: int):
+        self.avatar_label.setFixedSize(size, size)
+        self.avatar_label.setPixmap(self._make_avatar_pixmap(inner_size))
+        radius = size // 2
+        self.avatar_label.setStyleSheet(
+            f"border: 3px solid #DDE6F2; border-radius: {radius}px; background: #FFFFFF;"
+        )
+
+    def _update_avatar_for_state(self):
+        """Адаптивный размер аватара: в визуальном режиме крупнее."""
+        if not hasattr(self, "avatar_label"):
+            return
+        if not self._log_collapsed:
+            self._apply_avatar_size(self._avatar_size_normal, self._avatar_inner_normal)
+            return
+
+        # В визуальном режиме пытаемся занять большую часть доступного места.
+        w = int(self.main_tab.width() * 0.62)
+        h = int(self.main_tab.height() * 0.48)
+        size = max(self._avatar_size_focus_min, min(self._avatar_size_focus_max, min(w, h)))
+        inner = max(120, size - 22)
+        self._apply_avatar_size(size, inner)
+
+    def on_toggle_log(self):
+        self._log_collapsed = not self._log_collapsed
+        self.log_view.setVisible(not self._log_collapsed)
+        self.clear_log_btn.setVisible(not self._log_collapsed)
+        self.btn_toggle_log.setText("▸" if self._log_collapsed else "▾")
+        if self._log_collapsed:
+            self.user_text_label.setText("Визуальный режим. Скажи «Джарвис», затем команду.")
+        self._update_avatar_for_state()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # При изменении размера окна пересчитываем аватар в визуальном режиме.
+        if getattr(self, "_log_collapsed", False):
+            self._update_avatar_for_state()
+
+    @staticmethod
+    def _make_avatar_pixmap(size: int) -> QPixmap:
+        pix = QPixmap(size, size)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # Внешнее кольцо
+        painter.setPen(QPen(QColor("#D8E6FF"), 2))
+        painter.setBrush(QBrush(QColor("#F7FAFF")))
+        painter.drawEllipse(1, 1, size - 2, size - 2)
+
+        # Внутренний диск
+        pad = int(size * 0.14)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#EAF2FF")))
+        painter.drawEllipse(pad, pad, size - 2 * pad, size - 2 * pad)
+
+        # Точка-ядро
+        core = int(size * 0.23)
+        core_x = (size - core) // 2
+        core_y = (size - core) // 2
+        painter.setBrush(QBrush(QColor("#7EA8FF")))
+        painter.drawEllipse(core_x, core_y, core, core)
+        painter.end()
+        return pix
+
+    def _start_avatar_animation(self, duration_ms: int = 1800):
+        if self.avatar_pulse_anim.state() != QPropertyAnimation.State.Running:
+            self.avatar_pulse_anim.start()
+        self.avatar_shadow.setColor(QColor(76, 132, 255, 150))
+        self._avatar_pulse_timer.start(max(600, duration_ms))
+
+    def _stop_avatar_animation(self):
+        if self.avatar_pulse_anim.state() == QPropertyAnimation.State.Running:
+            self.avatar_pulse_anim.stop()
+        self.avatar_shadow.setBlurRadius(20)
+        self.avatar_shadow.setColor(QColor(104, 150, 255, 80))
+
+    def _apply_light_theme(self):
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget {
+                background: #F6F8FC;
+                color: #1F2A37;
+            }
+            QTabWidget::pane {
+                border: 1px solid #E4E8F0;
+                border-radius: 8px;
+                background: #FFFFFF;
+            }
+            QTabBar::tab {
+                background: #EEF2FA;
+                color: #334155;
+                padding: 8px 14px;
+                margin-right: 4px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+            }
+            QTabBar::tab:selected {
+                background: #FFFFFF;
+                color: #0F172A;
+                border: 1px solid #E4E8F0;
+                border-bottom: 1px solid #FFFFFF;
+            }
+            QPushButton {
+                background: #EEF2FF;
+                border: 1px solid #D9DEFF;
+                border-radius: 8px;
+                padding: 7px 12px;
+                color: #3730A3;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #E0E7FF;
+            }
+            QPushButton:disabled {
+                color: #94A3B8;
+                background: #F1F5F9;
+                border: 1px solid #E2E8F0;
+            }
+            QComboBox, QLineEdit, QDoubleSpinBox, QTextEdit {
+                background: #FFFFFF;
+                border: 1px solid #DCE3ED;
+                border-radius: 8px;
+                padding: 6px;
+                color: #1F2937;
+            }
+            QToolButton#spinStepUp, QToolButton#spinStepDown {
+                border: none;
+                background: transparent;
+                color: #334155;
+                padding: 0px;
+                margin: 0px;
+                font-size: 11px;
+                font-weight: 800;
+            }
+            QToolButton#spinStepUp:hover, QToolButton#spinStepDown:hover {
+                background: #EEF2FF;
+                border-radius: 6px;
+            }
+            QToolButton#spinStepUp:pressed, QToolButton#spinStepDown:pressed {
+                background: #E0E7FF;
+                border-radius: 6px;
+            }
+            QCheckBox {
+                spacing: 10px;
+                color: #0F172A;
+                font-weight: 600;
+            }
+            QCheckBox::indicator:unchecked {
+                width: 18px;
+                height: 18px;
+                border-radius: 5px;
+                border: 1px solid #CBD5E1;
+                background: #FFFFFF;
+            }
+            QCheckBox::indicator:checked {
+                width: 18px;
+                height: 18px;
+            }
+            QToolButton#helpBtn {
+                border: 1px solid #DCE3ED;
+                border-radius: 9px;
+                width: 18px;
+                height: 18px;
+                padding: 0px;
+                background: #FFFFFF;
+                color: #475569;
+                font-weight: 800;
+            }
+            QToolButton#helpBtn:hover {
+                background: #EEF2FF;
+                border: 1px solid #C7D2FE;
+                color: #3730A3;
+            }
+            QProgressBar {
+                border: 1px solid #DCE3ED;
+                border-radius: 7px;
+                background: #F1F5F9;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background: #8BB4FF;
+                border-radius: 6px;
+            }
+            QFrame#avatarWrap {
+                border: 1px solid #E7ECF4;
+                border-radius: 12px;
+                background: #FFFFFF;
+            }
+            QLabel#heardText {
+                color: #334155;
+                font-size: 13px;
+                padding: 2px 12px 6px 12px;
+            }
+            QTextEdit#logView {
+                background: #FCFDFF;
+                border: 1px solid #E6EBF4;
+                border-radius: 10px;
+                font-family: Consolas, 'Cascadia Mono', monospace;
+                font-size: 12px;
+            }
+            """
+        )
+
+    @staticmethod
+    def _help_button(text: str) -> QToolButton:
+        btn = QToolButton()
+        btn.setObjectName("helpBtn")
+        btn.setText("?")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(text)
+        btn.clicked.connect(lambda _=False, t=text, b=btn: QToolTip.showText(QCursor.pos(), t, b))
+        btn.setAutoRaise(False)
+        return btn
 
     def on_tab_changed(self, index):
         _ = index
     
     def setup_settings_tab(self):
         """Настройка вкладки настроек"""
-        layout = QVBoxLayout()
-        
-        # Выбор микрофона
-        device_layout = QHBoxLayout()
-        device_layout.addWidget(QLabel("Микрофон:"))
-        self.device_combo = QComboBox()
-        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
-        device_layout.addWidget(self.device_combo)
-        
-        self.btn_refresh_devices = QPushButton("🔄 Обновить")
-        self.btn_refresh_devices.clicked.connect(self.load_devices)
-        device_layout.addWidget(self.btn_refresh_devices)
-        
-        self.btn_test_mic = QPushButton("🎙 Тест")
-        self.btn_test_mic.setToolTip("Проверить уровень звука микрофона")
-        self.btn_test_mic.clicked.connect(self.on_test_microphone)
-        device_layout.addWidget(self.btn_test_mic)
-        
-        layout.addLayout(device_layout)
-        
-        # Результат теста микрофона
-        self.mic_test_result = QLabel("")
-        self.mic_test_result.setStyleSheet("color: #666; font-size: 10px;")
-        self.mic_test_result.setWordWrap(True)
-        layout.addWidget(self.mic_test_result)
-        
-        # Параметры ASR
-        params_group_label = QLabel("Параметры распознавания:")
-        params_font = params_group_label.font()
-        params_font.setBold(True)
-        params_group_label.setFont(params_font)
-        layout.addWidget(params_group_label)
+        # Делаем "Настройки" прокручиваемыми: много параметров не влезает в фиксированное окно.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
 
-        wakeword_layout = QHBoxLayout()
-        wakeword_layout.addWidget(QLabel("Движок активации:"))
-        self.wake_engine_combo = QComboBox()
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(12)
+        
+        mic_group = QGroupBox("Микрофон")
+        mic_form = QFormLayout(mic_group)
+        mic_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        mic_row = QHBoxLayout()
+        self.device_combo = NoWheelComboBox()
+        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+        mic_row.addWidget(self.device_combo, 1)
+
+        self.btn_refresh_devices = QPushButton("Обновить")
+        self.btn_refresh_devices.setToolTip("Если переподключил микрофон — нажми, чтобы обновить список устройств.")
+        self.btn_refresh_devices.clicked.connect(self.load_devices)
+        mic_row.addWidget(self.btn_refresh_devices)
+
+        self.btn_test_mic = QPushButton("Тест")
+        self.btn_test_mic.setToolTip("Короткий тест микрофона (3 секунды).")
+        self.btn_test_mic.clicked.connect(self.on_test_microphone)
+        mic_row.addWidget(self.btn_test_mic)
+
+        mic_form.addRow("Устройство:", mic_row)
+
+        self.mic_test_result = QLabel("")
+        self.mic_test_result.setStyleSheet("color: #475569; font-size: 11px;")
+        self.mic_test_result.setWordWrap(True)
+        mic_form.addRow("", self.mic_test_result)
+
+        layout.addWidget(mic_group)
+        
+        asr_group = QGroupBox("Распознавание и активация")
+        asr_form = QFormLayout(asr_group)
+
+        wake_row = QHBoxLayout()
+        self.wake_engine_combo = NoWheelComboBox()
         self.wake_engine_combo.addItem("Vosk (текстовый)", "vosk_text")
         self.wake_engine_combo.addItem("Porcupine (Picovoice)", "porcupine")
         self.wake_engine_combo.currentIndexChanged.connect(self.on_wake_engine_changed)
-        wakeword_layout.addWidget(self.wake_engine_combo)
-        wakeword_layout.addStretch()
-        layout.addLayout(wakeword_layout)
+        wake_row.addWidget(self.wake_engine_combo, 1)
+        wake_row.addWidget(
+            self._help_button(
+                "Движок активации (wake-word):\n\n"
+                "• Vosk (текстовый) — проще, без ключей, может быть менее точным.\n"
+                "• Porcupine (Picovoice) — быстрый wake-word, обычно точнее, но нужен ключ Picovoice.\n\n"
+                "Рекомендация: если есть ключ — Porcupine; если нет — Vosk."
+            )
+        )
+        asr_form.addRow("Движок активации:", wake_row)
 
         self.wake_engine_combo.blockSignals(True)
         current_engine = getattr(self.engine, "wakeword_engine", "vosk_text")
@@ -255,80 +601,80 @@ class MainWindow(QMainWindow):
         self.wake_engine_combo.setCurrentIndex(current_idx if current_idx >= 0 else 0)
         self.wake_engine_combo.blockSignals(False)
         
-        # Таймаут фразы
-        timeout_layout = QHBoxLayout()
-        timeout_layout.addWidget(QLabel("Таймаут фразы (сек):"))
-        self.timeout_spinbox = QDoubleSpinBox()
+        timeout_row = QHBoxLayout()
+        self.timeout_spinbox = OverlayStepperDoubleSpinBox()
         self.timeout_spinbox.setMinimum(1.0)
         self.timeout_spinbox.setMaximum(30.0)
         self.timeout_spinbox.setValue(6.0)
         self.timeout_spinbox.setSingleStep(0.5)
         self.timeout_spinbox.setDecimals(1)
-        self.timeout_spinbox.setToolTip("Максимальное время ожидания фразы")
+        self.timeout_spinbox.setToolTip("Максимальное время ожидания одной команды.")
         self.timeout_spinbox.valueChanged.connect(self.on_phrase_timeout_changed)
-        timeout_layout.addWidget(self.timeout_spinbox)
-        timeout_layout.addStretch()
-        layout.addLayout(timeout_layout)
+        timeout_row.addWidget(self.timeout_spinbox)
+        timeout_row.addWidget(
+            self._help_button(
+                "Таймаут фразы — максимальное время, которое ассистент ждёт одну команду.\n"
+                "Если пользователь говорит дольше — команда может обрезаться."
+            )
+        )
+        timeout_row.addStretch()
+        asr_form.addRow("Таймаут фразы (сек):", timeout_row)
         
-        # Таймаут молчания
-        silence_layout = QHBoxLayout()
-        silence_layout.addWidget(QLabel("Таймаут молчания (сек):"))
-        self.silence_spinbox = QDoubleSpinBox()
+        silence_row = QHBoxLayout()
+        self.silence_spinbox = OverlayStepperDoubleSpinBox()
         self.silence_spinbox.setMinimum(0.1)
         self.silence_spinbox.setMaximum(10.0)
         self.silence_spinbox.setValue(1.2)
         self.silence_spinbox.setSingleStep(0.1)
         self.silence_spinbox.setDecimals(1)
-        self.silence_spinbox.setToolTip("Время тишины для завершения фразы")
+        self.silence_spinbox.setToolTip("Через сколько секунд тишины считать команду законченной.")
         self.silence_spinbox.valueChanged.connect(self.on_silence_timeout_changed)
-        silence_layout.addWidget(self.silence_spinbox)
-        silence_layout.addStretch()
-        layout.addLayout(silence_layout)
+        silence_row.addWidget(self.silence_spinbox)
+        silence_row.addWidget(
+            self._help_button(
+                "Таймаут молчания — сколько ждать тишину внутри команды.\n"
+                "Меньше значение — быстрее завершает распознавание, но может обрезать паузы."
+            )
+        )
+        silence_row.addStretch()
+        asr_form.addRow("Таймаут молчания (сек):", silence_row)
 
-        tts_head = QLabel("Озвучка (TTS, pyttsx3):")
-        tts_bf = tts_head.font()
-        tts_bf.setBold(True)
-        tts_head.setFont(tts_bf)
-        layout.addWidget(tts_head)
+        layout.addWidget(asr_group)
 
-        tts_row = QHBoxLayout()
-        self.tts_enabled_checkbox = QCheckBox("Включить озвучку")
+        tts_group = QGroupBox("Озвучка (TTS)")
+        tts_form = QFormLayout(tts_group)
+
+        self.tts_enabled_checkbox = QCheckBox("Включить озвучку (pyttsx3)")
         self.tts_enabled_checkbox.stateChanged.connect(self.on_tts_enabled_changed)
-        tts_row.addWidget(self.tts_enabled_checkbox)
+        tts_form.addRow(self.tts_enabled_checkbox)
 
-        tts_row.addWidget(QLabel("Пресет:"))
-        self.tts_preset_combo = QComboBox()
+        self.tts_preset_combo = NoWheelComboBox()
         self.tts_preset_combo.addItem("Тихий", "quiet")
         self.tts_preset_combo.addItem("Нормальный", "normal")
         self.tts_preset_combo.addItem("Чёткий", "clear")
         self.tts_preset_combo.currentIndexChanged.connect(self.on_tts_preset_changed)
-        tts_row.addWidget(self.tts_preset_combo)
+        tts_form.addRow("Пресет:", self.tts_preset_combo)
 
-        tts_row.addWidget(QLabel("Пауза микрофона после речи (сек):"))
-        self.post_tts_spin = QDoubleSpinBox()
+        self.post_tts_spin = OverlayStepperDoubleSpinBox()
         self.post_tts_spin.setMinimum(0.1)
         self.post_tts_spin.setMaximum(2.5)
         self.post_tts_spin.setSingleStep(0.05)
         self.post_tts_spin.setDecimals(2)
         self.post_tts_spin.setToolTip("Чтобы микрофон не ловил собственную озвучку")
         self.post_tts_spin.valueChanged.connect(self.on_post_tts_delay_changed)
-        tts_row.addWidget(self.post_tts_spin)
-
         self.btn_test_tts = QPushButton("🔊 Тест озвучки")
         self.btn_test_tts.clicked.connect(self.on_test_tts)
-        tts_row.addWidget(self.btn_test_tts)
-        tts_row.addStretch()
-        layout.addLayout(tts_row)
+        post_row = QHBoxLayout()
+        post_row.addWidget(self.post_tts_spin)
+        post_row.addWidget(self._help_button("Пауза после TTS: микрофон ждёт, чтобы не услышать собственный голос."))
+        post_row.addStretch()
+        tts_form.addRow("Пауза микрофона (сек):", post_row)
+        tts_form.addRow(self.btn_test_tts)
+
+        layout.addWidget(tts_group)
         
-        # Информация
-        info_label = QLabel(
-            "💡 Информация:\n"
-            "• Таймаут фразы: максимальное время ожидания одной фразы\n"
-            "• Таймаут молчания: время тишины, после которого фраза считается завершённой\n"
-            "• Нажми 'Обновить' для переподключения микрофона"
-        )
-        info_label.setStyleSheet("color: #666; font-size: 10px;")
-        layout.addWidget(info_label)
+        misc_group = QGroupBox("Дополнительно")
+        misc_layout = QVBoxLayout(misc_group)
 
         autostart_layout = QHBoxLayout()
         self.autostart_checkbox = QCheckBox("Автозапуск Jarvis при входе в Windows (в трее)")
@@ -336,13 +682,12 @@ class MainWindow(QMainWindow):
         self.autostart_checkbox.stateChanged.connect(self.on_autostart_toggled)
         autostart_layout.addWidget(self.autostart_checkbox)
         autostart_layout.addStretch()
-        layout.addLayout(autostart_layout)
+        misc_layout.addLayout(autostart_layout)
 
         self.autostart_checkbox.blockSignals(True)
         self.autostart_checkbox.setChecked(self._is_autostart_enabled())
         self.autostart_checkbox.blockSignals(False)
         
-        # Push-to-talk
         ptt_layout = QHBoxLayout()
         self.ptt_checkbox = QCheckBox("Push-to-talk режим")
         self.ptt_checkbox.setToolTip("Удерживай горячую клавишу для записи команды без wake-word")
@@ -357,14 +702,12 @@ class MainWindow(QMainWindow):
         ptt_layout.addWidget(self.ptt_key_input)
         
         ptt_layout.addStretch()
-        layout.addLayout(ptt_layout)
+        misc_layout.addLayout(ptt_layout)
 
-        # AI настройки
-        ai_group_label = QLabel("AI ответы:")
-        ai_font = ai_group_label.font()
-        ai_font.setBold(True)
-        ai_group_label.setFont(ai_font)
-        layout.addWidget(ai_group_label)
+        layout.addWidget(misc_group)
+
+        ai_group = QGroupBox("AI (ответы на неизвестные команды)")
+        ai_layout = QVBoxLayout(ai_group)
 
         ai_enable_layout = QHBoxLayout()
         self.ai_enabled_checkbox = QCheckBox("Включить AI для неизвестных команд")
@@ -372,11 +715,11 @@ class MainWindow(QMainWindow):
         self.ai_enabled_checkbox.stateChanged.connect(self.on_ai_enabled_toggled)
         ai_enable_layout.addWidget(self.ai_enabled_checkbox)
         ai_enable_layout.addStretch()
-        layout.addLayout(ai_enable_layout)
+        ai_layout.addLayout(ai_enable_layout)
 
         ai_model_layout = QHBoxLayout()
         ai_model_layout.addWidget(QLabel("Модель AI:"))
-        self.ai_model_combo = QComboBox()
+        self.ai_model_combo = NoWheelComboBox()
         self.ai_model_combo.addItem("gpt-4o-mini", "gpt-4o-mini")
         self.ai_model_combo.addItem("gpt-4.1-mini", "gpt-4.1-mini")
         self.ai_model_combo.addItem("gpt-4o", "gpt-4o")
@@ -387,7 +730,7 @@ class MainWindow(QMainWindow):
         self.ai_test_btn.setToolTip("Проверить, что выбранный AI-провайдер отвечает")
         self.ai_test_btn.clicked.connect(self.on_test_ai)
         ai_model_layout.addWidget(self.ai_test_btn)
-        layout.addLayout(ai_model_layout)
+        ai_layout.addLayout(ai_model_layout)
 
         ai_info_label = QLabel(
             "• Локальные системные команды выполняются без AI\n"
@@ -395,7 +738,7 @@ class MainWindow(QMainWindow):
             "• Ключи хранятся локально в keys.json (или в переменных окружения)"
         )
         ai_info_label.setStyleSheet("color: #666; font-size: 10px;")
-        layout.addWidget(ai_info_label)
+        ai_layout.addWidget(ai_info_label)
 
         chat_ctx_layout = QHBoxLayout()
         self.clear_ctx_btn = QPushButton("🧹 Очистить контекст")
@@ -403,7 +746,12 @@ class MainWindow(QMainWindow):
         self.clear_ctx_btn.clicked.connect(self.on_clear_chat_history)
         chat_ctx_layout.addWidget(self.clear_ctx_btn)
         chat_ctx_layout.addStretch()
-        layout.addLayout(chat_ctx_layout)
+        ai_layout.addLayout(chat_ctx_layout)
+
+        layout.addWidget(ai_group)
+
+        keys_group = QGroupBox("Ключи и конфигурация")
+        keys_layout = QVBoxLayout(keys_group)
 
         openai_key_layout = QHBoxLayout()
         openai_key_layout.addWidget(QLabel("Ключ OpenAI:"))
@@ -415,11 +763,11 @@ class MainWindow(QMainWindow):
         openai_save_btn = QPushButton("💾 Сохранить OpenAI")
         openai_save_btn.clicked.connect(self.on_save_openai_key)
         openai_key_layout.addWidget(openai_save_btn)
-        layout.addLayout(openai_key_layout)
+        keys_layout.addLayout(openai_key_layout)
 
         self.openai_key_warning = QLabel("")
         self.openai_key_warning.setStyleSheet("color: #cc6600; font-size: 10px;")
-        layout.addWidget(self.openai_key_warning)
+        keys_layout.addWidget(self.openai_key_warning)
 
         pv_layout = QHBoxLayout()
         pv_layout.addWidget(QLabel("Ключ Porcupine (Picovoice):"))
@@ -431,11 +779,11 @@ class MainWindow(QMainWindow):
         pv_save_btn = QPushButton("💾 Сохранить Porcupine")
         pv_save_btn.clicked.connect(self.on_save_pv_key)
         pv_layout.addWidget(pv_save_btn)
-        layout.addLayout(pv_layout)
+        keys_layout.addLayout(pv_layout)
 
         self.pv_key_warning = QLabel("")
         self.pv_key_warning.setStyleSheet("color: #cc6600; font-size: 10px;")
-        layout.addWidget(self.pv_key_warning)
+        keys_layout.addWidget(self.pv_key_warning)
         
         # Кнопки управления конфигом
         config_buttons_layout = QHBoxLayout()
@@ -456,9 +804,17 @@ class MainWindow(QMainWindow):
         config_buttons_layout.addWidget(scan_apps_btn)
 
         layout.addLayout(config_buttons_layout)
+        keys_layout.addLayout(config_buttons_layout)
+
+        layout.addWidget(keys_group)
         
         layout.addStretch()
-        self.settings_tab.setLayout(layout)
+        scroll.setWidget(content)
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+        self.settings_tab.setLayout(outer)
 
     def refresh_buttons(self):
         # Обновление микрофона
@@ -513,13 +869,27 @@ class MainWindow(QMainWindow):
 
 
     def append_log(self, msg: str):
+        raw = str(msg or "")
+        recognized = re.search(r"Распознано:\s*(.+)$", raw)
+        if recognized:
+            self.user_text_label.setText(recognized.group(1).strip())
+            self._start_avatar_animation(2200)
+        elif "Скажи команду" in raw or "Слушаю следующую команду" in raw:
+            self._start_avatar_animation(1200)
+        elif "Не расслышал" in raw:
+            self.user_text_label.setText("Не расслышал. Повтори команду.")
+            self._stop_avatar_animation()
+
         formatted = self._format_log_message(msg)
         color = self._color_for_level(formatted["level"])
         escaped_text = html.escape(formatted["text"])
         line_html = (
-            f'<span style="color:{color};">'
-            f'[{formatted["timestamp"]}] [{formatted["level"]}] {escaped_text}'
-            "</span>"
+            "<div style='margin:2px 0 2px 0; padding:6px 9px; "
+            "border-radius:8px; background:#F4F7FD; border:1px solid #E6ECF7;'>"
+            f"<span style='color:#64748B;'>[{formatted['timestamp']}]</span> "
+            f"<span style='color:{color}; font-weight:700;'>[{formatted['level']}]</span> "
+            f"<span style='color:#1F2937;'>{escaped_text}</span>"
+            "</div>"
         )
         self.log_view.append(line_html)
         self._append_runtime_log_file(
@@ -599,10 +969,10 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _color_for_level(level: str) -> str:
         palette = {
-            "DEBUG": "#9E9E9E",
-            "INFO": "#FFFFFF",
-            "WARNING": "#FFD54F",
-            "ERROR": "#EF5350",
+            "DEBUG": "#64748B",
+            "INFO": "#334155",
+            "WARNING": "#B45309",
+            "ERROR": "#B91C1C",
         }
         return palette.get(level, "#FFFFFF")
 
