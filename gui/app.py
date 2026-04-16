@@ -3,10 +3,13 @@ import logging
 import threading
 import re
 import argparse
+import difflib
 import json
 import os
 import subprocess
 import html
+import time
+import math
 from pathlib import Path
 from datetime import datetime
 from PySide6.QtWidgets import (
@@ -14,15 +17,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
     QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle, QCheckBox, QLineEdit,
     QFrame, QGraphicsDropShadowEffect, QGroupBox, QFormLayout, QToolButton, QSizePolicy, QToolTip,
-    QScrollArea,
+    QScrollArea, QSlider, QStackedWidget, QFileDialog, QInputDialog,
 )
 
 import sounddevice as sd
 
 from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QCursor
-from PySide6.QtCore import Signal, QObject, QTimer, QEvent, Qt, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Signal, QObject, QTimer, QEvent, Qt, QPropertyAnimation, QEasingCurve, QRect
 
-from src.jarvis.engine import JarvisEngine, TTS_PRESETS
+from src.jarvis.engine import JarvisEngine
 from src.jarvis.key_store import ensure_keys_file, save_keys
 from src.jarvis.app_scanner import merge_scanned_apps_into_config
 
@@ -88,6 +91,154 @@ class NoWheelComboBox(QComboBox):
         event.ignore()
 
 
+class MicSensitivitySlider(QWidget):
+    """Один элемент: порог + живой уровень (как в Discord)."""
+
+    thresholdChanged = Signal(float)  # 0..1
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(24)
+        self.setMouseTracking(True)
+
+        self._threshold = 0.2  # 0..1
+        self._auto = False
+        self._drag = False
+
+        self._level_target = 0.0  # 0..1
+        self._level_smooth = 0.0  # 0..1
+        self._smooth_timer = QTimer(self)
+        self._smooth_timer.timeout.connect(self._tick_smoothing)
+        self._smooth_timer.start(30)
+
+    def set_threshold(self, value: float, emit_signal: bool = False):
+        v = max(0.0, min(1.0, float(value)))
+        if abs(v - self._threshold) < 1e-6:
+            return
+        self._threshold = v
+        self.update()
+        if emit_signal:
+            self.thresholdChanged.emit(self._threshold)
+
+    def threshold(self) -> float:
+        return float(self._threshold)
+
+    def set_auto(self, enabled: bool):
+        self._auto = bool(enabled)
+        self.setEnabled(True)  # визуально оставляем видимым, но блокируем перетаскивание
+        self.update()
+
+    def is_auto(self) -> bool:
+        return bool(self._auto)
+
+    def set_level(self, value: float):
+        self._level_target = max(0.0, min(1.0, float(value)))
+
+    def _tick_smoothing(self):
+        # Плавное сглаживание без резких скачков
+        a = 0.22
+        self._level_smooth = (1.0 - a) * self._level_smooth + a * self._level_target
+        self.update()
+
+    def _track_rect(self):
+        pad_x = 10
+        pad_y = 9
+        return self.rect().adjusted(pad_x, pad_y, -pad_x, -pad_y)
+
+    def _threshold_x(self) -> int:
+        r = self._track_rect()
+        return int(r.left() + self._threshold * max(1, r.width()))
+
+    def _set_threshold_from_pos(self, x: int):
+        r = self._track_rect()
+        if r.width() <= 1:
+            return
+        v = (x - r.left()) / float(r.width())
+        self.set_threshold(v, emit_signal=True)
+
+    def mousePressEvent(self, event):  # noqa: N802 (Qt naming)
+        if self._auto:
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = True
+            self._set_threshold_from_pos(event.position().x())
+
+    def mouseMoveEvent(self, event):  # noqa: N802 (Qt naming)
+        if self._auto or not self._drag:
+            return
+        self._set_threshold_from_pos(event.position().x())
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 (Qt naming)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = False
+
+    def paintEvent(self, event):  # noqa: N802 (Qt naming)
+        _ = event
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        r = self._track_rect()
+        if r.width() <= 2:
+            p.end()
+            return
+
+        # Базовая дорожка
+        radius = r.height() // 2
+        base = QColor("#1F2937")
+        base.setAlpha(18)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(base))
+        p.drawRoundedRect(r, radius, radius)
+
+        # Зоны: слева до порога — жёлтая, справа — зелёная (как в Discord)
+        th_x = self._threshold_x()
+        left = r.adjusted(0, 0, -(r.right() - th_x), 0)
+        right = r.adjusted(th_x - r.left(), 0, 0, 0)
+
+        yellow = QColor("#F59E0B")
+        yellow.setAlpha(90)
+        green = QColor("#22C55E")
+        green.setAlpha(90)
+        if left.width() > 0:
+            p.setBrush(QBrush(yellow))
+            p.drawRoundedRect(left, radius, radius)
+        if right.width() > 0:
+            p.setBrush(QBrush(green))
+            p.drawRoundedRect(right, radius, radius)
+
+        # Живой уровень (более насыщенный поверх)
+        lvl = max(0.0, min(1.0, float(self._level_smooth)))
+        lvl_w = int(r.width() * lvl)
+        if lvl_w > 0:
+            lvl_rect = r.adjusted(0, 0, -(r.width() - lvl_w), 0)
+            if lvl < self._threshold:
+                fill = QColor("#D97706")  # темнее жёлтого
+            else:
+                fill = QColor("#16A34A")  # темнее зелёного
+            fill.setAlpha(180)
+            p.setBrush(QBrush(fill))
+            p.drawRoundedRect(lvl_rect, radius, radius)
+
+        # Ползунок порога
+        handle_r = r.height() + 4
+        hx = th_x
+        hy = r.center().y()
+        handle = QRect(int(hx - handle_r / 2), int(hy - handle_r / 2), handle_r, handle_r)
+        p.setBrush(QBrush(QColor("#F1F5F9")))
+        p.setPen(QPen(QColor("#111827"), 1))
+        p.drawEllipse(handle)
+
+        # В авто режиме подсветка приглушена
+        if self._auto:
+            veil = QColor("#FFFFFF")
+            veil.setAlpha(80)
+            p.setBrush(QBrush(veil))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(r, radius, radius)
+
+        p.end()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, engine: JarvisEngine, bus: LogBus):
         super().__init__()
@@ -95,7 +246,6 @@ class MainWindow(QMainWindow):
         self.bus = bus
         self.tray: QSystemTrayIcon | None = None
         self._quit_requested = False
-        self._loading_progress_value = 0
         self._ptt_hotkey = "f6"  # По умолчанию F6
         self._recording_key = False  # Флаг записи клавиши
         self._recorded_combo = []  # Комбинация клавиш во время записи
@@ -110,6 +260,22 @@ class MainWindow(QMainWindow):
         self._avatar_inner_normal = 152
         self._avatar_size_focus_min = 260
         self._avatar_size_focus_max = 430
+        self._avatar_state = "unknown"
+        self._avatar_accent = QColor("#3B82F6")  # default: blue (waiting wake-word)
+        self._avatar_shadow_base = QColor(59, 130, 246, 80)
+        self._loading_anim_active = False
+        self._mic_monitor_stream = None
+        self._mic_monitor_active = False
+        self._mic_level_stream = None
+        self._mic_level_active = False
+        self._mic_level_rms = 0.0  # raw RMS (0..1)
+        self._mic_level_norm = 0.0  # normalized level (0..1)
+        self._mic_auto_enabled = False
+        self._mic_noise_est = 0.02
+        self._mic_auto_last_save = 0.0
+        self._mic_level_timer = QTimer(self)
+        self._mic_level_timer.timeout.connect(self._update_mic_level_ui)
+        self._mic_level_timer.start(50)
 
         self.setWindowTitle("Jarvis Assistant")
         self.resize(900, 700)
@@ -118,23 +284,22 @@ class MainWindow(QMainWindow):
         self.setFixedSize(self.size())
         self._apply_light_theme()
 
-        # Вкладки для навигации
-        self.tabs = QTabWidget()
-        
-        # Вкладка 1: Основное окно
+        # Навигация без вкладок: основной экран + экран настроек
+        root = QWidget()
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(10)
+
+        self._stack = QStackedWidget()
         self.main_tab = QWidget()
-        self.setup_main_tab()
-        
-        # Вкладка 2: Настройки
         self.settings_tab = QWidget()
+        self.setup_main_tab()
         self.setup_settings_tab()
+        self._stack.addWidget(self.main_tab)
+        self._stack.addWidget(self.settings_tab)
 
-        self.tabs.addTab(self.main_tab, "Основное")
-        self.tabs.addTab(self.settings_tab, "Настройки")
-
-        self.tabs.currentChanged.connect(self.on_tab_changed)
-        
-        self.setCentralWidget(self.tabs)
+        root_layout.addWidget(self._stack)
+        self.setCentralWidget(root)
 
         self.bus.log.connect(self.append_log)
         self.engine.set_asr_ready_callback(self._schedule_asr_ready_tray_notification)
@@ -144,6 +309,14 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_buttons)
         self.timer.start(100)
+
+    def _show_settings(self):
+        if hasattr(self, "_stack"):
+            self._stack.setCurrentWidget(self.settings_tab)
+
+    def _show_main(self):
+        if hasattr(self, "_stack"):
+            self._stack.setCurrentWidget(self.main_tab)
 
     def _startup_script_path(self) -> Path:
         startup_dir = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
@@ -200,6 +373,11 @@ class MainWindow(QMainWindow):
 
         event.ignore()
         self.hide()
+        # На всякий случай останавливаем мониторинг микрофона, если он был включен.
+        try:
+            self._stop_mic_monitoring()
+        except Exception:
+            pass
         if self.tray:
             self.tray.showMessage(
                 "Jarvis Assistant",
@@ -216,34 +394,6 @@ class MainWindow(QMainWindow):
     def setup_main_tab(self):
         """Настройка основной вкладки"""
         layout = QVBoxLayout()
-        
-        # Статус
-        self.status_label = QLabel("Статус: INIT")
-        status_font = self.status_label.font()
-        status_font.setPointSize(12)
-        status_font.setBold(True)
-        self.status_label.setFont(status_font)
-        layout.addWidget(self.status_label)
-        
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMinimum(0)
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-        
-        # Информация о микрофоне и режиме
-        info_layout = QHBoxLayout()
-        self.microphone_label = QLabel("🎤 Микрофон: не выбран")
-        self.microphone_label.setStyleSheet("color: #666;")
-        info_layout.addWidget(self.microphone_label)
-        
-        self.mode_label = QLabel("⏸ Режим: не активен")
-        self.mode_label.setStyleSheet("color: #666;")
-        info_layout.addWidget(self.mode_label)
-        info_layout.addStretch()
-        layout.addLayout(info_layout)
 
         # Центральный визуальный блок ассистента
         avatar_wrap = QFrame()
@@ -311,9 +461,14 @@ class MainWindow(QMainWindow):
         self.btn_start.clicked.connect(self.engine.start)
         self.btn_stop.clicked.connect(self.engine.stop)
         self.btn_stop.setEnabled(False)
-        
+
+        self.btn_open_settings = QPushButton("⚙ Настройки")
+        self.btn_open_settings.setToolTip("Открыть настройки")
+        self.btn_open_settings.clicked.connect(self._show_settings)
+
         button_layout.addWidget(self.btn_start)
         button_layout.addWidget(self.btn_stop)
+        button_layout.addWidget(self.btn_open_settings)
         layout.addLayout(button_layout)
         
         self.main_tab.setLayout(layout)
@@ -323,9 +478,52 @@ class MainWindow(QMainWindow):
         self.avatar_label.setFixedSize(size, size)
         self.avatar_label.setPixmap(self._make_avatar_pixmap(inner_size))
         radius = size // 2
+        border = self._avatar_accent.name() if hasattr(self, "_avatar_accent") else "#DDE6F2"
         self.avatar_label.setStyleSheet(
-            f"border: 3px solid #DDE6F2; border-radius: {radius}px; background: #FFFFFF;"
+            f"border: 3px solid {border}; border-radius: {radius}px; background: #FFFFFF;"
         )
+
+    def _set_avatar_state(self, state: str):
+        """Меняет цвет центрального "крючка" по режиму."""
+        state = (state or "").strip().lower() or "unknown"
+        if state == self._avatar_state:
+            return
+        self._avatar_state = state
+
+        if state == "armed":
+            accent = QColor("#22C55E")  # green
+            shadow = QColor(34, 197, 94, 90)
+        elif state == "loading":
+            accent = QColor("#F59E0B")  # orange
+            shadow = QColor(245, 158, 11, 110)
+        elif state == "idle":
+            accent = QColor("#EF4444")  # red
+            shadow = QColor(239, 68, 68, 90)
+        else:
+            accent = QColor("#3B82F6")  # blue (running/waiting wake-word)
+            shadow = QColor(59, 130, 246, 90)
+
+        self._avatar_accent = accent
+        self._avatar_shadow_base = shadow
+
+        # если прямо сейчас не "пульсируем", ставим базовый цвет подсветки
+        if self.avatar_pulse_anim.state() != QPropertyAnimation.State.Running:
+            self.avatar_shadow.setColor(self._avatar_shadow_base)
+        self._update_avatar_for_state()
+
+    def _set_loading_animation(self, active: bool):
+        active = bool(active)
+        if active == self._loading_anim_active:
+            return
+        self._loading_anim_active = active
+        if active:
+            # постоянная "пульсация" во время загрузки модели
+            if self.avatar_pulse_anim.state() != QPropertyAnimation.State.Running:
+                self.avatar_pulse_anim.start()
+            self._avatar_pulse_timer.stop()  # не останавливаем по таймеру
+        else:
+            # выходим из "loading" — оставляем базовую подсветку по текущему состоянию
+            self._stop_avatar_animation()
 
     def _update_avatar_for_state(self):
         """Адаптивный размер аватара: в визуальном режиме крупнее."""
@@ -357,15 +555,17 @@ class MainWindow(QMainWindow):
         if getattr(self, "_log_collapsed", False):
             self._update_avatar_for_state()
 
-    @staticmethod
-    def _make_avatar_pixmap(size: int) -> QPixmap:
+    def _make_avatar_pixmap(self, size: int) -> QPixmap:
         pix = QPixmap(size, size)
         pix.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         # Внешнее кольцо
-        painter.setPen(QPen(QColor("#D8E6FF"), 2))
+        accent = self._avatar_accent if hasattr(self, "_avatar_accent") else QColor("#7EA8FF")
+        ring = QColor(accent)
+        ring.setAlpha(190)
+        painter.setPen(QPen(ring, 2))
         painter.setBrush(QBrush(QColor("#F7FAFF")))
         painter.drawEllipse(1, 1, size - 2, size - 2)
 
@@ -379,7 +579,7 @@ class MainWindow(QMainWindow):
         core = int(size * 0.23)
         core_x = (size - core) // 2
         core_y = (size - core) // 2
-        painter.setBrush(QBrush(QColor("#7EA8FF")))
+        painter.setBrush(QBrush(accent))
         painter.drawEllipse(core_x, core_y, core, core)
         painter.end()
         return pix
@@ -387,14 +587,17 @@ class MainWindow(QMainWindow):
     def _start_avatar_animation(self, duration_ms: int = 1800):
         if self.avatar_pulse_anim.state() != QPropertyAnimation.State.Running:
             self.avatar_pulse_anim.start()
-        self.avatar_shadow.setColor(QColor(76, 132, 255, 150))
+        # более яркая подсветка тем же акцентом
+        c = QColor(self._avatar_accent)
+        c.setAlpha(160)
+        self.avatar_shadow.setColor(c)
         self._avatar_pulse_timer.start(max(600, duration_ms))
 
     def _stop_avatar_animation(self):
         if self.avatar_pulse_anim.state() == QPropertyAnimation.State.Running:
             self.avatar_pulse_anim.stop()
         self.avatar_shadow.setBlurRadius(20)
-        self.avatar_shadow.setColor(QColor(104, 150, 255, 80))
+        self.avatar_shadow.setColor(self._avatar_shadow_base if hasattr(self, "_avatar_shadow_base") else QColor(104, 150, 255, 80))
 
     def _apply_light_theme(self):
         self.setStyleSheet(
@@ -569,6 +772,16 @@ class MainWindow(QMainWindow):
 
         mic_form.addRow("Устройство:", mic_row)
 
+        # Чувствительность (как в Discord): один компонент "уровень + порог"
+        self.mic_auto_checkbox = QCheckBox("Автоматически определять чувствительность ввода")
+        self.mic_auto_checkbox.setToolTip("Как в Discord: порог подбирается автоматически по уровню шума.")
+        self.mic_auto_checkbox.stateChanged.connect(self.on_mic_auto_toggled)
+        mic_form.addRow(self.mic_auto_checkbox)
+
+        self.mic_sensitivity = MicSensitivitySlider()
+        self.mic_sensitivity.thresholdChanged.connect(self.on_mic_threshold_changed_01)
+        mic_form.addRow("", self.mic_sensitivity)
+
         self.mic_test_result = QLabel("")
         self.mic_test_result.setStyleSheet("color: #475569; font-size: 11px;")
         self.mic_test_result.setWordWrap(True)
@@ -644,16 +857,39 @@ class MainWindow(QMainWindow):
         tts_group = QGroupBox("Озвучка (TTS)")
         tts_form = QFormLayout(tts_group)
 
-        self.tts_enabled_checkbox = QCheckBox("Включить озвучку (pyttsx3)")
+        self.tts_enabled_checkbox = QCheckBox("Включить озвучку")
         self.tts_enabled_checkbox.stateChanged.connect(self.on_tts_enabled_changed)
         tts_form.addRow(self.tts_enabled_checkbox)
 
-        self.tts_preset_combo = NoWheelComboBox()
-        self.tts_preset_combo.addItem("Тихий", "quiet")
-        self.tts_preset_combo.addItem("Нормальный", "normal")
-        self.tts_preset_combo.addItem("Чёткий", "clear")
-        self.tts_preset_combo.currentIndexChanged.connect(self.on_tts_preset_changed)
-        tts_form.addRow("Пресет:", self.tts_preset_combo)
+        # Ползунок скорости речи
+        self.tts_rate_value = QLabel("182")
+        self.tts_rate_value.setStyleSheet("color: #64748B;")
+        self.tts_rate_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tts_rate_slider.setMinimum(120)
+        self.tts_rate_slider.setMaximum(240)
+        self.tts_rate_slider.setSingleStep(1)
+        self.tts_rate_slider.setPageStep(5)
+        self.tts_rate_slider.valueChanged.connect(self.on_tts_rate_changed)
+        rate_row = QHBoxLayout()
+        rate_row.addWidget(self.tts_rate_slider, stretch=1)
+        rate_row.addWidget(self.tts_rate_value)
+        rate_row.addWidget(self._help_button("Скорость речи: выше — быстрее, ниже — медленнее."))
+        tts_form.addRow("Скорость речи:", rate_row)
+
+        # Ползунок громкости
+        self.tts_volume_value = QLabel("95%")
+        self.tts_volume_value.setStyleSheet("color: #64748B;")
+        self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tts_volume_slider.setMinimum(0)
+        self.tts_volume_slider.setMaximum(100)
+        self.tts_volume_slider.setSingleStep(1)
+        self.tts_volume_slider.setPageStep(5)
+        self.tts_volume_slider.valueChanged.connect(self.on_tts_volume_changed)
+        vol_row = QHBoxLayout()
+        vol_row.addWidget(self.tts_volume_slider, stretch=1)
+        vol_row.addWidget(self.tts_volume_value)
+        vol_row.addWidget(self._help_button("Громкость озвучки (0–100%)."))
+        tts_form.addRow("Громкость:", vol_row)
 
         self.post_tts_spin = OverlayStepperDoubleSpinBox()
         self.post_tts_spin.setMinimum(0.1)
@@ -803,6 +1039,16 @@ class MainWindow(QMainWindow):
         scan_apps_btn.clicked.connect(self.on_scan_apps)
         config_buttons_layout.addWidget(scan_apps_btn)
 
+        add_app_btn = QPushButton("➕ Добавить программу")
+        add_app_btn.setToolTip("Добавить свою программу в apps и синонимы.")
+        add_app_btn.clicked.connect(self.on_add_program)
+        config_buttons_layout.addWidget(add_app_btn)
+
+        add_site_btn = QPushButton("➕ Добавить сайт")
+        add_site_btn.setToolTip("Добавить свой сайт в sites и синонимы.")
+        add_site_btn.clicked.connect(self.on_add_site)
+        config_buttons_layout.addWidget(add_site_btn)
+
         layout.addLayout(config_buttons_layout)
         keys_layout.addLayout(config_buttons_layout)
 
@@ -813,56 +1059,47 @@ class MainWindow(QMainWindow):
 
         outer = QVBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
+        header = QHBoxLayout()
+        self.btn_back = QPushButton("← Назад")
+        self.btn_back.setToolTip("Вернуться на главный экран")
+        self.btn_back.setFixedWidth(120)
+        self.btn_back.clicked.connect(self._show_main)
+        header.addWidget(self.btn_back)
+        header.addStretch()
+        outer.addLayout(header)
         outer.addWidget(scroll)
         self.settings_tab.setLayout(outer)
 
     def refresh_buttons(self):
-        # Обновление микрофона
-        mic_name = self.device_combo.currentText() if self.device_combo.currentIndex() >= 0 else "не выбран"
-        self.microphone_label.setText(f"🎤 Микрофон: {mic_name}")
-        
-        # Обновление режима
-        if getattr(self.engine, "is_running", False):
-            if getattr(self.engine, "continuous_mode", False):
-                self.mode_label.setText("🔄 Режим: continuous")
-            elif getattr(self.engine, "armed", False):
-                self.mode_label.setText("🎙 Режим: ожидание команды")
-            else:
-                wake_engine = getattr(self.engine, "wakeword_engine", "vosk_text")
-                self.mode_label.setText(f"👂 Режим: ожидание wake-word ({wake_engine})")
-        else:
-            self.mode_label.setText("⏸ Режим: не активен")
-        
         # LOADING
         if getattr(self.engine, "is_loading", False):
-            self.status_label.setText("Статус: LOADING (загрузка модели)")
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(self._loading_progress_value)
+            self._set_avatar_state("loading")
+            self._set_loading_animation(True)
+            self.user_text_label.setText("Загрузка модели распознавания…")
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(False)
             return
 
         # READY (после LOADING)
         if getattr(self.engine, "is_ready", False) and not getattr(self.engine, "is_running", False):
-            self.progress_bar.setVisible(False)
-            self.progress_bar.setValue(0)
-            self._loading_progress_value = 0
-            self.status_label.setText("Статус: READY (готов)")
+            self._set_loading_animation(False)
+            self._set_avatar_state("idle")
+            self.user_text_label.setText("Модель загружена. Нажми «Старт» или скажи «Джарвис».")
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
             return
 
         # RUNNING
         if getattr(self.engine, "is_running", False):
-            self.progress_bar.setVisible(False)
-            self.status_label.setText("Статус: RUNNING (слушаю)")
+            self._set_loading_animation(False)
+            self._set_avatar_state("armed" if getattr(self.engine, "armed", False) else "running")
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(True)
             return
 
         # INIT / UNKNOWN
-        self.progress_bar.setVisible(False)
-        self.status_label.setText("Статус: INIT")
+        self._set_loading_animation(False)
+        self._set_avatar_state("idle")
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(False)
 
@@ -896,16 +1133,17 @@ class MainWindow(QMainWindow):
             f'[{formatted["timestamp"]}] [{formatted["level"]}] {formatted["text"]}'
         )
 
-        if self.tray and str(msg).startswith("⏰ Напоминание:"):
-            body = str(msg).replace("⏰ Напоминание:", "", 1).strip()
+        s = str(msg)
+        if self.tray and (s.startswith("⏰ Напоминание:") or s.startswith("Напоминание:")):
+            body = s.replace("⏰ ", "", 1).replace("Напоминание:", "", 1).strip()
             self.tray.showMessage(
                 "Jarvis — Напоминание",
                 body or "Время напоминания наступило.",
                 QSystemTrayIcon.MessageIcon.Information,
                 6000,
             )
-        if self.tray and str(msg).startswith("⏱ Таймер: время вышло"):
-            body = str(msg).replace("⏱ Таймер:", "", 1).strip()
+        if self.tray and (s.startswith("⏱ Таймер: время вышло") or s.startswith("Таймер: время вышло")):
+            body = s.replace("⏱ ", "", 1).replace("Таймер:", "", 1).strip()
             self.tray.showMessage(
                 "Jarvis — Таймер",
                 body or "Время таймера вышло.",
@@ -913,14 +1151,7 @@ class MainWindow(QMainWindow):
                 6000,
             )
 
-        # Привязываем прогресс-бар к реальному прогрессу загрузки из логов:
-        # "📊 Загрузка: 50% (1/2)"
-        match = re.search(r"Загрузка:\s*(\d+)%", msg)
-        if match:
-            progress = int(match.group(1))
-            self._loading_progress_value = max(0, min(100, progress))
-            if self.progress_bar.isVisible():
-                self.progress_bar.setValue(self._loading_progress_value)
+        # Прогресс-бар убран: загрузка отображается анимацией/цветом аватара.
 
     @staticmethod
     def _strip_emoji(text: str) -> str:
@@ -1022,6 +1253,11 @@ class MainWindow(QMainWindow):
 
         self.engine.set_device(device_index)
         self.save_audio_setting("microphone_name", self.device_combo.currentText())
+        # Перезапускаем поток индикатора уровня под новое устройство
+        try:
+            self._stop_mic_level_stream()
+        except Exception:
+            pass
 
     def on_clear_log(self):
         self.log_view.clear()
@@ -1086,6 +1322,248 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.append_log(f"❌ Ошибка автопоиска приложений: {e}")
 
+    @staticmethod
+    def _normalize_config_key(name: str) -> str:
+        s = (name or "").strip().lower()
+        s = re.sub(r"\s+", "_", s)
+        s = re.sub(r"[^a-zа-яё0-9_]+", "", s)
+        return s.strip("_")
+
+    def _generate_synonyms_with_ai(self, kind: str, title: str, key: str, value: str) -> list[str]:
+        """
+        Генерация синонимов через AI (опционально).
+        kind: app|site
+        value: путь к exe или url
+        """
+        try:
+            ex = getattr(self.engine, "ex", None)
+            ai = getattr(ex, "_ai_client", None)
+            if not ai or not ai.is_enabled():
+                return []
+            prompt = (
+                "Верни строго JSON: {\"synonyms\":[\"...\", ...]} без дополнительного текста.\n"
+                f"Тип: {kind}\n"
+                f"Название: {title}\n"
+                f"Ключ: {key}\n"
+                f"Значение: {value}\n"
+                "Нужно 6-12 полезных и реалистичных вариантов только на русском языке.\n"
+                "Важно:\n"
+                "- без английских слов, translit и технических терминов;\n"
+                "- только то, что человек реально может сказать голосом;\n"
+                "- включи: исходную форму, простые падежные формы, разговорные формы;\n"
+                "- если название из 2+ слов, дай варианты и для каждого слова отдельно "
+                "(особенно для первого слова), и для полной фразы;\n"
+                "- добавь вероятные ошибки распознавания и похожие по звучанию формы, "
+                "если они правдоподобны;\n"
+                "- не добавляй фразы-команды (типа 'открой ...', 'запусти ...');\n"
+                "- не добавляй статусные фразы (типа '... работает', '... открыта').\n"
+                "Пример для Зона: зона, зону, зоны, зоне, сона, сону.\n"
+                "Пример для Телеграм: телеграм, телеграма, телеграму, телеграме, телеграмм, телеграмма."
+            )
+            raw = ai.get_response(
+                prompt,
+                history=None,
+                system_prompt=(
+                    "Ты генератор русских синонимов для голосовых команд. "
+                    "Только русский язык, без английских слов. "
+                    "Нужны только полезные и реалистичные формы слова, без мусора. "
+                    "Отвечай только JSON формата {\"synonyms\":[...]}."
+                ),
+                max_tokens=140,
+                temperature=0.2,
+            )
+            if not raw:
+                return []
+            data = json.loads(raw)
+            arr = data.get("synonyms") if isinstance(data, dict) else None
+            if not isinstance(arr, list):
+                return []
+            out: list[str] = []
+            title_parts = [p for p in re.split(r"[\s\-]+", (title or "").lower()) if p]
+            banned_tokens = {
+                "открой", "открыть", "запусти", "запустить", "включи", "включить",
+                "зайди", "зайти", "найди", "найти", "покажи", "показать",
+                "работает", "работать", "запущена", "запущен", "открыта", "открыт",
+                "экране", "программа", "приложение", "сайт",
+            }
+            similarity_bases = []
+            full_base = re.sub(r"[^а-яё0-9]", "", (title or "").lower())
+            if full_base:
+                similarity_bases.append(full_base)
+            for tp in title_parts:
+                clean_tp = re.sub(r"[^а-яё0-9]", "", tp)
+                if clean_tp:
+                    similarity_bases.append(clean_tp)
+            fallback_base = re.sub(r"[^а-яё0-9]", "", (key or "").replace("_", " ").lower())
+            if fallback_base:
+                similarity_bases.append(fallback_base)
+            for item in arr:
+                s = str(item or "").strip().lower()
+                s = re.sub(r"\s+", " ", s)
+                # Только русские символы/цифры/пробел/дефис.
+                # Отсекаем англ. варианты вроде "zone", "area" и т.п.
+                if not re.fullmatch(r"[а-яё0-9][а-яё0-9\s\-]{0,39}", s):
+                    continue
+                if not s or len(s) > 40:
+                    continue
+                parts = [p for p in re.split(r"[\s\-]+", s) if p]
+                # Оставляем только короткие "словарные" варианты (1-2 слова).
+                # Фразы-команды и статусные фразы отбрасываем.
+                if len(parts) == 0 or len(parts) > 2:
+                    continue
+                if any(p in banned_tokens for p in parts):
+                    continue
+                # Защита от «левых» слов: оставляем формы, похожие на название
+                # целиком или на отдельные слова в названии.
+                candidate = re.sub(r"[^а-яё0-9]", "", s)
+                if similarity_bases and candidate:
+                    ratio = max(
+                        difflib.SequenceMatcher(None, base, candidate).ratio()
+                        for base in similarity_bases
+                    )
+                    if ratio < 0.42:
+                        continue
+                out.append(s)
+
+            # Локальная "человеческая" нормализация склеенных слов:
+            # античит -> анти чит (частый вариант в речи/распознавании).
+            expanded: list[str] = []
+            for syn in out:
+                expanded.append(syn)
+                token_parts = [p for p in re.split(r"[\s\-]+", syn) if p]
+                if len(token_parts) == 1:
+                    token = token_parts[0]
+                    if token.startswith("анти") and len(token) >= 7:
+                        expanded.append(f"анти {token[4:]}")
+
+            # уникальные, в исходном порядке
+            uniq = list(dict.fromkeys(expanded))
+            return uniq[:10]
+        except Exception:
+            return []
+
+    def _config_path(self) -> Path:
+        return Path(__file__).resolve().parents[1] / "src" / "jarvis" / "config.json"
+
+    def _load_full_config(self) -> dict:
+        path = self._config_path()
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+
+    def _save_full_config(self, config: dict) -> None:
+        path = self._config_path()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+
+    def on_add_program(self):
+        title, ok = QInputDialog.getText(self, "Добавить программу", "Название программы:")
+        if not ok:
+            return
+        title = (title or "").strip()
+        if not title:
+            self.append_log("⚠ Название программы пустое.")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбери .exe программы",
+            str(Path.home()),
+            "Программы (*.exe);;Все файлы (*.*)",
+        )
+        if not file_path:
+            return
+
+        key = self._normalize_config_key(title)
+        if not key:
+            self.append_log("⚠ Не удалось нормализовать имя программы.")
+            return
+
+        try:
+            cfg = self._load_full_config()
+            apps = cfg.get("apps", {})
+            synonyms = cfg.get("synonyms", {})
+            if not isinstance(apps, dict):
+                apps = {}
+            if not isinstance(synonyms, dict):
+                synonyms = {}
+
+            apps[key] = file_path.replace("\\", "/")
+            # Базовые + AI-синонимы
+            base_syns = [
+                self._normalize_config_key(title).replace("_", " "),
+                key,
+            ]
+            ai_syns = self._generate_synonyms_with_ai("app", title, key, apps[key])
+            for syn in list(dict.fromkeys(base_syns + ai_syns)):
+                if syn:
+                    synonyms[syn] = key
+
+            cfg["apps"] = apps
+            cfg["synonyms"] = synonyms
+            self._save_full_config(cfg)
+            self.engine.reload_config()
+            self.append_log(f"✅ Программа добавлена: {title} -> {key}")
+            if ai_syns:
+                self.append_log(f"🤖 Добавлены AI-синонимы: {', '.join(ai_syns[:8])}{'…' if len(ai_syns) > 8 else ''}")
+        except Exception as e:
+            self.append_log(f"❌ Не удалось добавить программу: {e}")
+
+    def on_add_site(self):
+        title, ok = QInputDialog.getText(self, "Добавить сайт", "Название сайта:")
+        if not ok:
+            return
+        title = (title or "").strip()
+        if not title:
+            self.append_log("⚠ Название сайта пустое.")
+            return
+
+        url, ok = QInputDialog.getText(self, "Добавить сайт", "Ссылка (https://...):")
+        if not ok:
+            return
+        url = (url or "").strip()
+        if not url:
+            self.append_log("⚠ Ссылка сайта пустая.")
+            return
+        if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+            url = "https://" + url
+
+        key = self._normalize_config_key(title)
+        if not key:
+            self.append_log("⚠ Не удалось нормализовать имя сайта.")
+            return
+
+        try:
+            cfg = self._load_full_config()
+            sites = cfg.get("sites", {})
+            synonyms = cfg.get("synonyms", {})
+            if not isinstance(sites, dict):
+                sites = {}
+            if not isinstance(synonyms, dict):
+                synonyms = {}
+
+            sites[key] = url
+            base_syns = [
+                self._normalize_config_key(title).replace("_", " "),
+                key,
+            ]
+            ai_syns = self._generate_synonyms_with_ai("site", title, key, url)
+            for syn in list(dict.fromkeys(base_syns + ai_syns)):
+                if syn:
+                    synonyms[syn] = key
+
+            cfg["sites"] = sites
+            cfg["synonyms"] = synonyms
+            self._save_full_config(cfg)
+            self.engine.reload_config()
+            self.append_log(f"✅ Сайт добавлен: {title} -> {url}")
+            if ai_syns:
+                self.append_log(f"🤖 Добавлены AI-синонимы: {', '.join(ai_syns[:8])}{'…' if len(ai_syns) > 8 else ''}")
+        except Exception as e:
+            self.append_log(f"❌ Не удалось добавить сайт: {e}")
+
     def on_phrase_timeout_changed(self, value):
         self.save_audio_setting("phrase_timeout", value)
 
@@ -1101,19 +1579,23 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self.append_log(f"❌ Не удалось применить настройки TTS: {error}")
 
-    def on_tts_preset_changed(self, _index: int):
-        preset = self.tts_preset_combo.currentData()
-        if not preset:
-            return
-        pr = TTS_PRESETS.get(preset, TTS_PRESETS["normal"])
-        self.save_audio_setting("tts_preset", preset)
-        self.save_audio_setting("tts_rate", pr["tts_rate"])
-        self.save_audio_setting("tts_volume", pr["tts_volume"])
+    def on_tts_rate_changed(self, value: int):
+        v = int(value)
+        self.tts_rate_value.setText(str(v))
+        self.save_audio_setting("tts_rate", v)
         try:
             self.engine.reload_config()
-            self.append_log(f"🔊 Пресет озвучки: {self.tts_preset_combo.currentText()}")
         except Exception as error:
-            self.append_log(f"❌ Не удалось применить пресет: {error}")
+            self.append_log(f"❌ Не удалось применить скорость TTS: {error}")
+
+    def on_tts_volume_changed(self, value: int):
+        pct = max(0, min(100, int(value)))
+        self.tts_volume_value.setText(f"{pct}%")
+        self.save_audio_setting("tts_volume", round(pct / 100.0, 3))
+        try:
+            self.engine.reload_config()
+        except Exception as error:
+            self.append_log(f"❌ Не удалось применить громкость TTS: {error}")
 
     def on_post_tts_delay_changed(self, value: float):
         v = float(value)
@@ -1362,61 +1844,195 @@ class MainWindow(QMainWindow):
         super().mousePressEvent(event)
     
     def on_test_microphone(self):
-        """Тест микрофона с визуализацией уровня звука"""
+        """Мониторинг микрофона (как в Discord): слышишь сам себя."""
+        # Toggle
+        if getattr(self, "_mic_monitor_active", False):
+            self._stop_mic_monitoring()
+            return
+
         if self.device_combo.currentIndex() < 0:
             self.append_log("❌ Сначала выбери микрофон")
             return
-        
+        # Во время активного прослушивания мониторинг не включаем (иначе будет каша/эхо).
+        # Во время загрузки модели (is_loading) мониторинг разрешаем: это полезно как в Discord.
+        if getattr(self.engine, "is_running", False):
+            self.append_log("⚠ Останови движок перед тестом микрофона.")
+            return
+        if getattr(self.engine, "is_loading", False):
+            self.append_log("ℹ Идёт загрузка модели. Тест микрофона может не запуститься, если устройство занято.")
+
         device_id = self.device_combo.itemData(self.device_combo.currentIndex())
-        self.append_log(f"🎙 Тест микрофона (говори 3 секунды)...")
-        
+
         try:
-            import numpy as np
-            duration = 3.0
-            sample_rate = 16000
-            
-            recording = sd.rec(
-                int(duration * sample_rate),
-                samplerate=sample_rate,
+            in_info = sd.query_devices(device_id, "input")
+            sr = int(in_info.get("default_samplerate", 48000))
+
+            def rms_to_level01(rms: float) -> float:
+                # Нормализация, чтобы "обычная речь" была заметной (как в Discord).
+                # Лог-кривая: small rms -> заметно, большие -> насыщение.
+                r = max(0.0, min(1.0, float(rms)))
+                k = 60.0
+                return max(0.0, min(1.0, math.log1p(r * k) / math.log1p(k)))
+
+            def callback(indata, outdata, frames, time_info, status):  # noqa: ANN001
+                if status:
+                    # не спамим в лог, просто молча продолжаем
+                    pass
+                # Voice gate по порогу чувствительности (как в Discord).
+                try:
+                    rms = float((indata * indata).mean() ** 0.5)
+                except Exception:
+                    rms = 0.0
+                lvl01 = rms_to_level01(rms)
+                thr = self.mic_sensitivity.threshold() if hasattr(self, "mic_sensitivity") else 0.2
+                target = 1.0 if lvl01 >= thr else 0.0
+
+                # Сглаживаем включение/выключение, чтобы не было щелчков
+                gain = getattr(callback, "_gain", 0.0)
+                a = 0.25 if target > gain else 0.12
+                gain = (1.0 - a) * gain + a * target
+                setattr(callback, "_gain", gain)
+
+                outdata[:] = indata * gain
+
+            stream = sd.Stream(
+                device=(device_id, None),
+                samplerate=sr,
                 channels=1,
-                device=device_id,
-                dtype='int16'
+                dtype="float32",
+                callback=callback,
             )
-            sd.wait()
-            
-            # Анализ уровня звука
-            audio_data = recording.flatten()
-            max_amplitude = np.abs(audio_data).max()
-            rms = np.sqrt(np.mean(audio_data.astype(np.float32)**2))
-            
-            # Нормализация к 100
-            max_percent = (max_amplitude / 32768.0) * 100
-            rms_percent = (rms / 32768.0) * 100
-            
-            result_msg = ""
-            if max_percent < 1:
-                result_msg = "⚠ Очень тихо! Проверь микрофон или увеличь громкость"
-                self.mic_test_result.setStyleSheet("color: #ff0000; font-size: 10px;")
-            elif max_percent < 10:
-                result_msg = "🔉 Уровень низкий. Говори громче или ближе к микрофону"
-                self.mic_test_result.setStyleSheet("color: #ff8800; font-size: 10px;")
-            elif max_percent > 90:
-                result_msg = "🔊 Уровень слишком высокий! Уменьши громкость микрофона"
-                self.mic_test_result.setStyleSheet("color: #ff8800; font-size: 10px;")
-            else:
-                result_msg = f"✅ Микрофон работает (пик: {max_percent:.1f}%, средний: {rms_percent:.1f}%)"
-                self.mic_test_result.setStyleSheet("color: #00aa00; font-size: 10px;")
-            
-            self.append_log(result_msg)
-            self.mic_test_result.setText(result_msg)
-            self.engine.speak_if_logged_phrase(result_msg)
+            stream.start()
+            self._mic_monitor_stream = stream
+            self._mic_monitor_active = True
+            self.btn_test_mic.setText("Стоп")
+            msg = "Тест микрофона: мониторинг включен. Ты слышишь сам себя. Нажми «Стоп»."
+            self.mic_test_result.setStyleSheet("color: #0F172A; font-size: 11px;")
+            self.mic_test_result.setText(msg)
+            self.append_log(msg)
 
         except Exception as e:
             error_msg = f"❌ Ошибка теста микрофона: {e}"
             self.append_log(error_msg)
             self.mic_test_result.setText(error_msg)
             self.mic_test_result.setStyleSheet("color: #ff0000; font-size: 10px;")
-            self.engine.speak_if_logged_phrase(error_msg)
+
+    def on_mic_threshold_changed_01(self, value01: float):
+        v01 = max(0.0, min(1.0, float(value01)))
+        self.save_audio_setting("mic_threshold", int(round(v01 * 100)))
+
+    def on_mic_auto_toggled(self, state: int):
+        enabled = state != 0
+        self.save_audio_setting("mic_auto_sensitivity", bool(enabled))
+        self._mic_auto_enabled = bool(enabled)
+        if hasattr(self, "mic_sensitivity"):
+            self.mic_sensitivity.set_auto(self._mic_auto_enabled)
+
+    def _ensure_mic_level_stream(self):
+        if getattr(self, "_mic_level_active", False):
+            return
+        if not hasattr(self, "device_combo") or self.device_combo.currentIndex() < 0:
+            return
+        device_id = self.device_combo.itemData(self.device_combo.currentIndex())
+        try:
+            info = sd.query_devices(device_id, "input")
+            sr = int(info.get("default_samplerate", 48000))
+
+            def cb(indata, frames, time_info, status):  # noqa: ANN001
+                try:
+                    # RMS level for current chunk (0..1)
+                    # indata is float32 [-1..1]
+                    rms = float((indata * indata).mean() ** 0.5)
+                    self._mic_level_rms = max(0.0, min(1.0, rms))
+                    # Нормализованный уровень для UI/порога
+                    k = 60.0
+                    self._mic_level_norm = max(
+                        0.0, min(1.0, math.log1p(self._mic_level_rms * k) / math.log1p(k))
+                    )
+                except Exception:
+                    pass
+
+            stream = sd.InputStream(
+                device=device_id,
+                samplerate=sr,
+                channels=1,
+                dtype="float32",
+                callback=cb,
+            )
+            stream.start()
+            self._mic_level_stream = stream
+            self._mic_level_active = True
+        except Exception:
+            # если устройство занято — просто не показываем живой уровень
+            self._mic_level_stream = None
+            self._mic_level_active = False
+
+    def _stop_mic_level_stream(self):
+        stream = getattr(self, "_mic_level_stream", None)
+        try:
+            if stream is not None:
+                stream.stop()
+                stream.close()
+        finally:
+            self._mic_level_stream = None
+            self._mic_level_active = False
+            self._mic_level_rms = 0.0
+            self._mic_level_norm = 0.0
+
+    def _update_mic_level_ui(self):
+        # Поднимаем поток уровня только когда открыт экран настроек и выбран микрофон.
+        try:
+            if hasattr(self, "_stack") and self._stack.currentWidget() is self.settings_tab:
+                self._ensure_mic_level_stream()
+            else:
+                if getattr(self, "_mic_level_active", False):
+                    self._stop_mic_level_stream()
+        except Exception:
+            pass
+
+        if not hasattr(self, "mic_sensitivity"):
+            return
+
+        lvl01 = max(0.0, min(1.0, float(self._mic_level_norm)))
+        self.mic_sensitivity.set_level(lvl01)
+
+        # Авто-порог (по шуму) — простой, понятный алгоритм для диплома.
+        if getattr(self, "_mic_auto_enabled", False):
+            now = time.time()
+            if not hasattr(self, "_mic_noise_est"):
+                self._mic_noise_est = max(0.02, min(0.4, lvl01))
+            # нижняя огибающая: быстро вниз, медленно вверх
+            if lvl01 < self._mic_noise_est:
+                self._mic_noise_est = lvl01
+            else:
+                self._mic_noise_est = self._mic_noise_est * 0.995 + lvl01 * 0.005
+
+            suggested = self._mic_noise_est * 1.8 + 0.05
+            suggested = max(0.06, min(0.85, suggested))
+            self.mic_sensitivity.set_threshold(suggested, emit_signal=True)
+
+            # чтобы не спамить записью в файл, сохраняем раз в ~1с
+            last = getattr(self, "_mic_auto_last_save", 0.0)
+            if now - last > 1.0:
+                self._mic_auto_last_save = now
+                self.save_audio_setting("mic_threshold", int(round(suggested * 100)))
+
+    def _stop_mic_monitoring(self):
+        stream = getattr(self, "_mic_monitor_stream", None)
+        try:
+            if stream is not None:
+                stream.stop()
+                stream.close()
+        finally:
+            self._mic_monitor_stream = None
+            self._mic_monitor_active = False
+            if hasattr(self, "btn_test_mic"):
+                self.btn_test_mic.setText("Тест")
+            msg = "Тест микрофона: мониторинг выключен."
+            if hasattr(self, "mic_test_result"):
+                self.mic_test_result.setStyleSheet("color: #475569; font-size: 11px;")
+                self.mic_test_result.setText(msg)
+            self.append_log(msg)
 
 
     def save_audio_setting(self, key: str, value):
@@ -1462,11 +2078,28 @@ class MainWindow(QMainWindow):
             self.tts_enabled_checkbox.setChecked(tts_en)
             self.tts_enabled_checkbox.blockSignals(False)
 
-            preset = str(audio.get("tts_preset", "normal")).strip().lower()
-            pidx = self.tts_preset_combo.findData(preset)
-            self.tts_preset_combo.blockSignals(True)
-            self.tts_preset_combo.setCurrentIndex(pidx if pidx >= 0 else 1)
-            self.tts_preset_combo.blockSignals(False)
+            tts_rate = int(audio.get("tts_rate", 182))
+            tts_vol = float(audio.get("tts_volume", 0.95))
+            self.tts_rate_slider.blockSignals(True)
+            self.tts_rate_slider.setValue(max(120, min(240, tts_rate)))
+            self.tts_rate_slider.blockSignals(False)
+            self.tts_rate_value.setText(str(max(120, min(240, tts_rate))))
+
+            pct = int(round(max(0.0, min(1.0, tts_vol)) * 100))
+            self.tts_volume_slider.blockSignals(True)
+            self.tts_volume_slider.setValue(pct)
+            self.tts_volume_slider.blockSignals(False)
+            self.tts_volume_value.setText(f"{pct}%")
+
+            mic_threshold_pct = int(audio.get("mic_threshold", 20))
+            mic_threshold_pct = max(0, min(100, mic_threshold_pct))
+            mic_auto = bool(audio.get("mic_auto_sensitivity", False))
+            self._mic_auto_enabled = mic_auto
+            self.mic_auto_checkbox.blockSignals(True)
+            self.mic_auto_checkbox.setChecked(mic_auto)
+            self.mic_auto_checkbox.blockSignals(False)
+            self.mic_sensitivity.set_auto(mic_auto)
+            self.mic_sensitivity.set_threshold(mic_threshold_pct / 100.0, emit_signal=False)
 
             self.post_tts_spin.blockSignals(True)
             self.post_tts_spin.setValue(float(audio.get("post_tts_mic_delay", 0.45)))

@@ -7,6 +7,7 @@ import inspect
 import re
 import subprocess
 import random
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -49,13 +50,14 @@ class JarvisEngine:
         self._tts_unavailable_logged = False
         self._tts_enabled = bool(self.audio_config.get("tts_enabled", True))
         self._on_asr_ready_callback: Optional[Callable[[], None]] = None
-        # Короткие фиксированные реплики для защиты / демо (без «сэр» — естественнее для TTS)
-        self._command_ack_variants = (
-            "Слушаю.",
-            "Готово.",
-            "Не расслышал.",
-            "Открываю.",
-            "Проверь микрофон.",
+        # Озвучка для локальных команд (как для диплома)
+        # По ТЗ: при любой успешно выполненной локальной команде — одна фраза из списка.
+        self._sir_done_variants = (
+            "Есть, сэр.",
+            "Выполняю, сэр.",
+            "Да, сэр.",
+            "Сделал, сэр.",
+            "Как вы и просили, сэр.",
         )
 
         self._record_startup_timing("app_start")
@@ -93,30 +95,51 @@ class JarvisEngine:
         self._ptt_pressed = False  # Флаг для предотвращения повторных срабатываний
         self._init_tts()
 
-    def _speak_known_command_ack(self, intent_type: str):
-        t = (intent_type or "").strip().lower()
-        if not t or t == "unknown":
-            return
-        phrase = random.choice(self._command_ack_variants)
-        self._speak_async(phrase)
+    @staticmethod
+    def _strip_emoji(text: str) -> str:
+        s = str(text or "")
+        # Убираем emoji/symbols, чтобы ничего не "ломалось" в озвучке и UI.
+        out = []
+        for ch in s:
+            cat = unicodedata.category(ch)
+            if cat in {"So", "Cs"}:
+                continue
+            out.append(ch)
+        return "".join(out)
+
+    def _speak_local_done(self):
+        self._speak_async(random.choice(self._sir_done_variants))
 
     def _emit_log(self, msg: str):
-        self._log_sink(msg)
-        spoken = self._extract_tts_text(msg)
-        if spoken:
-            self._speak_async(spoken)
+        clean = self._strip_emoji(msg)
+        self._log_sink(clean)
+        # Не озвучиваем логи, если движок не запущен (важно для тестов/инициализации UI).
+        if not getattr(self, "is_running", False) and not getattr(self, "is_loading", False):
+            return
+        # Озвучка (минимально и стабильно):
+        # - AI: ... -> озвучиваем текст AI
+        # - короткие системные ответы ("Готово.") -> озвучиваем
+        # - вопросы (заканчиваются на "?") -> озвучиваем, чтобы пользователь слышал уточнение
+        s = clean.strip()
+        low = s.lower()
+        if low.startswith("ai:"):
+            self._speak_async(s.split(":", 1)[1].strip() if ":" in s else s)
+            return
+        if s.endswith("?") or low in {"готово.", "готово"}:
+            self._speak_async(s)
+            return
 
     def set_asr_ready_callback(self, callback: Optional[Callable[[], None]]) -> None:
         """Вызывается после успешной загрузки Vosk (без озвучки — для трея / UI)."""
         self._on_asr_ready_callback = callback
 
     def speak_if_logged_phrase(self, msg: str) -> None:
-        """Те же правила озвучки, что у логов движка (для строк только из GUI)."""
+        """Для строк из GUI: говорим только если это AI-текст."""
         if not self._tts_enabled:
             return
-        spoken = self._extract_tts_text(msg)
-        if spoken:
-            self._speak_async(spoken)
+        clean = self._strip_emoji(msg)
+        if clean.strip().lower().startswith("ai:"):
+            self._speak_async(clean.split(":", 1)[1].strip() if ":" in clean else clean)
 
     @staticmethod
     def _clean_for_tts(text: str, max_len: int = 380) -> str:
@@ -146,8 +169,16 @@ class JarvisEngine:
             return None
         if text.startswith("⏱") and "слушаю следующую команду" in low:
             return "Слушаю."
-        if low.startswith(("⏱", "📊", "📥", "🔊 wake-word")):
+        # Технические замеры/прогресс — не озвучиваем.
+        if low.startswith(("📊", "📥", "🔊 wake-word")):
             return None
+        if text.startswith("⏱"):
+            # Оставляем озвучку для пользовательских сообщений про таймер,
+            # но убираем метрики и внутренние тайминги.
+            if "таймер" not in low:
+                return None
+            if re.match(r"^⏱\s*(от |время |запуск|команда )", low):
+                return None
         if "загрузка:" in low and "%" in text:
             return None
 
@@ -155,6 +186,10 @@ class JarvisEngine:
             return "Слушаю."
         if text.startswith("🎙") and "слушаю команду" in low:
             return "Слушаю."
+
+        # Иногда в логе может быть "AI:" без эмодзи.
+        if low.startswith("ai:"):
+            return cls._clean_for_tts(text.split(":", 1)[1].strip() if ":" in text else text)
 
         if text.startswith("🤖 AI:"):
             return cls._clean_for_tts(text.replace("🤖 AI:", "", 1).strip())
@@ -174,6 +209,15 @@ class JarvisEngine:
             "🛑 ",
             "🔉 ",
             "🔊 ",
+            "⏰ ",
+            "⏱ ",
+            "📌 ",
+            "🎞 ",
+            "🪟 ",
+            "📜 ",
+            "📅 ",
+            "🕐 ",
+            "🎧 ",
         )
         for prefix in speak_prefixes:
             if text.startswith(prefix):
@@ -198,7 +242,8 @@ class JarvisEngine:
             return
         if self._tts_engine is None:
             self._init_tts()
-            if self._tts_engine is None:
+            # Важно: на Windows можем говорить через SAPI даже без pyttsx3.
+            if self._tts_engine is None and os.name != "nt":
                 return
         threading.Thread(target=self._speak_blocking, args=(text,), daemon=True).start()
 
@@ -218,11 +263,19 @@ class JarvisEngine:
                         com_inited = True
                     except Exception:
                         pass
-                if self._tts_engine is not None:
-                    self._tts_engine.say(clean)
-                    self._tts_engine.runAndWait()
-                elif os.name == "nt":
-                    self._speak_with_windows_sapi(clean)
+                # На Windows SAPI работает стабильнее pyttsx3 (особенно при многократных вызовах).
+                if os.name == "nt":
+                    try:
+                        self._speak_with_windows_sapi(clean)
+                    except Exception:
+                        # fallback на pyttsx3 если SAPI внезапно не сработал
+                        if self._tts_engine is not None:
+                            self._tts_engine.say(clean)
+                            self._tts_engine.runAndWait()
+                else:
+                    if self._tts_engine is not None:
+                        self._tts_engine.say(clean)
+                        self._tts_engine.runAndWait()
             except Exception as error:
                 self._log_sink(f"⚠ Озвучка не сработала, текст в логе. Причина: {error}")
                 logger.warning("TTS failed: %s", error)
@@ -238,13 +291,28 @@ class JarvisEngine:
                 self._listen_resume_at = time.time() + max(0.0, delay)
                 self._assistant_speaking.clear()
 
-    @staticmethod
-    def _speak_with_windows_sapi(text: str):
+    def _speak_with_windows_sapi(self, text: str):
         escaped = text.replace("'", "''")
+        # SAPI Rate: -10..10, Volume: 0..100
+        try:
+            tts_rate = int(self.audio_config.get("tts_rate", 182))
+        except Exception:
+            tts_rate = 182
+        try:
+            tts_volume = float(self.audio_config.get("tts_volume", 0.95))
+        except Exception:
+            tts_volume = 0.95
+
+        # Маппинг "pyttsx3-like rate" -> SAPI rate
+        sapi_rate = int(round((tts_rate - 182) / 10.0))
+        sapi_rate = max(-10, min(10, sapi_rate))
+        sapi_volume = int(round(max(0.0, min(1.0, tts_volume)) * 100))
+
         script = (
             "Add-Type -AssemblyName System.Speech; "
             "$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            "$speak.Rate = 0; "
+            f"$speak.Rate = {sapi_rate}; "
+            f"$speak.Volume = {sapi_volume}; "
             f"$speak.Speak('{escaped}');"
         )
         subprocess.run(
@@ -390,8 +458,8 @@ class JarvisEngine:
                 return
             
             def on_progress(step, total):
-                percent = int((step / total) * 100)
-                self.log(f"📊 Загрузка: {percent}% ({step}/{total})")
+                # Намеренно не логируем проценты: это вводит в заблуждение (часто всего 2 шага).
+                _ = step, total
             
             try:
                 from .vosk_asr import VoskASR
@@ -712,9 +780,9 @@ class JarvisEngine:
                 return True
             if confirmed_intent:
                 try:
-                    self._speak_known_command_ack(confirmed_intent.get("type", ""))
                     self.ex.run(confirmed_intent)
-                    self.log("✅ Подтвержденное действие выполнено.")
+                    self._speak_local_done()
+                    self.log("Подтвержденное действие выполнено.")
                     _pipe(str(confirmed_intent.get("type") or "unknown"), "ok_confirmed")
                     return True
                 except Exception as error:
@@ -753,14 +821,14 @@ class JarvisEngine:
             _pipe(str(intent.get("type") or "unknown"), "pending_confirmation")
             return True
         try:
-            self._speak_known_command_ack(intent.get("type", ""))
             self.ex.run(intent)
         except Exception as error:
             self.log(f"❌ Ошибка выполнения команды: {error}")
             logger.exception("Executor run failed")
             _pipe(str(intent.get("type") or "unknown"), "error")
             return False
-        self.log("✅ Готово.")
+        self._speak_local_done()
+        self.log("Готово.")
         _pipe(str(intent.get("type") or "unknown"), "ok")
         return True
 
@@ -774,6 +842,17 @@ class JarvisEngine:
             self.log("⏰ Режим continuous истёк. Скажи «Джарвис» для активации.")
             return True
         return False
+
+    def _enter_continuous_mode_after_speech(self):
+        """
+        Важно: таймер continuous (10с) должен стартовать ПОСЛЕ озвучки,
+        иначе пока ассистент говорит — время "сгорает", хотя микрофон заблокирован.
+        """
+        if not self._wait_until_not_speaking():
+            return
+        self.continuous_mode = True
+        self.continuous_mode_until = time.time() + self.continuous_mode_timeout
+        self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
 
     def _run_porcupine(self):
         while not self._stop.is_set():
@@ -801,13 +880,11 @@ class JarvisEngine:
                         self.log(f"🧹 Очищено: {text_clean}")
                     text = text_clean
                 else:
-                    self.log("⚠ Не расслышал.")
+                    pass
 
                 executed = self._execute_intent_if_valid(text or "") if text else False
                 if executed:
-                    self.continuous_mode = True
-                    self.continuous_mode_until = time.time() + self.continuous_mode_timeout
-                    self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
+                    self._enter_continuous_mode_after_speech()
                 
                 self.armed = False
                 continue
@@ -827,9 +904,12 @@ class JarvisEngine:
                 f"⏱ От детекта wake-word до старта прослушивания: "
                 f"{(command_listen_started - wake_detected_at) * 1000:.0f}мс"
             )
+            # В режиме Porcupine поднимаем armed, чтобы GUI показал "жду команду" (зелёный).
+            self.armed = True
             self.log("✅ Активирован. Скажи команду…")
 
             text = self._listen_once_timed("Команда после wake-word")
+            self.armed = False
             if self._stop.is_set():
                 break
             if text:
@@ -840,13 +920,11 @@ class JarvisEngine:
                     self.log(f"🧹 Очищено: {text_clean}")
                 text = text_clean
             else:
-                self.log("⚠ Не расслышал.")
+                pass
 
             executed = self._execute_intent_if_valid(text or "") if text else False
             if executed:
-                self.continuous_mode = True
-                self.continuous_mode_until = time.time() + self.continuous_mode_timeout
-                self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
+                self._enter_continuous_mode_after_speech()
 
             while self.continuous_mode and not self._stop.is_set():
                 if self._expire_continuous_if_needed(now=time.time()):
@@ -856,7 +934,6 @@ class JarvisEngine:
                 if self._stop.is_set():
                     break
                 if not next_text:
-                    self.log("⚠ Не расслышал.")
                     continue
 
                 self.log(f"🎙 Распознано: {next_text}")
@@ -867,8 +944,8 @@ class JarvisEngine:
                 next_text = next_text_clean
                 
                 if self._execute_intent_if_valid(next_text):
-                    self.continuous_mode_until = time.time() + self.continuous_mode_timeout
-                    self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
+                    # таймер должен начинаться после озвучки результата команды
+                    self._enter_continuous_mode_after_speech()
 
             if self._wake_detector and not self._stop.is_set():
                 self._wake_detector.start_listening()
@@ -898,7 +975,7 @@ class JarvisEngine:
                 break
             if not text:
                 if stage != "Ожидание wake-word":
-                    self.log("⚠ Не расслышал.")
+                    pass
                 continue
 
             t = text.strip().lower()
@@ -944,9 +1021,7 @@ class JarvisEngine:
                     self.log("✅ Готово.")
                     
                     # Enter continuous mode - wait for next command without wake word
-                    self.continuous_mode = True
-                    self.continuous_mode_until = time.time() + self.continuous_mode_timeout
-                    self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
+                    self._enter_continuous_mode_after_speech()
                     continue
                 else:
                     # Wake word found but no known command after it - пробуем AI сразу
@@ -958,9 +1033,7 @@ class JarvisEngine:
                         logger.exception("AI fallback failed (wake+unknown)")
                         handled = False
                     if handled:
-                        self.continuous_mode = True
-                        self.continuous_mode_until = time.time() + self.continuous_mode_timeout
-                        self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
+                        self._enter_continuous_mode_after_speech()
                     else:
                         self.armed = True
                         self._pending_command_since = time.perf_counter()
@@ -994,8 +1067,7 @@ class JarvisEngine:
                     self.log("✅ Готово.")
                     
                     # Reset continuous mode timer
-                    self.continuous_mode_until = time.time() + self.continuous_mode_timeout
-                    self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
+                    self._enter_continuous_mode_after_speech()
                     continue
                 else:
                     self.log("[DEBUG] continuous unknown -> AI")
@@ -1039,10 +1111,8 @@ class JarvisEngine:
                 self.log("✅ Готово.")
 
                 # Enter continuous mode after command execution
-                self.continuous_mode = True
-                self.continuous_mode_until = time.time() + self.continuous_mode_timeout
                 self.armed = False
-                self.log(f"⏱ Слушаю следующую команду... ({self.continuous_mode_timeout:.0f}с)")
+                self._enter_continuous_mode_after_speech()
                 continue
 
             # Not armed and no wake word - just log and continue

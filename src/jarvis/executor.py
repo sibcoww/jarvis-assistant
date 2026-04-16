@@ -149,6 +149,11 @@ class Executor:
             return ""
 
         kind = pending.get("kind")
+        # Если пользователь вместо уточнения произнёс новую команду — не "съедаем" её как аргумент.
+        if kind in {"browser_target", "app_target", "browser_query"}:
+            if qn.startswith(("открой", "открыть", "запусти", "запустить", "найди", "поищи", "покажи")):
+                self._pending_clarification = None
+                return None
         if kind in {"volume_value", "volume_down_delta", "volume_up_delta"}:
             num = extract_number(q)
             if num is None:
@@ -465,7 +470,7 @@ class Executor:
             self._append_chat_message("assistant", message)
             self._save_chat_history()
             self._last_ai_at = now_ts
-            self._log(f"🤖 AI: {message}")
+            self._log(f"AI: {message}")
             return True
 
         return False
@@ -515,6 +520,8 @@ class Executor:
             return "Отменил таймер."
         if t == "show_weather":
             return "Показал погоду."
+        if t == "list_known_apps":
+            return "Показал список доступных программ."
         if t == "shutdown_pc":
             return "Выключаю компьютер."
         if t == "restart_pc":
@@ -873,6 +880,7 @@ class Executor:
         allowed = {
             "add_todo",
             "list_todos",
+            "list_known_apps",
             "complete_todo",
             "delete_todo",
             "create_reminder",
@@ -896,6 +904,7 @@ class Executor:
 
         if intent in {
             "list_todos",
+            "list_known_apps",
             "timer_status",
             "cancel_timer",
             "shutdown_pc",
@@ -968,6 +977,11 @@ class Executor:
             "заблокируй экран",
             "блокир",
             "погод",
+            "какие программы",
+            "доступные программы",
+            "список программ",
+            "какие приложения",
+            "умеешь открывать",
         )
         return any(m in low for m in markers)
 
@@ -986,6 +1000,7 @@ class Executor:
             "Разрешённые intent:\n"
             "- add_todo: slots {\"text\":\"...\"}\n"
             "- list_todos: slots {}\n"
+            "- list_known_apps: slots {}\n"
             "- complete_todo: slots {\"ref\":\"...\"}\n"
             "- delete_todo: slots {\"ref\":\"...\"}\n"
             "- create_reminder: slots {\"reminder\":\"...\"}\n"
@@ -1579,13 +1594,45 @@ class Executor:
             except Exception as e:
                 logger.error(f"Ошибка запуска приложения {cmd_path}: {e}")
         else:
+            # 1) Сначала пробуем локальный сайт из config (sites/synonyms), без AI.
+            normalized_target = target.strip().lower()
+            site_aliases = self.config.get("sites", {}) if isinstance(self.config, dict) else {}
+            if not isinstance(site_aliases, dict):
+                site_aliases = {}
+            resolved_site = str(site_aliases.get(normalized_target, "")).strip()
+            if not resolved_site and normalized_target in {
+                "microsoft teams",
+                "teams",
+                "майкрософт тимс",
+                "тимс",
+                "whatsapp",
+                "ватсап",
+                "ватсапп",
+                "вотсап",
+                "вацап",
+            }:
+                resolved_site = self._resolve_site_target(normalized_target)
+            if resolved_site:
+                self.browser_navigate(resolved_site)
+                logger.info(f"Открываю сайт из config (sites): {resolved_site}")
+                return
+
+            # 2) Прямой URL/домен.
+            if "." in article_target and " " not in article_target:
+                self.browser_navigate(article_target)
+                logger.info(f"Открываю как URL/домен: {article_target}")
+                return
+
+            # 3) Если не нашли локально — пробуем AI только как web-навигацию/поиск.
             if self._is_article_first_query(article_target):
                 article_url = self._resolve_article_url_with_ai(article_target)
                 if article_url:
                     self.browser_navigate(article_url)
                     logger.info(f"Article-first direct URL: {article_url}")
                     return
-            # Интеллектуальное разрешение сайтов/запросов — через AI; исполнитель только открывает URL.
+
+            # Интеллектуальное разрешение сайтов/запросов — через AI;
+            # здесь не принимаем произвольные локальные интенты.
             if self._ai_client and self._ai_client.is_enabled():
                 phrase = (
                     article_target
@@ -1611,23 +1658,15 @@ class Executor:
                         article_url = self._resolve_article_url_with_ai(article_target)
                         if article_url:
                             ai_intent = {"type": "browser_navigate", "slots": {"url": article_url}}
+                    if ai_intent.get("type") not in {"browser_navigate", "browser_search"}:
+                        ai_intent = None
+                if ai_intent:
                     try:
                         self.run(ai_intent)
                         logger.info("Открыто через AI-интерпретацию (open_app)")
                         return
                     except Exception as e:
                         logger.warning(f"AI-команда open_app не выполнена: {e}")
-
-            resolved_site = self._resolve_site_target(article_target)
-            if resolved_site != article_target.strip().lower():
-                self.browser_navigate(resolved_site)
-                logger.info(f"Открываю сайт из config (sites): {resolved_site}")
-                return
-
-            if "." in article_target and " " not in article_target:
-                self.browser_navigate(article_target)
-                logger.info(f"Открываю как URL/домен: {article_target}")
-                return
 
             if self._is_video_or_blog_query(article_target):
                 yt_url = self._youtube_search_url(article_target)
@@ -1900,6 +1939,10 @@ class Executor:
 
             if t == "show_weather":
                 self.show_weather(slots.get("city", ""))
+                return
+
+            if t == "list_known_apps":
+                self.list_known_apps()
                 return
 
             if t == "repeat_last_command":
@@ -2688,6 +2731,20 @@ class Executor:
         self._log(f"📌 Активных задач: {len(active)}")
         for i, row in enumerate(active[:10], 1):
             self._log(f"  {i}. {str(row.get('text') or '').strip()}")
+
+    def list_known_apps(self):
+        apps = self.config.get("apps", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(apps, dict) or not apps:
+            self._log("⚠ Список программ пуст.")
+            return
+        names = [str(k).strip() for k in apps.keys() if str(k).strip()]
+        if not names:
+            self._log("⚠ Список программ пуст.")
+            return
+        names = sorted(dict.fromkeys(names))
+        self._log(f"📦 Доступных программ: {len(names)}")
+        for i, name in enumerate(names, 1):
+            self._log(f"  {i}. {name}")
 
     def complete_todo(self, ref: str):
         todos = self._load_todos()

@@ -7,9 +7,11 @@
     "ptt_hotkey": "f6",
     "tts_enabled": true,
     "tts_preset": "normal",
-    "tts_rate": 182,
-    "tts_volume": 0.95,
-    "post_tts_mic_delay": 0.45
+    "tts_rate": 196,
+    "tts_volume": 0.98,
+    "post_tts_mic_delay": 0.45,
+    "mic_threshold": 6,
+    "mic_auto_sensitivity": true
   },
   "ai": {
     "enabled": true,
@@ -28,7 +30,7 @@
     "browser": "C:/Program Files/Google/Chrome/Application/chrome.exe",
     "vscode": "E:/Tools/Microsoft VS Code/Code.exe",
     "telegram": "C:/Users/sibcoww/AppData/Roaming/Telegram Desktop/Telegram.exe",
-    "discord": "C:/Users/sibcoww/AppData/Local/Discord/app-1.0.9232/Discord.exe",
+    "discord": "C:/Users/sibcoww/AppData/Local/Discord/app-1.0.9233/Discord.exe",
     "cursor": "C:/Users/sibcoww/AppData/Local/Programs/cursor/Cursor.exe",
     "steam": "C:/Program Files (x86)/Steam/steam.exe",
     "obs": "C:/Program Files/obs-studio/bin/64bit/obs64.exe",
@@ -37,7 +39,9 @@
     "seven_zip": "C:/Program Files/7-Zip/7zFM.exe",
     "word": "C:/Program Files/Microsoft Office/root/Office16/WINWORD.EXE",
     "excel": "C:/Program Files/Microsoft Office/root/Office16/EXCEL.EXE",
-    "notepad": "notepad"
+    "notepad": "notepad",
+    "зона": "C:/Users/sibcoww/Zona/Zona.exe",
+    "фейсит_античит": "C:/Program Files/FACEIT AC/faceitclient.exe"
   },
   "synonyms": {
     "браузер": "browser",
@@ -81,14 +85,51 @@
     "7 zip": "seven_zip",
     "7-zip": "seven_zip",
     "семь зип": "seven_zip",
-    "семьзип": "seven_zip"
+    "семьзип": "seven_zip",
+    "зона": "зона",
+    "зону": "зона",
+    "зоны": "зона",
+    "зоне": "зона",
+    "зон": "зона",
+    "зонка": "зона",
+    "зончик": "зона",
+    "логбук": "логбук",
+    "логбука": "логбук",
+    "логбуку": "логбук",
+    "логбуком": "логбук",
+    "логбуке": "логбук",
+    "логбух": "логбук",
+    "логбуха": "логбук",
+    "логбуху": "логбук",
+    "логбухом": "логбук",
+    "логбухе": "логбук",
+    "фейсит античит": "фейсит_античит",
+    "фейсит_античит": "фейсит_античит",
+    "фейсит": "фейсит",
+    "фейсита": "фейсит",
+    "фейситу": "фейсит",
+    "фейсите": "фейсит",
+    "фейсит античита": "фейсит_античит",
+    "фейсит античиту": "фейсит_античит",
+    "фейсит античите": "фейсит_античит",
+    "фейсит антикит": "фейсит_античит",
+    "фейсит антикита": "фейсит_античит",
+    "фейситом": "фейсит",
+    "фейситах": "фейсит",
+    "фейзит": "фейсит",
+    "фейзита": "фейсит",
+    "фейзиту": "фейсит",
+    "фейзите": "фейсит"
   },
   "sites": {
     "ютуб": "www.youtube.com",
     "youtube": "www.youtube.com",
     "гугл": "google.com",
     "яндекс": "yandex.ru",
-    "гитхаб": "github.com"
+    "гитхаб": "github.com",
+    "антиплагиат": "https://antiplagiat.ru/",
+    "логбук": "https://lb.itstep.org/attendance",
+    "фейсит": "https://www.faceit.com/ru/"
   },
   "scenarios": {
     "рабочий режим": [

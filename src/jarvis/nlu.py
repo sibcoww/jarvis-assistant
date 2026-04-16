@@ -128,6 +128,19 @@ class SimpleNLU:
         ):
             return {"type": "show_action_history", "slots": {}}
 
+        if any(
+            p in t
+            for p in (
+                "какие программы ты знаешь",
+                "покажи список доступных программ",
+                "покажи доступные программы",
+                "список доступных программ",
+                "какие приложения ты знаешь",
+                "что ты умеешь открывать",
+            )
+        ):
+            return {"type": "list_known_apps", "slots": {}}
+
         # window management
         if any(p in t for p in ("сверни окно", "минимизируй окно", "сверни текущее окно")):
             return {"type": "window_minimize", "slots": {}}
@@ -307,6 +320,12 @@ class SimpleNLU:
                 if target.startswith(verb):
                     target = target.replace(verb, "", 1).strip()
                     break
+            # "открой программу зона" -> "зона"
+            target = re.sub(
+                r"^(?:программу|программа|приложение|приложуху|сайт)\s+",
+                "",
+                target,
+            ).strip()
             generic_targets = {"сайт", "программу", "программа", "приложение", "приложуху"}
             if target in generic_targets:
                 return {"type": "unknown", "slots": {"text": text}}
