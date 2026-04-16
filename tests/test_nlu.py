@@ -156,6 +156,12 @@ class TestSimpleNLU(unittest.TestCase):
         intent = self.nlu.parse("рабочий режим")
         self.assertEqual(intent["type"], "run_scenario")
         self.assertEqual(intent["slots"]["name"], "рабочий режим")
+
+    def test_run_scenario_phrase(self):
+        """Распознавание фразы 'запусти сценарий <имя>'"""
+        intent = self.nlu.parse("запусти сценарий стрим")
+        self.assertEqual(intent["type"], "run_scenario")
+        self.assertEqual(intent["slots"]["name"], "стрим")
     
     def test_case_insensitivity(self):
         """Проверка регистронезависимости"""

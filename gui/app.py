@@ -7,6 +7,7 @@ import difflib
 import json
 import os
 import subprocess
+import shutil
 import html
 import time
 import math
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QSystemTrayIcon, QMenu, QLabel,
     QComboBox, QHBoxLayout, QProgressBar, QTabWidget, QDoubleSpinBox, QStyle, QCheckBox, QLineEdit,
     QFrame, QGraphicsDropShadowEffect, QGroupBox, QFormLayout, QToolButton, QSizePolicy, QToolTip,
-    QScrollArea, QSlider, QStackedWidget, QFileDialog, QInputDialog,
+    QScrollArea, QSlider, QStackedWidget, QFileDialog, QInputDialog, QDialog, QMessageBox,
 )
 
 import sounddevice as sd
@@ -86,6 +87,13 @@ class OverlayStepperDoubleSpinBox(NoWheelDoubleSpinBox):
 
 class NoWheelComboBox(QComboBox):
     """ComboBox, который не меняет выбор колесом мыши."""
+
+    def wheelEvent(self, event):  # noqa: N802 (Qt naming)
+        event.ignore()
+
+
+class NoWheelSlider(QSlider):
+    """Slider, который не меняет значение колесом мыши."""
 
     def wheelEvent(self, event):  # noqa: N802 (Qt naming)
         event.ignore()
@@ -237,6 +245,572 @@ class MicSensitivitySlider(QWidget):
             p.drawRoundedRect(r, radius, radius)
 
         p.end()
+
+
+class ScenarioStepRow(QWidget):
+    def __init__(self, app_keys: list[str], on_remove, add_program_cb=None, parent=None):
+        super().__init__(parent)
+        self._types = [("app", "Программа"), ("url", "Сайт"), ("bat", "Файл .bat")]
+        self._type_idx = 0
+        self._on_remove = on_remove
+        self._add_program_cb = add_program_cb
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.type_btn = QPushButton("→ прога")
+        self.type_btn.setFixedWidth(86)
+        self.type_btn.clicked.connect(self._cycle_type)
+        layout.addWidget(self.type_btn)
+
+        self.stack = QStackedWidget()
+
+        app_page = QWidget()
+        app_l = QHBoxLayout(app_page)
+        app_l.setContentsMargins(0, 0, 0, 0)
+        self.app_combo = QComboBox()
+        self.app_combo.addItems(app_keys)
+        self.app_combo.setEditable(False)
+        app_browse_btn = QPushButton("...")
+        app_browse_btn.setFixedWidth(36)
+        app_browse_btn.setToolTip("Выбрать .exe и добавить программу в конфиг")
+        app_browse_btn.clicked.connect(self._pick_and_add_program)
+        app_l.addWidget(self.app_combo)
+        app_l.addWidget(app_browse_btn)
+        self.stack.addWidget(app_page)
+
+        url_page = QWidget()
+        url_l = QHBoxLayout(url_page)
+        url_l.setContentsMargins(0, 0, 0, 0)
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://example.com")
+        url_l.addWidget(self.url_edit)
+        self.stack.addWidget(url_page)
+
+        bat_page = QWidget()
+        bat_l = QHBoxLayout(bat_page)
+        bat_l.setContentsMargins(0, 0, 0, 0)
+        self.bat_edit = QLineEdit()
+        self.bat_edit.setPlaceholderText("Выбери .bat/.cmd файл")
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(36)
+        browse_btn.clicked.connect(self._pick_script)
+        bat_l.addWidget(self.bat_edit)
+        bat_l.addWidget(browse_btn)
+        self.stack.addWidget(bat_page)
+
+        layout.addWidget(self.stack)
+        self.remove_btn = QPushButton("−")
+        self.remove_btn.setFixedSize(34, 34)
+        self.remove_btn.setToolTip("Убрать этот шаг")
+        self.remove_btn.clicked.connect(self._remove_self)
+        layout.addWidget(self.remove_btn)
+        self._refresh_type_ui()
+
+    def _remove_self(self):
+        if callable(self._on_remove):
+            self._on_remove(self)
+
+    def _cycle_type(self):
+        self._type_idx = (self._type_idx + 1) % len(self._types)
+        self._refresh_type_ui()
+
+    def _refresh_type_ui(self):
+        t, label = self._types[self._type_idx]
+        self.type_btn.setText(f"→ {label}")
+        if t == "app":
+            self.stack.setCurrentIndex(0)
+        elif t == "url":
+            self.stack.setCurrentIndex(1)
+        else:
+            self.stack.setCurrentIndex(2)
+
+    def _pick_script(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбери .bat/.cmd для сценария",
+            str(Path.home()),
+            "Scripts (*.bat *.cmd);;Все файлы (*.*)",
+        )
+        if file_path:
+            self.bat_edit.setText(file_path)
+
+    def _pick_and_add_program(self):
+        if not callable(self._add_program_cb):
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбери .exe программы",
+            str(Path.home()),
+            "Программы (*.exe);;Все файлы (*.*)",
+        )
+        if not file_path:
+            return
+        try:
+            key = self._add_program_cb(file_path)
+            if key:
+                if self.app_combo.findText(key) < 0:
+                    self.app_combo.addItem(key)
+                self.app_combo.setCurrentText(key)
+        except Exception:
+            pass
+
+    def to_action(self, copy_script_cb) -> str:
+        t, _ = self._types[self._type_idx]
+        if t == "app":
+            app_key = (self.app_combo.currentText() or "").strip()
+            if not app_key:
+                raise ValueError("Выбери программу для шага app.")
+            return f"open:{app_key}"
+        if t == "url":
+            url = (self.url_edit.text() or "").strip()
+            if not url:
+                raise ValueError("Укажи ссылку для шага url.")
+            if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+                url = "https://" + url
+            return f"url:{url}"
+        file_path = (self.bat_edit.text() or "").strip()
+        if not file_path:
+            raise ValueError("Выбери .bat/.cmd для шага bat.")
+        saved = copy_script_cb(file_path)
+        return f"bat:{saved}"
+
+    def apply_action(self, action: str):
+        raw = str(action or "").strip()
+        if raw.startswith("open:"):
+            self._type_idx = 0
+            self._refresh_type_ui()
+            app_key = raw.split(":", 1)[1].strip()
+            if app_key:
+                if self.app_combo.findText(app_key) < 0:
+                    self.app_combo.addItem(app_key)
+                self.app_combo.setCurrentText(app_key)
+            return
+        if raw.startswith("url:"):
+            self._type_idx = 1
+            self._refresh_type_ui()
+            self.url_edit.setText(raw.split(":", 1)[1].strip())
+            return
+        if raw.startswith("bat:"):
+            self._type_idx = 2
+            self._refresh_type_ui()
+            self.bat_edit.setText(raw.split(":", 1)[1].strip())
+            return
+
+
+class ScenarioEditorDialog(QDialog):
+    def __init__(
+        self,
+        app_keys: list[str],
+        copy_script_cb,
+        add_program_cb=None,
+        initial_name: str = "",
+        initial_actions: list[str] | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._app_keys = app_keys
+        self._copy_script_cb = copy_script_cb
+        self._add_program_cb = add_program_cb
+        self._rows: list[ScenarioStepRow] = []
+        self._result_name = ""
+        self._result_actions: list[str] = []
+
+        self.setWindowTitle("Конструктор сценария")
+        self.setModal(True)
+        self.resize(760, 520)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("название")
+        root.addWidget(self.name_edit)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
+
+        self.rows_host = QWidget()
+        self.rows_layout = QVBoxLayout(self.rows_host)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(8)
+        self.rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        body.addWidget(self.rows_host, 1)
+        body.setAlignment(self.rows_host, Qt.AlignmentFlag.AlignTop)
+        self.rows_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+
+        side = QVBoxLayout()
+        add_btn = QPushButton("+")
+        add_btn.setFixedSize(36, 36)
+        add_btn.setToolTip("Добавить шаг")
+        add_btn.clicked.connect(self.add_row)
+        side.addWidget(add_btn)
+        side.addStretch()
+        side.setAlignment(Qt.AlignmentFlag.AlignTop)
+        body.addLayout(side)
+
+        root.addLayout(body, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        save_btn = QPushButton("Сохранить")
+        save_btn.setFixedWidth(180)
+        save_btn.clicked.connect(self._on_save)
+        footer.addWidget(save_btn)
+        root.addLayout(footer)
+
+        if initial_name:
+            self.name_edit.setText(initial_name)
+        seed_actions = initial_actions or []
+        if seed_actions:
+            for action in seed_actions:
+                self.add_row(action)
+        else:
+            self.add_row()
+
+    def add_row(self, initial_action: str = ""):
+        row = ScenarioStepRow(self._app_keys, self.remove_row, self._add_program_cb, self)
+        if initial_action:
+            row.apply_action(initial_action)
+        self._rows.append(row)
+        self.rows_layout.addWidget(row)
+
+    def remove_row(self, row: ScenarioStepRow | None = None):
+        if len(self._rows) <= 1:
+            return
+        if row is None:
+            row = self._rows[-1]
+        if row not in self._rows:
+            return
+        self._rows.remove(row)
+        self.rows_layout.removeWidget(row)
+        row.deleteLater()
+
+    def _on_save(self):
+        name = (self.name_edit.text() or "").strip()
+        if not name:
+            QMessageBox.warning(self, "Сценарий", "Укажи название сценария.")
+            return
+        actions: list[str] = []
+        try:
+            for row in self._rows:
+                actions.append(row.to_action(self._copy_script_cb))
+        except Exception as err:
+            QMessageBox.warning(self, "Сценарий", str(err))
+            return
+        if not actions:
+            QMessageBox.warning(self, "Сценарий", "Добавь хотя бы один шаг.")
+            return
+        self._result_name = name
+        self._result_actions = actions
+        self.accept()
+
+    def scenario_name(self) -> str:
+        return self._result_name
+
+    def scenario_actions(self) -> list[str]:
+        return list(self._result_actions)
+
+
+class ProgramItemRow(QWidget):
+    def __init__(self, name: str = "", path: str = "", on_remove=None, parent=None):
+        super().__init__(parent)
+        self._on_remove = on_remove
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("Название программы")
+        self.path_edit = QLineEdit(path)
+        self.path_edit.setPlaceholderText("Путь к .exe")
+
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(36)
+        browse_btn.clicked.connect(self._browse_exe)
+
+        remove_btn = QPushButton("−")
+        remove_btn.setFixedWidth(36)
+        remove_btn.clicked.connect(self._remove_self)
+
+        layout.addWidget(self.name_edit, 2)
+        layout.addWidget(self.path_edit, 4)
+        layout.addWidget(browse_btn)
+        layout.addWidget(remove_btn)
+
+    def _browse_exe(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбери .exe программы",
+            str(Path.home()),
+            "Программы (*.exe);;Все файлы (*.*)",
+        )
+        if file_path:
+            self.path_edit.setText(file_path)
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(Path(file_path).stem)
+
+    def _remove_self(self):
+        if callable(self._on_remove):
+            self._on_remove(self)
+
+
+class SiteItemRow(QWidget):
+    def __init__(self, name: str = "", url: str = "", on_remove=None, parent=None):
+        super().__init__(parent)
+        self._on_remove = on_remove
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("Название сайта")
+        self.url_edit = QLineEdit(url)
+        self.url_edit.setPlaceholderText("https://example.com")
+
+        remove_btn = QPushButton("−")
+        remove_btn.setFixedWidth(36)
+        remove_btn.clicked.connect(self._remove_self)
+
+        layout.addWidget(self.name_edit, 2)
+        layout.addWidget(self.url_edit, 4)
+        layout.addWidget(remove_btn)
+
+    def _remove_self(self):
+        if callable(self._on_remove):
+            self._on_remove(self)
+
+
+class ProgramsManagerDialog(QDialog):
+    def __init__(self, programs: dict[str, str], parent=None):
+        super().__init__(parent)
+        self._rows: list[ProgramItemRow] = []
+        self._result: dict[str, str] = {}
+        self.setWindowTitle("Программы")
+        self.setModal(True)
+        self.resize(820, 520)
+
+        root = QVBoxLayout(self)
+        self.rows_host = QWidget()
+        self.rows_layout = QVBoxLayout(self.rows_host)
+        self.rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        root.addWidget(self.rows_host, 1)
+
+        for name, path in (programs or {}).items():
+            self.add_row(str(name), str(path))
+        if not self._rows:
+            self.add_row()
+
+        controls = QHBoxLayout()
+        add_btn = QPushButton("+")
+        add_btn.setFixedWidth(36)
+        add_btn.clicked.connect(lambda: self.add_row())
+        save_btn = QPushButton("Сохранить")
+        save_btn.setFixedWidth(170)
+        save_btn.clicked.connect(self._on_save)
+        controls.addWidget(add_btn)
+        controls.addStretch()
+        controls.addWidget(save_btn)
+        root.addLayout(controls)
+
+    def add_row(self, name: str = "", path: str = ""):
+        row = ProgramItemRow(name, path, self.remove_row, self)
+        self._rows.append(row)
+        self.rows_layout.addWidget(row)
+
+    def remove_row(self, row: ProgramItemRow):
+        if row not in self._rows:
+            return
+        self._rows.remove(row)
+        self.rows_layout.removeWidget(row)
+        row.deleteLater()
+        if not self._rows:
+            self.add_row()
+
+    def _on_save(self):
+        result: dict[str, str] = {}
+        for row in self._rows:
+            name = (row.name_edit.text() or "").strip()
+            path = (row.path_edit.text() or "").strip()
+            if not name and not path:
+                continue
+            if not name or not path:
+                QMessageBox.warning(self, "Программы", "У каждой строки должны быть и название, и путь.")
+                return
+            key = MainWindow._normalize_config_key(name)
+            if not key:
+                QMessageBox.warning(self, "Программы", f"Некорректное имя: {name}")
+                return
+            result[key] = path.replace("\\", "/")
+        self._result = result
+        self.accept()
+
+    def programs(self) -> dict[str, str]:
+        return dict(self._result)
+
+
+class SitesManagerDialog(QDialog):
+    def __init__(self, sites: dict[str, str], parent=None):
+        super().__init__(parent)
+        self._rows: list[SiteItemRow] = []
+        self._result: dict[str, str] = {}
+        self.setWindowTitle("Сайты")
+        self.setModal(True)
+        self.resize(820, 520)
+
+        root = QVBoxLayout(self)
+        self.rows_host = QWidget()
+        self.rows_layout = QVBoxLayout(self.rows_host)
+        self.rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        root.addWidget(self.rows_host, 1)
+
+        for name, url in (sites or {}).items():
+            self.add_row(str(name), str(url))
+        if not self._rows:
+            self.add_row()
+
+        controls = QHBoxLayout()
+        add_btn = QPushButton("+")
+        add_btn.setFixedWidth(36)
+        add_btn.clicked.connect(lambda: self.add_row())
+        save_btn = QPushButton("Сохранить")
+        save_btn.setFixedWidth(170)
+        save_btn.clicked.connect(self._on_save)
+        controls.addWidget(add_btn)
+        controls.addStretch()
+        controls.addWidget(save_btn)
+        root.addLayout(controls)
+
+    def add_row(self, name: str = "", url: str = ""):
+        row = SiteItemRow(name, url, self.remove_row, self)
+        self._rows.append(row)
+        self.rows_layout.addWidget(row)
+
+    def remove_row(self, row: SiteItemRow):
+        if row not in self._rows:
+            return
+        self._rows.remove(row)
+        self.rows_layout.removeWidget(row)
+        row.deleteLater()
+        if not self._rows:
+            self.add_row()
+
+    def _on_save(self):
+        result: dict[str, str] = {}
+        for row in self._rows:
+            name = (row.name_edit.text() or "").strip()
+            url = (row.url_edit.text() or "").strip()
+            if not name and not url:
+                continue
+            if not name or not url:
+                QMessageBox.warning(self, "Сайты", "У каждой строки должны быть и название, и ссылка.")
+                return
+            if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+                url = "https://" + url
+            key = MainWindow._normalize_config_key(name)
+            if not key:
+                QMessageBox.warning(self, "Сайты", f"Некорректное имя: {name}")
+                return
+            result[key] = url
+        self._result = result
+        self.accept()
+
+    def sites(self) -> dict[str, str]:
+        return dict(self._result)
+
+
+class ScenarioListRow(QWidget):
+    def __init__(self, name: str, on_edit=None, on_remove=None, parent=None):
+        super().__init__(parent)
+        self.name = name
+        self._on_edit = on_edit
+        self._on_remove = on_remove
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.name_label = QLabel(name)
+        edit_btn = QPushButton("Редактировать")
+        edit_btn.clicked.connect(self._edit_self)
+        remove_btn = QPushButton("−")
+        remove_btn.setFixedWidth(36)
+        remove_btn.clicked.connect(self._remove_self)
+
+        layout.addWidget(self.name_label, 1)
+        layout.addWidget(edit_btn)
+        layout.addWidget(remove_btn)
+
+    def _edit_self(self):
+        if callable(self._on_edit):
+            self._on_edit(self.name)
+
+    def _remove_self(self):
+        if callable(self._on_remove):
+            self._on_remove(self.name)
+
+
+class ScenariosManagerDialog(QDialog):
+    def __init__(self, scenarios: dict[str, list], on_add=None, on_edit=None, on_remove=None, parent=None):
+        super().__init__(parent)
+        self._scenarios = scenarios or {}
+        self._on_add = on_add
+        self._on_edit = on_edit
+        self._on_remove = on_remove
+
+        self.setWindowTitle("Сценарии")
+        self.setModal(True)
+        self.resize(760, 520)
+
+        root = QVBoxLayout(self)
+        self.rows_host = QWidget()
+        self.rows_layout = QVBoxLayout(self.rows_host)
+        self.rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        root.addWidget(self.rows_host, 1)
+
+        controls = QHBoxLayout()
+        add_btn = QPushButton("+")
+        add_btn.setFixedWidth(36)
+        add_btn.clicked.connect(self._add_new)
+        close_btn = QPushButton("Закрыть")
+        close_btn.setFixedWidth(170)
+        close_btn.clicked.connect(self.accept)
+        controls.addWidget(add_btn)
+        controls.addStretch()
+        controls.addWidget(close_btn)
+        root.addLayout(controls)
+
+        self.refresh_rows()
+
+    def refresh_rows(self):
+        while self.rows_layout.count():
+            item = self.rows_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        names = sorted([str(k).strip() for k in self._scenarios.keys() if str(k).strip()])
+        if not names:
+            self.rows_layout.addWidget(QLabel("Сценариев пока нет. Нажми + для добавления."))
+            return
+        for name in names:
+            self.rows_layout.addWidget(ScenarioListRow(name, self._edit_name, self._remove_name, self))
+
+    def _add_new(self):
+        if callable(self._on_add) and self._on_add():
+            self.refresh_rows()
+
+    def _edit_name(self, name: str):
+        if callable(self._on_edit) and self._on_edit(name):
+            self.refresh_rows()
+
+    def _remove_name(self, name: str):
+        if callable(self._on_remove) and self._on_remove(name):
+            self.refresh_rows()
+
+    def set_scenarios(self, scenarios: dict[str, list]):
+        self._scenarios = scenarios or {}
+        self.refresh_rows()
 
 
 class MainWindow(QMainWindow):
@@ -603,8 +1177,11 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background: #F6F8FC;
+                background: transparent;
                 color: #1F2A37;
+            }
+            QMainWindow {
+                background: #F6F8FC;
             }
             QTabWidget::pane {
                 border: 1px solid #E4E8F0;
@@ -629,9 +1206,10 @@ class MainWindow(QMainWindow):
                 background: #EEF2FF;
                 border: 1px solid #D9DEFF;
                 border-radius: 8px;
-                padding: 7px 12px;
+                padding: 8px 12px;
                 color: #3730A3;
                 font-weight: 600;
+                font-family: 'Segoe UI', 'Segoe UI Emoji';
             }
             QPushButton:hover {
                 background: #E0E7FF;
@@ -681,11 +1259,25 @@ class MainWindow(QMainWindow):
                 width: 18px;
                 height: 18px;
             }
+            QGroupBox {
+                background: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                border-radius: 10px;
+                margin-top: 0px;
+                padding: 14px;
+            }
+            QLabel#sectionHeader {
+                color: #0F172A;
+                font-size: 12px;
+                font-weight: 900;
+                padding: 2px 2px 0px 2px;
+            }
             QToolButton#helpBtn {
                 border: 1px solid #DCE3ED;
                 border-radius: 9px;
                 width: 18px;
                 height: 18px;
+                margin-left: 8px;
                 padding: 0px;
                 background: #FFFFFF;
                 color: #475569;
@@ -739,6 +1331,20 @@ class MainWindow(QMainWindow):
 
     def on_tab_changed(self, index):
         _ = index
+
+    @staticmethod
+    def _section_separator() -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Plain)
+        line.setStyleSheet("color: #CBD5E1; background: #CBD5E1; min-height: 1px; max-height: 1px;")
+        return line
+
+    @staticmethod
+    def _section_header(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setObjectName("sectionHeader")
+        return lbl
     
     def setup_settings_tab(self):
         """Настройка вкладки настроек"""
@@ -751,14 +1357,19 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(content)
         layout.setSpacing(12)
         
-        mic_group = QGroupBox("Микрофон")
+        layout.addWidget(self._section_header("Микрофон"))
+        mic_group = QGroupBox("")
         mic_form = QFormLayout(mic_group)
         mic_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        mic_form.setContentsMargins(10, 10, 10, 10)
+        mic_form.setVerticalSpacing(10)
 
         mic_row = QHBoxLayout()
+        mic_row.setSpacing(8)
         self.device_combo = NoWheelComboBox()
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
         mic_row.addWidget(self.device_combo, 1)
+        mic_row.addSpacing(6)
 
         self.btn_refresh_devices = QPushButton("Обновить")
         self.btn_refresh_devices.setToolTip("Если переподключил микрофон — нажми, чтобы обновить список устройств.")
@@ -785,12 +1396,15 @@ class MainWindow(QMainWindow):
         self.mic_test_result = QLabel("")
         self.mic_test_result.setStyleSheet("color: #475569; font-size: 11px;")
         self.mic_test_result.setWordWrap(True)
-        mic_form.addRow("", self.mic_test_result)
+        self.mic_test_result.setVisible(False)
 
         layout.addWidget(mic_group)
         
-        asr_group = QGroupBox("Распознавание и активация")
+        layout.addWidget(self._section_header("Распознавание и активация"))
+        asr_group = QGroupBox("")
         asr_form = QFormLayout(asr_group)
+        asr_form.setContentsMargins(10, 10, 10, 10)
+        asr_form.setVerticalSpacing(10)
 
         wake_row = QHBoxLayout()
         self.wake_engine_combo = NoWheelComboBox()
@@ -821,6 +1435,7 @@ class MainWindow(QMainWindow):
         self.timeout_spinbox.setValue(6.0)
         self.timeout_spinbox.setSingleStep(0.5)
         self.timeout_spinbox.setDecimals(1)
+        self.timeout_spinbox.setMinimumWidth(84)
         self.timeout_spinbox.setToolTip("Максимальное время ожидания одной команды.")
         self.timeout_spinbox.valueChanged.connect(self.on_phrase_timeout_changed)
         timeout_row.addWidget(self.timeout_spinbox)
@@ -840,6 +1455,7 @@ class MainWindow(QMainWindow):
         self.silence_spinbox.setValue(1.2)
         self.silence_spinbox.setSingleStep(0.1)
         self.silence_spinbox.setDecimals(1)
+        self.silence_spinbox.setMinimumWidth(84)
         self.silence_spinbox.setToolTip("Через сколько секунд тишины считать команду законченной.")
         self.silence_spinbox.valueChanged.connect(self.on_silence_timeout_changed)
         silence_row.addWidget(self.silence_spinbox)
@@ -854,8 +1470,11 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(asr_group)
 
-        tts_group = QGroupBox("Озвучка (TTS)")
+        layout.addWidget(self._section_header("Озвучка (TTS)"))
+        tts_group = QGroupBox("")
         tts_form = QFormLayout(tts_group)
+        tts_form.setContentsMargins(10, 10, 10, 10)
+        tts_form.setVerticalSpacing(10)
 
         self.tts_enabled_checkbox = QCheckBox("Включить озвучку")
         self.tts_enabled_checkbox.stateChanged.connect(self.on_tts_enabled_changed)
@@ -864,7 +1483,7 @@ class MainWindow(QMainWindow):
         # Ползунок скорости речи
         self.tts_rate_value = QLabel("182")
         self.tts_rate_value.setStyleSheet("color: #64748B;")
-        self.tts_rate_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tts_rate_slider = NoWheelSlider(Qt.Orientation.Horizontal)
         self.tts_rate_slider.setMinimum(120)
         self.tts_rate_slider.setMaximum(240)
         self.tts_rate_slider.setSingleStep(1)
@@ -879,7 +1498,7 @@ class MainWindow(QMainWindow):
         # Ползунок громкости
         self.tts_volume_value = QLabel("95%")
         self.tts_volume_value.setStyleSheet("color: #64748B;")
-        self.tts_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tts_volume_slider = NoWheelSlider(Qt.Orientation.Horizontal)
         self.tts_volume_slider.setMinimum(0)
         self.tts_volume_slider.setMaximum(100)
         self.tts_volume_slider.setSingleStep(1)
@@ -909,8 +1528,11 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(tts_group)
         
-        misc_group = QGroupBox("Дополнительно")
+        layout.addWidget(self._section_header("Дополнительно"))
+        misc_group = QGroupBox("")
         misc_layout = QVBoxLayout(misc_group)
+        misc_layout.setContentsMargins(10, 10, 10, 10)
+        misc_layout.setSpacing(10)
 
         autostart_layout = QHBoxLayout()
         self.autostart_checkbox = QCheckBox("Автозапуск Jarvis при входе в Windows (в трее)")
@@ -942,14 +1564,25 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(misc_group)
 
-        ai_group = QGroupBox("AI (ответы на неизвестные команды)")
+        layout.addWidget(self._section_header("AI (искусственный интеллект)"))
+        ai_group = QGroupBox("")
         ai_layout = QVBoxLayout(ai_group)
+        ai_layout.setContentsMargins(10, 10, 10, 10)
+        ai_layout.setSpacing(10)
 
         ai_enable_layout = QHBoxLayout()
         self.ai_enabled_checkbox = QCheckBox("Включить AI для неизвестных команд")
         self.ai_enabled_checkbox.setToolTip("Если команда не распознана локально, вопрос отправляется в выбранный AI-провайдер")
         self.ai_enabled_checkbox.stateChanged.connect(self.on_ai_enabled_toggled)
         ai_enable_layout.addWidget(self.ai_enabled_checkbox)
+        ai_enable_layout.addWidget(
+            self._help_button(
+                "AI используется только для неизвестных или свободных запросов.\n"
+                "Локальные системные команды (таймеры, задачи, окна, системные действия) "
+                "выполняются без AI.\n"
+                "Ключи хранятся локально в keys.json (или через переменные окружения)."
+            )
+        )
         ai_enable_layout.addStretch()
         ai_layout.addLayout(ai_enable_layout)
 
@@ -968,26 +1601,27 @@ class MainWindow(QMainWindow):
         ai_model_layout.addWidget(self.ai_test_btn)
         ai_layout.addLayout(ai_model_layout)
 
-        ai_info_label = QLabel(
-            "• Локальные системные команды выполняются без AI\n"
-            "• AI используется только для неизвестных команд и общих вопросов\n"
-            "• Ключи хранятся локально в keys.json (или в переменных окружения)"
-        )
-        ai_info_label.setStyleSheet("color: #666; font-size: 10px;")
-        ai_layout.addWidget(ai_info_label)
-
         chat_ctx_layout = QHBoxLayout()
         self.clear_ctx_btn = QPushButton("🧹 Очистить контекст")
         self.clear_ctx_btn.setToolTip("Очистить историю диалога для AI")
         self.clear_ctx_btn.clicked.connect(self.on_clear_chat_history)
         chat_ctx_layout.addWidget(self.clear_ctx_btn)
+        chat_ctx_layout.addWidget(
+            self._help_button(
+                "Очищает историю сообщений для AI (chat context).\n"
+                "Это полезно, если ассистент начал отвечать с учетом старой темы."
+            )
+        )
         chat_ctx_layout.addStretch()
         ai_layout.addLayout(chat_ctx_layout)
 
         layout.addWidget(ai_group)
 
-        keys_group = QGroupBox("Ключи и конфигурация")
+        layout.addWidget(self._section_header("Ключи и конфигурация"))
+        keys_group = QGroupBox("")
         keys_layout = QVBoxLayout(keys_group)
+        keys_layout.setContentsMargins(10, 10, 10, 10)
+        keys_layout.setSpacing(10)
 
         openai_key_layout = QHBoxLayout()
         openai_key_layout.addWidget(QLabel("Ключ OpenAI:"))
@@ -1021,33 +1655,43 @@ class MainWindow(QMainWindow):
         self.pv_key_warning.setStyleSheet("color: #cc6600; font-size: 10px;")
         keys_layout.addWidget(self.pv_key_warning)
         
-        # Кнопки управления конфигом
-        config_buttons_layout = QHBoxLayout()
-        
+        # Кнопки управления конфигом (в 2 строки, чтобы не перегружать интерфейс)
+        config_buttons_layout = QVBoxLayout()
+        config_row_1 = QHBoxLayout()
+        config_row_2 = QHBoxLayout()
+
         open_config_btn = QPushButton("📄 Открыть config.json")
         open_config_btn.clicked.connect(self.on_open_config)
-        config_buttons_layout.addWidget(open_config_btn)
+        config_row_1.addWidget(open_config_btn)
         
         reload_config_btn = QPushButton("🔄 Перезагрузить конфиг")
         reload_config_btn.clicked.connect(self.on_reload_config)
-        config_buttons_layout.addWidget(reload_config_btn)
+        config_row_1.addWidget(reload_config_btn)
 
         scan_apps_btn = QPushButton("🔎 Найти приложения")
         scan_apps_btn.setToolTip(
             "Ищет ~40 типовых программ (браузеры, IDE, мессенджеры, игры, Office…) и дописывает apps в config.json"
         )
         scan_apps_btn.clicked.connect(self.on_scan_apps)
-        config_buttons_layout.addWidget(scan_apps_btn)
+        config_row_1.addWidget(scan_apps_btn)
 
-        add_app_btn = QPushButton("➕ Добавить программу")
-        add_app_btn.setToolTip("Добавить свою программу в apps и синонимы.")
-        add_app_btn.clicked.connect(self.on_add_program)
-        config_buttons_layout.addWidget(add_app_btn)
+        manage_apps_btn = QPushButton("📦 Программы")
+        manage_apps_btn.setToolTip("Открыть список программ и управлять ими (+/-).")
+        manage_apps_btn.clicked.connect(self.on_manage_programs)
+        config_row_2.addWidget(manage_apps_btn)
 
-        add_site_btn = QPushButton("➕ Добавить сайт")
-        add_site_btn.setToolTip("Добавить свой сайт в sites и синонимы.")
-        add_site_btn.clicked.connect(self.on_add_site)
-        config_buttons_layout.addWidget(add_site_btn)
+        manage_sites_btn = QPushButton("🌐 Сайты")
+        manage_sites_btn.setToolTip("Открыть список сайтов и управлять ими (+/-).")
+        manage_sites_btn.clicked.connect(self.on_manage_sites)
+        config_row_2.addWidget(manage_sites_btn)
+
+        manage_scenarios_btn = QPushButton("🧩 Сценарии")
+        manage_scenarios_btn.setToolTip("Открыть список сценариев и управлять ими (+/-).")
+        manage_scenarios_btn.clicked.connect(self.on_manage_scenarios)
+        config_row_2.addWidget(manage_scenarios_btn)
+
+        config_buttons_layout.addLayout(config_row_1)
+        config_buttons_layout.addLayout(config_row_2)
 
         layout.addLayout(config_buttons_layout)
         keys_layout.addLayout(config_buttons_layout)
@@ -1458,6 +2102,233 @@ class MainWindow(QMainWindow):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
 
+    def _add_program_to_config(self, title: str, file_path: str) -> tuple[str, list[str]]:
+        title = (title or "").strip()
+        file_path = (file_path or "").strip()
+        if not title:
+            raise ValueError("Название программы пустое.")
+        if not file_path:
+            raise ValueError("Путь к программе пустой.")
+
+        key = self._normalize_config_key(title)
+        if not key:
+            raise ValueError("Не удалось нормализовать имя программы.")
+
+        cfg = self._load_full_config()
+        apps = cfg.get("apps", {})
+        synonyms = cfg.get("synonyms", {})
+        if not isinstance(apps, dict):
+            apps = {}
+        if not isinstance(synonyms, dict):
+            synonyms = {}
+
+        apps[key] = file_path.replace("\\", "/")
+        base_syns = [
+            self._normalize_config_key(title).replace("_", " "),
+            key,
+        ]
+        ai_syns = self._generate_synonyms_with_ai("app", title, key, apps[key])
+        for syn in list(dict.fromkeys(base_syns + ai_syns)):
+            if syn:
+                synonyms[syn] = key
+
+        cfg["apps"] = apps
+        cfg["synonyms"] = synonyms
+        self._save_full_config(cfg)
+        self.engine.reload_config()
+        return key, ai_syns
+
+    def _add_program_from_scenario_path(self, file_path: str) -> str:
+        title_default = Path(file_path).stem
+        title, ok = QInputDialog.getText(
+            self,
+            "Добавить программу в сценарий",
+            "Название программы:",
+            text=title_default,
+        )
+        if not ok:
+            return ""
+        title = (title or "").strip()
+        if not title:
+            self.append_log("⚠ Название программы пустое.")
+            return ""
+        key, ai_syns = self._add_program_to_config(title, file_path)
+        self.append_log(f"✅ Программа добавлена: {title} -> {key}")
+        if ai_syns:
+            self.append_log(f"🤖 Добавлены AI-синонимы: {', '.join(ai_syns[:8])}{'…' if len(ai_syns) > 8 else ''}")
+        return key
+
+    def _scenario_scripts_dir(self) -> Path:
+        root = Path(__file__).resolve().parents[1]
+        folder = root / "data" / "scenario_scripts"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _copy_scenario_script(self, src_path: str) -> str:
+        src = Path(src_path)
+        if not src.exists() or src.suffix.lower() not in {".bat", ".cmd"}:
+            raise ValueError("Нужен существующий .bat/.cmd файл.")
+        safe_name = self._normalize_config_key(src.stem) or "script"
+        dst = self._scenario_scripts_dir() / f"{safe_name}_{int(time.time())}{src.suffix.lower()}"
+        shutil.copy2(src, dst)
+        return str(dst).replace("\\", "/")
+
+    def _open_scenario_editor(
+        self,
+        app_names: list[str],
+        initial_name: str = "",
+        initial_actions: list[str] | None = None,
+    ) -> tuple[str, list[str]] | None:
+        dlg = ScenarioEditorDialog(
+            app_names,
+            self._copy_scenario_script,
+            self._add_program_from_scenario_path,
+            initial_name=initial_name,
+            initial_actions=initial_actions or [],
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dlg.scenario_name(), dlg.scenario_actions()
+
+    def _remove_synonyms_by_targets(self, synonyms: dict, removed_targets: set[str]) -> dict:
+        if not isinstance(synonyms, dict):
+            return {}
+        if not removed_targets:
+            return dict(synonyms)
+        return {k: v for k, v in synonyms.items() if str(v) not in removed_targets}
+
+    def on_manage_programs(self):
+        try:
+            cfg = self._load_full_config()
+            apps = cfg.get("apps", {})
+            if not isinstance(apps, dict):
+                apps = {}
+            dlg = ProgramsManagerDialog(apps, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            new_apps = dlg.programs()
+            old_apps = dict(apps)
+            synonyms = cfg.get("synonyms", {})
+            removed = set(old_apps.keys()) - set(new_apps.keys())
+            synonyms = self._remove_synonyms_by_targets(synonyms, removed)
+            for k in new_apps.keys():
+                synonyms[k] = k
+                synonyms[k.replace("_", " ")] = k
+            cfg["apps"] = new_apps
+            cfg["synonyms"] = synonyms
+            self._save_full_config(cfg)
+            self.engine.reload_config()
+            self.append_log(f"✅ Список программ обновлён: {len(new_apps)} шт.")
+        except Exception as e:
+            self.append_log(f"❌ Не удалось обновить программы: {e}")
+
+    def on_manage_sites(self):
+        try:
+            cfg = self._load_full_config()
+            sites = cfg.get("sites", {})
+            if not isinstance(sites, dict):
+                sites = {}
+            dlg = SitesManagerDialog(sites, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            new_sites = dlg.sites()
+            old_sites = dict(sites)
+            synonyms = cfg.get("synonyms", {})
+            removed = set(old_sites.keys()) - set(new_sites.keys())
+            synonyms = self._remove_synonyms_by_targets(synonyms, removed)
+            for k in new_sites.keys():
+                synonyms[k] = k
+                synonyms[k.replace("_", " ")] = k
+            cfg["sites"] = new_sites
+            cfg["synonyms"] = synonyms
+            self._save_full_config(cfg)
+            self.engine.reload_config()
+            self.append_log(f"✅ Список сайтов обновлён: {len(new_sites)} шт.")
+        except Exception as e:
+            self.append_log(f"❌ Не удалось обновить сайты: {e}")
+
+    def _scenario_add_new(self) -> bool:
+        cfg = self._load_full_config()
+        apps = cfg.get("apps", {})
+        if not isinstance(apps, dict):
+            apps = {}
+        app_names = sorted([str(k).strip() for k in apps.keys() if str(k).strip()])
+        result = self._open_scenario_editor(app_names)
+        if not result:
+            return False
+        name, actions = result
+        key = self._normalize_config_key(name)
+        if not key:
+            self.append_log("⚠ Не удалось нормализовать имя сценария.")
+            return False
+        scenarios = cfg.get("scenarios", {})
+        if not isinstance(scenarios, dict):
+            scenarios = {}
+        scenarios[key] = actions
+        cfg["scenarios"] = scenarios
+        self._save_full_config(cfg)
+        self.engine.reload_config()
+        self.append_log(f"✅ Сценарий добавлен: {name} ({len(actions)} шаг.)")
+        return True
+
+    def _scenario_edit(self, source_key: str) -> bool:
+        cfg = self._load_full_config()
+        scenarios = cfg.get("scenarios", {})
+        if not isinstance(scenarios, dict) or source_key not in scenarios:
+            return False
+        apps = cfg.get("apps", {})
+        if not isinstance(apps, dict):
+            apps = {}
+        app_names = sorted([str(k).strip() for k in apps.keys() if str(k).strip()])
+        raw_actions = scenarios.get(source_key, [])
+        initial_actions = [str(x).strip() for x in raw_actions if str(x).strip()] if isinstance(raw_actions, list) else []
+        result = self._open_scenario_editor(app_names, initial_name=source_key, initial_actions=initial_actions)
+        if not result:
+            return False
+        name, actions = result
+        key = self._normalize_config_key(name)
+        if not key:
+            self.append_log("⚠ Не удалось нормализовать имя сценария.")
+            return False
+        if source_key != key:
+            scenarios.pop(source_key, None)
+        scenarios[key] = actions
+        cfg["scenarios"] = scenarios
+        self._save_full_config(cfg)
+        self.engine.reload_config()
+        self.append_log(f"✅ Сценарий обновлён: {name} ({len(actions)} шаг.)")
+        return True
+
+    def _scenario_remove(self, key: str) -> bool:
+        cfg = self._load_full_config()
+        scenarios = cfg.get("scenarios", {})
+        if not isinstance(scenarios, dict) or key not in scenarios:
+            return False
+        scenarios.pop(key, None)
+        cfg["scenarios"] = scenarios
+        self._save_full_config(cfg)
+        self.engine.reload_config()
+        self.append_log(f"✅ Сценарий удалён: {key}")
+        return True
+
+    def on_manage_scenarios(self):
+        try:
+            cfg = self._load_full_config()
+            scenarios = cfg.get("scenarios", {})
+            if not isinstance(scenarios, dict):
+                scenarios = {}
+            dlg = ScenariosManagerDialog(
+                scenarios,
+                on_add=self._scenario_add_new,
+                on_edit=self._scenario_edit,
+                on_remove=self._scenario_remove,
+                parent=self,
+            )
+            dlg.exec()
+        except Exception as e:
+            self.append_log(f"❌ Не удалось открыть менеджер сценариев: {e}")
+
     def on_add_program(self):
         title, ok = QInputDialog.getText(self, "Добавить программу", "Название программы:")
         if not ok:
@@ -1476,35 +2347,8 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
-        key = self._normalize_config_key(title)
-        if not key:
-            self.append_log("⚠ Не удалось нормализовать имя программы.")
-            return
-
         try:
-            cfg = self._load_full_config()
-            apps = cfg.get("apps", {})
-            synonyms = cfg.get("synonyms", {})
-            if not isinstance(apps, dict):
-                apps = {}
-            if not isinstance(synonyms, dict):
-                synonyms = {}
-
-            apps[key] = file_path.replace("\\", "/")
-            # Базовые + AI-синонимы
-            base_syns = [
-                self._normalize_config_key(title).replace("_", " "),
-                key,
-            ]
-            ai_syns = self._generate_synonyms_with_ai("app", title, key, apps[key])
-            for syn in list(dict.fromkeys(base_syns + ai_syns)):
-                if syn:
-                    synonyms[syn] = key
-
-            cfg["apps"] = apps
-            cfg["synonyms"] = synonyms
-            self._save_full_config(cfg)
-            self.engine.reload_config()
+            key, ai_syns = self._add_program_to_config(title, file_path)
             self.append_log(f"✅ Программа добавлена: {title} -> {key}")
             if ai_syns:
                 self.append_log(f"🤖 Добавлены AI-синонимы: {', '.join(ai_syns[:8])}{'…' if len(ai_syns) > 8 else ''}")
@@ -1563,6 +2407,10 @@ class MainWindow(QMainWindow):
                 self.append_log(f"🤖 Добавлены AI-синонимы: {', '.join(ai_syns[:8])}{'…' if len(ai_syns) > 8 else ''}")
         except Exception as e:
             self.append_log(f"❌ Не удалось добавить сайт: {e}")
+
+    def on_add_scenario(self):
+        # Backward compatibility: старый хендлер теперь просто открывает менеджер.
+        self.on_manage_scenarios()
 
     def on_phrase_timeout_changed(self, value):
         self.save_audio_setting("phrase_timeout", value)

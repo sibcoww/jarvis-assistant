@@ -7,8 +7,8 @@
     "ptt_hotkey": "f6",
     "tts_enabled": true,
     "tts_preset": "normal",
-    "tts_rate": 196,
-    "tts_volume": 0.98,
+    "tts_rate": 218,
+    "tts_volume": 1.0,
     "post_tts_mic_delay": 0.45,
     "mic_threshold": 6,
     "mic_auto_sensitivity": true
@@ -41,7 +41,8 @@
     "excel": "C:/Program Files/Microsoft Office/root/Office16/EXCEL.EXE",
     "notepad": "notepad",
     "зона": "C:/Users/sibcoww/Zona/Zona.exe",
-    "фейсит_античит": "C:/Program Files/FACEIT AC/faceitclient.exe"
+    "фейсит_античит": "C:/Program Files/FACEIT AC/faceitclient.exe",
+    "вк_плэй": "C:/Users/sibcoww/AppData/Local/GameCenter/GameCenter.exe"
   },
   "synonyms": {
     "браузер": "browser",
@@ -119,14 +120,35 @@
     "фейзит": "фейсит",
     "фейзита": "фейсит",
     "фейзиту": "фейсит",
-    "фейзите": "фейсит"
+    "фейзите": "фейсит",
+    "вк плэй": "вк_плэй",
+    "вк_плэй": "вк_плэй",
+    "вк": "вк_плэй",
+    "вк плей": "вк_плэй",
+    "вкплей": "вк_плэй",
+    "вкплэй": "вк_плэй",
+    "вк игра": "вк_плэй",
+    "вкигра": "вк_плэй",
+    "вкигры": "вк_плэй",
+    "вконтакте плэй": "вк_плэй",
+    "вконтакте плей": "вк_плэй",
+    "browser": "browser",
+    "seven_zip": "seven_zip",
+    "seven zip": "seven_zip",
+    "notepad": "notepad",
+    "ютуб": "ютуб",
+    "youtube": "youtube",
+    "гугл": "гугл",
+    "яндекс": "яндекс",
+    "гитхаб": "гитхаб",
+    "антиплагиат": "антиплагиат"
   },
   "sites": {
-    "ютуб": "www.youtube.com",
-    "youtube": "www.youtube.com",
-    "гугл": "google.com",
-    "яндекс": "yandex.ru",
-    "гитхаб": "github.com",
+    "ютуб": "https://www.youtube.com",
+    "youtube": "https://www.youtube.com",
+    "гугл": "https://google.com",
+    "яндекс": "https://yandex.ru",
+    "гитхаб": "https://github.com",
     "антиплагиат": "https://antiplagiat.ru/",
     "логбук": "https://lb.itstep.org/attendance",
     "фейсит": "https://www.faceit.com/ru/"
@@ -135,6 +157,16 @@
     "рабочий режим": [
       "open:vscode",
       "open:browser"
+    ],
+    "игровой": [
+      "open:фейсит_античит",
+      "url:https://www.faceit.com/ru/home"
+    ],
+    "стрим": [
+      "open:obs",
+      "url:https://www.twitch.tv/",
+      "open:discord",
+      "open:процесс_лассо"
     ]
   }
 }

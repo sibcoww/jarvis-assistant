@@ -303,6 +303,16 @@ class SimpleNLU:
         # scenario
         if "рабочий режим" in t:
             return {"type": "run_scenario", "slots": {"name": "рабочий режим"}}
+        m = re.search(r"(?:запусти|запустить|включи|включить|выполни|выполнить)\s+сценар(?:ий|ия)\s+(.+)", t)
+        if m:
+            name = (m.group(1) or "").strip()
+            if name:
+                return {"type": "run_scenario", "slots": {"name": name}}
+        m = re.search(r"^сценар(?:ий|ия)\s+(.+)$", t)
+        if m:
+            name = (m.group(1) or "").strip()
+            if name:
+                return {"type": "run_scenario", "slots": {"name": name}}
 
         if "громк" in t or "звук" in t:
             value = extract_number(text)

@@ -28,6 +28,15 @@ class TestExecutor(unittest.TestCase):
         self.assertEqual(ex._resolve_target("телеграм"), "telegram")
         self.assertEqual(ex._resolve_target("telegram"), "telegram")
 
+    def test_resolve_target_compact_fuzzy_for_short_alias(self):
+        ex = _make_executor(
+            {
+                "apps": {"obs": "C:/Program Files/obs-studio/bin/64bit/obs64.exe"},
+                "synonyms": {"обс": "obs"},
+            }
+        )
+        self.assertEqual(ex._resolve_target("об са"), "obs")
+
     def test_run_routes_volume_intents(self):
         ex = _make_executor({})
 

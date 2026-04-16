@@ -6,6 +6,7 @@ import shutil
 import time
 import re
 import threading
+import difflib
 from urllib.parse import quote_plus, urlparse
 from urllib.request import urlopen
 from pathlib import Path
@@ -1383,6 +1384,12 @@ class Executor:
                 self._log("🤖 Не нашёл подходящую запись в памяти.")
             return True
 
+        # Быстрый оффлайн запуск сценария по точному имени из config (например: "стрим").
+        scenarios = self.config.get("scenarios", {}) if isinstance(self.config, dict) else {}
+        if isinstance(scenarios, dict) and normalized_query in scenarios:
+            self.run_scenario(normalized_query)
+            return True
+
         if normalized_query in {"покажи историю", "покажи контекст", "что в истории"}:
             if not self._chat_history:
                 self._log("🤖 История пуста.")
@@ -1524,7 +1531,56 @@ class Executor:
     def _resolve_target(self, target: str) -> str:
         normalized = target.strip().lower()
         synonyms = self.config.get("synonyms", {})
-        return synonyms.get(normalized, normalized)
+        if not isinstance(synonyms, dict):
+            synonyms = {}
+        direct = synonyms.get(normalized)
+        if direct:
+            return direct
+
+        apps = self.config.get("apps", {})
+        if not isinstance(apps, dict):
+            apps = {}
+        if normalized in apps:
+            return normalized
+
+        def _compact(value: str) -> str:
+            return re.sub(r"[^a-zа-яё0-9]+", "", (value or "").strip().lower())
+
+        compact_target = _compact(normalized)
+        candidates: list[tuple[str, str]] = []
+        for alias, resolved in synonyms.items():
+            a = str(alias or "").strip().lower()
+            r = str(resolved or "").strip().lower()
+            if a and r:
+                candidates.append((a, r))
+        for app_key in apps.keys():
+            k = str(app_key or "").strip().lower()
+            if k:
+                candidates.append((k, k))
+
+        if compact_target:
+            for alias, resolved in candidates:
+                if _compact(alias) == compact_target:
+                    return resolved
+
+            # Мягкий fuzzy для коротких голосовых алиасов (например: "об са" -> "обс").
+            if len(compact_target) <= 6:
+                best_resolved = ""
+                best_score = 0.0
+                for alias, resolved in candidates:
+                    compact_alias = _compact(alias)
+                    if not compact_alias:
+                        continue
+                    if abs(len(compact_alias) - len(compact_target)) > 3:
+                        continue
+                    score = difflib.SequenceMatcher(None, compact_target, compact_alias).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_resolved = resolved
+                if best_score >= 0.74 and best_resolved:
+                    return best_resolved
+
+        return normalized
 
     def _resolve_site_target(self, target: str) -> str:
         """Только опциональные подсказки из config.json (sites); без встроенного словаря сайтов."""
@@ -1589,7 +1645,14 @@ class Executor:
             cmd_path = apps[target]
             try:
                 # Безопасный запуск без shell=True
-                subprocess.Popen([cmd_path], shell=False)
+                popen_kwargs = {"shell": False}
+                try:
+                    exe_path = Path(str(cmd_path))
+                    if exe_path.suffix.lower() == ".exe" and exe_path.exists():
+                        popen_kwargs["cwd"] = str(exe_path.parent)
+                except Exception:
+                    pass
+                subprocess.Popen([cmd_path], **popen_kwargs)
                 logger.info(f"Запускаю: {cmd_path}")
             except Exception as e:
                 logger.error(f"Ошибка запуска приложения {cmd_path}: {e}")
@@ -1767,6 +1830,12 @@ class Executor:
                 try:
                     if action.startswith("open:"):
                         self.open_app(action.split(":", 1)[1])
+                    elif action.startswith("url:"):
+                        self.browser_navigate(action.split(":", 1)[1])
+                    elif action.startswith("bat:"):
+                        script_path = action.split(":", 1)[1]
+                        if script_path:
+                            subprocess.Popen([script_path], shell=False)
                 except Exception as e:
                     logger.error(f"Ошибка выполнения действия {action}: {e}")
         except Exception as e:
