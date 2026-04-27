@@ -42,7 +42,8 @@
     "notepad": "notepad",
     "зона": "C:/Users/sibcoww/Zona/Zona.exe",
     "фейсит_античит": "C:/Program Files/FACEIT AC/faceitclient.exe",
-    "вк_плэй": "C:/Users/sibcoww/AppData/Local/GameCenter/GameCenter.exe"
+    "вк_плэй": "C:/Users/sibcoww/AppData/Local/GameCenter/GameCenter.exe",
+    "впн": "E:/Tools/OpenVPN/bin/openvpn-gui.exe"
   },
   "synonyms": {
     "браузер": "browser",
@@ -141,7 +142,8 @@
     "гугл": "гугл",
     "яндекс": "яндекс",
     "гитхаб": "гитхаб",
-    "антиплагиат": "антиплагиат"
+    "антиплагиат": "антиплагиат",
+    "впн": "впн"
   },
   "sites": {
     "ютуб": "https://www.youtube.com",
