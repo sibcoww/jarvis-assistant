@@ -2,7 +2,7 @@
   "audio": {
     "microphone_name": "1: Microphone (G435 Wireless Gamin",
     "phrase_timeout": 10.0,
-    "silence_timeout": 1.8,
+    "silence_timeout": 4.0,
     "wake_engine": "vosk_text",
     "ptt_hotkey": "f6",
     "tts_enabled": true,
@@ -17,7 +17,7 @@
     "enabled": true,
     "provider": "openai",
     "api_key": "",
-    "model": "gpt-4o-mini",
+    "model": "gpt-4o",
     "timeout_seconds": 20,
     "max_tokens": 180,
     "reply_max_tokens": 120,

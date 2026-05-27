@@ -118,6 +118,8 @@ def parse_unified_model_output(raw: str) -> dict[str, Any] | None:
 
 
 def unified_turn_system_prompt(*, informational_lock: bool) -> str:
+    from datetime import datetime
+    _today = datetime.now().strftime("%d %B %Y")  # например: 28 мая 2026
     lock = ""
     if informational_lock:
         lock = (
@@ -126,6 +128,7 @@ def unified_turn_system_prompt(*, informational_lock: bool) -> str:
             "Запрещено mode=action с browser_navigate или browser_search.\n"
         )
     return (
+        f"Сегодня {_today}. Используй эту дату при ответах на вопросы о времени, годе, датах выхода фильмов и т.п.\n\n"
         "Ты маршрутизатор голосового ассистента на ПК. На каждый запрос отвечай РОВНО одним JSON-объектом, "
         "без markdown, без текста до или после JSON.\n\n"
         "Два режима:\n"

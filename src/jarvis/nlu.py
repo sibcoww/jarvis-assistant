@@ -339,6 +339,14 @@ class SimpleNLU:
             generic_targets = {"сайт", "программу", "программа", "приложение", "приложуху"}
             if target in generic_targets:
                 return {"type": "unknown", "slots": {"text": text}}
+            # Указательные местоимения без конкретного имени — контекстная ссылка,
+            # AI лучше разберётся используя историю диалога.
+            _demonstratives = {"этот", "эту", "это", "этого", "этому", "этим", "этом",
+                                "тот", "ту", "то", "того", "тому", "тем", "том",
+                                "вот", "вон"}
+            target_words = set(target.split())
+            if target_words & _demonstratives:
+                return {"type": "unknown", "slots": {"text": text}}
             if target:
                 return {
                     "type": "open_app",
@@ -358,10 +366,13 @@ class SimpleNLU:
             return {"type": "create_folder", "slots": {"name": m.group(2).strip()}}
         
         # calendar/time commands
-        if any(w in t for w in ("какая дата", "сегодня дата", "текущая дата")):
+        if any(w in t for w in ("какая дата", "какая сейчас дата", "сегодня дата",
+                                 "текущая дата", "сегодняшняя дата", "дата сегодня",
+                                 "какое сегодня число", "какое число сегодня")):
             return {"type": "show_date", "slots": {}}
-        
-        if any(w in t for w in ("какое время", "текущее время", "который час")):
+
+        if any(w in t for w in ("какое время", "какое сейчас время", "текущее время",
+                                 "который час", "сколько времени", "который сейчас час")):
             return {"type": "show_time", "slots": {}}
 
         # weather commands

@@ -59,6 +59,13 @@ class JarvisEngine:
             "Сделал, сэр.",
             "Как вы и просили, сэр.",
         )
+        self._sir_wake_variants = (
+            "Да, сэр.",
+            "Слушаю, сэр.",
+            "К вашим услугам.",
+            "Слушаю вас.",
+            "Здесь, сэр.",
+        )
 
         self._record_startup_timing("app_start")
         self.log(f"⏱ Запуск приложения: {self._app_started_wall.strftime('%H:%M:%S')}")
@@ -66,11 +73,18 @@ class JarvisEngine:
         self.nlu = SimpleNLU()
         self.nlu_type = "Simple"
         
-        self.ex = Executor(log_callback=self.log)
+        self.ex = Executor(log_callback=self.log, speak_callback=self._speak_async)
         self._stop = threading.Event()
         self._stop_reason: str | None = None
         self._thread: Optional[threading.Thread] = None
         self._reminder_thread: Optional[threading.Thread] = None
+
+        # Информационные интенты — сами озвучивают результат, "Есть, сэр." не нужен
+        self._informational_intents = {
+            "show_date", "show_time", "show_weather",
+            "timer_status", "list_todos", "list_known_apps",
+            "show_action_history", "read_notes",
+        }
 
         self.armed = False  # ждём ли команду после wake-word
         self.continuous_mode = False  # ждём ли команду в continuous режиме
@@ -110,6 +124,9 @@ class JarvisEngine:
     def _speak_local_done(self):
         self._speak_async(random.choice(self._sir_done_variants))
 
+    def _speak_wake_ack(self):
+        self._speak_async(random.choice(self._sir_wake_variants))
+
     def _emit_log(self, msg: str):
         clean = self._strip_emoji(msg)
         self._log_sink(clean)
@@ -125,7 +142,7 @@ class JarvisEngine:
         if low.startswith("ai:"):
             self._speak_async(s.split(":", 1)[1].strip() if ":" in s else s)
             return
-        if s.endswith("?") or low in {"готово.", "готово"}:
+        if s.endswith("?"):
             self._speak_async(s)
             return
 
@@ -958,6 +975,13 @@ class JarvisEngine:
         words = text.lower().split()
         return any(w in wake_words for w in words)
 
+    def _strip_wake_word(self, text: str) -> str:
+        """Remove wake word tokens from text and return the remainder."""
+        wake_words = {"джарвис", "жарвис", "джервис", "джанверт", "джанвис", "джаврис"}
+        words = text.lower().split()
+        filtered = [w for w in words if w not in wake_words]
+        return " ".join(filtered).strip()
+
     def _run(self):
         if self.wakeword_engine == "porcupine" and self._wake_detector:
             self._run_porcupine()
@@ -1012,7 +1036,8 @@ class JarvisEngine:
                     # Got valid intent in same sentence as wake word
                     self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                     try:
-                        self._speak_known_command_ack(intent.get("type", ""))
+                        if intent.get("type") not in self._informational_intents:
+                            self._speak_local_done()
                         self.ex.run(intent)
                     except Exception as error:
                         self.log(f"❌ Ошибка выполнения команды: {error}")
@@ -1024,19 +1049,29 @@ class JarvisEngine:
                     self._enter_continuous_mode_after_speech()
                     continue
                 else:
-                    # Wake word found but no known command after it - пробуем AI сразу
-                    self.log("[DEBUG] Wake+unknown -> AI")
-                    try:
-                        handled = self.ex.handle_unrecognized_command(t)
-                    except Exception as error:
-                        self.log(f"❌ Ошибка AI fallback: {error}")
-                        logger.exception("AI fallback failed (wake+unknown)")
-                        handled = False
-                    if handled:
-                        self._enter_continuous_mode_after_speech()
+                    # Wake word found but no known command after it
+                    remainder = self._strip_wake_word(t)
+                    if remainder:
+                        # Есть текст после wake-word — пробуем AI
+                        self.log("[DEBUG] Wake+unknown -> AI")
+                        try:
+                            handled = self.ex.handle_unrecognized_command(remainder)
+                        except Exception as error:
+                            self.log(f"❌ Ошибка AI fallback: {error}")
+                            logger.exception("AI fallback failed (wake+unknown)")
+                            handled = False
+                        if handled:
+                            self._enter_continuous_mode_after_speech()
+                        else:
+                            self.armed = True
+                            self._pending_command_since = time.perf_counter()
+                            self._speak_wake_ack()
+                            self.log("✅ Активирован. Скажи команду…")
                     else:
+                        # Только wake-word, никакого текста — просто активируемся
                         self.armed = True
                         self._pending_command_since = time.perf_counter()
+                        self._speak_wake_ack()
                         self.log("✅ Активирован. Скажи команду…")
                     continue
             
@@ -1058,7 +1093,8 @@ class JarvisEngine:
 
                     self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                     try:
-                        self._speak_known_command_ack(intent.get("type", ""))
+                        if intent.get("type") not in self._informational_intents:
+                            self._speak_local_done()
                         self.ex.run(intent)
                     except Exception as error:
                         self.log(f"❌ Ошибка выполнения команды: {error}")
@@ -1072,10 +1108,13 @@ class JarvisEngine:
                 else:
                     self.log("[DEBUG] continuous unknown -> AI")
                     try:
-                        self.ex.handle_unrecognized_command(text)
+                        handled = self.ex.handle_unrecognized_command(text)
                     except Exception as error:
                         self.log(f"❌ Ошибка AI fallback: {error}")
                         logger.exception("AI fallback failed (continuous)")
+                        handled = False
+                    if handled:
+                        self._enter_continuous_mode_after_speech()
                     continue
             
             # Check if armed (regular two-step activation)
@@ -1089,10 +1128,13 @@ class JarvisEngine:
                 if intent.get("type") == "unknown":
                     self.log("[DEBUG] armed unknown -> AI")
                     try:
-                        self.ex.handle_unrecognized_command(text)
+                        handled = self.ex.handle_unrecognized_command(text)
                     except Exception as error:
                         self.log(f"❌ Ошибка AI fallback: {error}")
                         logger.exception("AI fallback failed (armed)")
+                        handled = False
+                    if handled:
+                        self._enter_continuous_mode_after_speech()
                     continue
 
                 confidence = intent.get("confidence")
@@ -1102,7 +1144,8 @@ class JarvisEngine:
 
                 self.log(f"🧠 Интент: {intent['type']} (confidence: {intent.get('confidence', 0):.2f})")
                 try:
-                    self._speak_known_command_ack(intent.get("type", ""))
+                    if intent.get("type") not in self._informational_intents:
+                        self._speak_local_done()
                     self.ex.run(intent)
                 except Exception as error:
                     self.log(f"❌ Ошибка выполнения команды: {error}")

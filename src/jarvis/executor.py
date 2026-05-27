@@ -41,9 +41,10 @@ from .unified_ai_turn import (
 logger = logging.getLogger(__name__)
 
 class Executor:
-    def __init__(self, config=None, log_callback=None):
+    def __init__(self, config=None, log_callback=None, speak_callback=None):
         self.config = config or self._load_default_config()
         self.log_callback = log_callback  # Callback для GUI
+        self.speak_callback = speak_callback  # Callback для TTS
         self._ai_client = None
         self._chat_history: List[Dict[str, str]] = []
         self._chat_history_path = Path.home() / ".jarvis" / "chat_history.json"
@@ -1054,6 +1055,11 @@ class Executor:
         if self.log_callback:
             self.log_callback(message)
 
+    def _speak(self, text: str):
+        """Озвучить текст через TTS движка."""
+        if self.speak_callback:
+            self.speak_callback(text)
+
     def _ai_settings(self) -> dict:
         raw = self.config.get("ai", {})
         return raw if isinstance(raw, dict) else {}
@@ -1794,7 +1800,8 @@ class Executor:
             value = max(0, min(100, int(value)))
             volume = self._get_volume_endpoint()
             volume.SetMasterVolumeLevelScalar(value / 100.0, None)
-            logger.info(f"Громкость установлена на {value}%")
+            self._log(f"🔊 Громкость: {value}%")
+            self._speak(f"Громкость {value} процентов.")
         except Exception as e:
             logger.error(f"Ошибка установки громкости: {e}")
 
@@ -1802,7 +1809,8 @@ class Executor:
         try:
             volume = self._get_volume_endpoint()
             current = int(round(volume.GetMasterVolumeLevelScalar() * 100))
-            self.set_volume(current + delta)
+            new_val = max(0, min(100, current + delta))
+            self.set_volume(new_val)
         except Exception as e:
             logger.error(f"Ошибка изменения громкости: {e}")
 
@@ -1812,10 +1820,10 @@ class Executor:
             if not folder_name:
                 logger.warning("Имя папки пустое")
                 return
-
             folder_path = Path.cwd() / folder_name
             folder_path.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Папка готова: {folder_path}")
+            self._log(f"📁 Папка создана: {folder_name}")
+            self._speak(f"Папка {folder_name} создана.")
         except Exception as e:
             logger.error(f"Ошибка создания папки: {e}")
 
@@ -1823,9 +1831,11 @@ class Executor:
         try:
             scenarios = self.config.get("scenarios", {})
             if name not in scenarios:
-                logger.warning(f"Сценарий не найден: {name}")
+                self._log(f"⚠ Сценарий не найден: {name}")
+                self._speak(f"Сценарий {name} не найден.")
                 return
 
+            self._speak(f"Запускаю сценарий {name}.")
             for action in scenarios[name]:
                 try:
                     if action.startswith("open:"):
@@ -2234,10 +2244,11 @@ class Executor:
                 logger.warning("pyautogui не установлен. Media команды недоступны.")
                 return
             pyautogui.press('playpause')
-            logger.info("Музыка включена")
+            self._log("▶ Воспроизведение.")
+            self._speak("Включаю.")
         except Exception as e:
             logger.error(f"Ошибка воспроизведения: {e}")
-    
+
     def media_pause(self):
         """Пауза"""
         try:
@@ -2245,10 +2256,11 @@ class Executor:
                 logger.warning("pyautogui не установлен.")
                 return
             pyautogui.press('playpause')
-            logger.info("Пауза")
+            self._log("⏸ Пауза.")
+            self._speak("Пауза.")
         except Exception as e:
             logger.error(f"Ошибка паузы: {e}")
-    
+
     def media_next(self):
         """Следующий трек"""
         try:
@@ -2256,10 +2268,11 @@ class Executor:
                 logger.warning("pyautogui не установлен.")
                 return
             pyautogui.press('nexttrack')
-            logger.info("Следующий трек")
+            self._log("⏭ Следующий трек.")
+            self._speak("Следующий трек.")
         except Exception as e:
             logger.error(f"Ошибка переключения трека: {e}")
-    
+
     def media_previous(self):
         """Предыдущий трек"""
         try:
@@ -2267,7 +2280,8 @@ class Executor:
                 logger.warning("pyautogui не установлен.")
                 return
             pyautogui.press('prevtrack')
-            logger.info("Предыдущий трек")
+            self._log("⏮ Предыдущий трек.")
+            self._speak("Предыдущий трек.")
         except Exception as e:
             logger.error(f"Ошибка переключения на предыдущий трек: {e}")
 
@@ -2451,19 +2465,26 @@ class Executor:
                 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря"
             }
             date_str = f"{now.day} {months_ru[now.month]} {now.year} года"
-            
             self._log(f"📅 Дата: {date_str}")
+            self._speak(date_str)
         except Exception as e:
             logger.error(f"Ошибка показа даты: {e}")
-    
+
     def show_time(self):
         """Показать текущее время"""
         try:
             now = datetime.now()
-            time_str = now.strftime("%H:%M")
-            time_ru = f"{now.hour} часов {now.minute} минут"
-            
-            self._log(f"🕐 Время: {time_str}")
+            h, m = now.hour, now.minute
+            if m == 0:
+                time_ru = f"{h} часов ровно"
+            elif m == 1:
+                time_ru = f"{h} час {m} минута"
+            elif 2 <= m <= 4:
+                time_ru = f"{h} часов {m} минуты"
+            else:
+                time_ru = f"{h} часов {m} минут"
+            self._log(f"🕐 Время: {now.strftime('%H:%M')}")
+            self._speak(time_ru)
         except Exception as e:
             logger.error(f"Ошибка показа времени: {e}")
     
@@ -2586,12 +2607,15 @@ class Executor:
                 self._save_reminders(reminders)
 
             if due_at is not None:
-                self._log(f"⏰ Напоминание создано на {due_at.strftime('%H:%M')}: {clean_text}")
+                time_str = due_at.strftime("%H:%M")
+                self._log(f"⏰ Напоминание создано на {time_str}: {clean_text}")
+                self._speak(f"Напоминание создано на {time_str}.")
             else:
                 self._log(
                     "⏰ Напоминание сохранено без времени. "
                     "Скажи: «напомни через 10 минут ...» или «напомни в 19:30 ...»"
                 )
+                self._speak("Напоминание сохранено без времени. Уточни когда напомнить.")
         except Exception as e:
             logger.error(f"Ошибка создания напоминания: {e}")
 
@@ -2622,29 +2646,37 @@ class Executor:
                 "done": False,
             }
         if total >= 60:
-            human = f"{total // 60} мин"
+            human = f"{total // 60} минут"
         else:
-            human = f"{total} сек"
-        if label:
-            self._log(f"⏱ Таймер запущен на {human}: {self._normalize_spaces(label)}")
+            human = f"{total} секунд"
+        label_clean = self._normalize_spaces(label)
+        if label_clean:
+            self._log(f"⏱ Таймер запущен на {human}: {label_clean}")
+            self._speak(f"Таймер на {human}, {label_clean}.")
         else:
             self._log(f"⏱ Таймер запущен на {human}.")
+            self._speak(f"Таймер на {human}.")
 
     def timer_status(self):
         with self._timer_lock:
             timer = dict(self._active_timer) if isinstance(self._active_timer, dict) else None
         if not timer or bool(timer.get("done")):
             self._log("⏱ Активного таймера нет.")
+            self._speak("Активного таймера нет.")
             return
         left = int(round(float(timer.get("end_ts", 0)) - time.time()))
         if left <= 0:
             self._log("⏱ Таймер уже срабатывает.")
+            self._speak("Таймер уже сработал.")
             return
         minutes, seconds = divmod(left, 60)
         if minutes > 0:
+            msg = f"Осталось {minutes} минут {seconds} секунд."
             self._log(f"⏱ До таймера осталось: {minutes} мин {seconds} сек.")
         else:
+            msg = f"Осталось {seconds} секунд."
             self._log(f"⏱ До таймера осталось: {seconds} сек.")
+        self._speak(msg)
 
     def cancel_timer(self):
         with self._timer_lock:
@@ -2652,8 +2684,10 @@ class Executor:
             self._active_timer = None
         if existed:
             self._log("⏱ Таймер отменён.")
+            self._speak("Таймер отменён.")
         else:
             self._log("⏱ Активного таймера нет.")
+            self._speak("Активного таймера нет.")
 
     def pop_due_timers(self) -> list[str]:
         with self._timer_lock:
@@ -2729,7 +2763,12 @@ class Executor:
                 parts.append(desc.lower())
             if humidity:
                 parts.append(f"влажность {humidity}%")
-            self._log(", ".join(parts) + ".")
+            log_str = ", ".join(parts) + "."
+            self._log(log_str)
+            speak_parts = [f"В {target_city} {temp} градусов"]
+            if desc:
+                speak_parts.append(desc.lower())
+            self._speak(", ".join(speak_parts) + ".")
         except Exception as e:
             logger.error(f"Ошибка получения погоды: {e}")
             self._log(f"⚠ Не удалось получить погоду для: {target_city}")
@@ -2757,18 +2796,42 @@ class Executor:
             encoding="utf-8",
         )
 
+    _ORDINALS_RU = {
+        "первую": 1, "первый": 1, "первое": 1, "первой": 1, "первого": 1, "первом": 1,
+        "вторую": 2, "второй": 2, "второе": 2, "второго": 2, "втором": 2,
+        "третью": 3, "третий": 3, "третье": 3, "третьей": 3, "третьего": 3,
+        "четвёртую": 4, "четвертую": 4, "четвёртый": 4, "четвертый": 4,
+        "пятую": 5, "пятый": 5, "пятое": 5,
+        "шестую": 6, "шестой": 6, "шестое": 6,
+        "седьмую": 7, "седьмой": 7,
+        "восьмую": 8, "восьмой": 8,
+        "девятую": 9, "девятой": 9,
+        "десятую": 10, "десятой": 10,
+    }
+
     @staticmethod
     def _find_todo_index(todos: list[dict], ref: str) -> int:
         token = (ref or "").strip()
         if not token:
             return -1
+        low = token.lower()
+        visible = [idx for idx, row in enumerate(todos) if not bool(row.get("done"))]
+
+        # Порядковые числительные: "первую", "вторую" и т.д.
+        ordinal = Executor._ORDINALS_RU.get(low)
+        if ordinal is not None and ordinal > 0:
+            pos = ordinal - 1
+            if 0 <= pos < len(visible):
+                return visible[pos]
+
+        # Количественные числительные: "один", "два" или цифры
         num = extract_number(token)
         if num is not None and num > 0:
-            visible = [idx for idx, row in enumerate(todos) if not bool(row.get("done"))]
             pos = num - 1
             if 0 <= pos < len(visible):
                 return visible[pos]
-        low = token.lower()
+
+        # Поиск по тексту задачи
         for idx, row in enumerate(todos):
             text = str(row.get("text") or "").lower()
             if low and low in text and not bool(row.get("done")):
@@ -2779,6 +2842,7 @@ class Executor:
         task = self._normalize_spaces(text)
         if not task:
             self._log("⚠ Не удалось добавить задачу: пустой текст.")
+            self._speak("Не удалось добавить задачу: пустой текст.")
             return
         todos = self._load_todos()
         todos.append(
@@ -2790,16 +2854,18 @@ class Executor:
         )
         self._save_todos(todos)
         self._log(f"📌 Задача добавлена: {task}")
+        self._speak(f"Задача добавлена: {task}.")
 
     def list_todos(self):
         todos = self._load_todos()
         active = [row for row in todos if isinstance(row, dict) and not bool(row.get("done"))]
         if not active:
             self._log("📌 Активных задач нет.")
+            self._speak("Активных задач нет.")
             return
         self._log(f"📌 Активных задач: {len(active)}")
-        for i, row in enumerate(active[:10], 1):
-            self._log(f"  {i}. {str(row.get('text') or '').strip()}")
+        tasks_text = ", ".join(str(row.get("text") or "").strip() for row in active[:5])
+        self._speak(f"У вас {len(active)} задач: {tasks_text}.")
 
     def list_known_apps(self):
         apps = self.config.get("apps", {}) if isinstance(self.config, dict) else {}
@@ -2817,26 +2883,42 @@ class Executor:
 
     def complete_todo(self, ref: str):
         todos = self._load_todos()
+        if ref.strip().lower() in {"все", "всё", "all", "всех", "всеми"}:
+            now_iso = datetime.now().isoformat()
+            count = 0
+            for row in todos:
+                if not bool(row.get("done")):
+                    row["done"] = True
+                    row["done_at"] = now_iso
+                    count += 1
+            self._save_todos(todos)
+            self._log(f"✅ Отмечено выполненными: {count} задач.")
+            self._speak(f"Все задачи отмечены выполненными, {count} штук.")
+            return
         idx = self._find_todo_index(todos, ref)
         if idx < 0:
             self._log("⚠ Задача не найдена.")
+            self._speak("Задача не найдена.")
             return
         todos[idx]["done"] = True
         todos[idx]["done_at"] = datetime.now().isoformat()
         text = str(todos[idx].get("text") or "").strip()
         self._save_todos(todos)
         self._log(f"✅ Задача выполнена: {text}")
+        self._speak(f"Задача выполнена: {text}.")
 
     def delete_todo(self, ref: str):
         todos = self._load_todos()
         idx = self._find_todo_index(todos, ref)
         if idx < 0:
             self._log("⚠ Задача не найдена.")
+            self._speak("Задача не найдена.")
             return
         text = str(todos[idx].get("text") or "").strip()
         todos.pop(idx)
         self._save_todos(todos)
         self._log(f"🗑 Удалил задачу: {text}")
+        self._speak(f"Задача удалена: {text}.")
     
     def add_note(self, text: str):
         """Добавить заметку"""
