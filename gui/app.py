@@ -1174,13 +1174,18 @@ class MainWindow(QMainWindow):
         self.avatar_shadow.setColor(self._avatar_shadow_base if hasattr(self, "_avatar_shadow_base") else QColor(104, 150, 255, 80))
 
     def _apply_light_theme(self):
-        self.setStyleSheet(
+        app = QApplication.instance()
+        target = app if app is not None else self
+        target.setStyleSheet(
             """
             QMainWindow, QWidget {
                 background: transparent;
                 color: #1F2A37;
             }
             QMainWindow {
+                background: #F6F8FC;
+            }
+            QDialog {
                 background: #F6F8FC;
             }
             QTabWidget::pane {
@@ -1225,6 +1230,17 @@ class MainWindow(QMainWindow):
                 border-radius: 8px;
                 padding: 6px;
                 color: #1F2937;
+            }
+            QComboBox QAbstractItemView {
+                background: #FFFFFF;
+                color: #1F2937;
+                border: 1px solid #DCE3ED;
+                selection-background-color: #E0E7FF;
+                selection-color: #1F2937;
+                outline: 0;
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 6px 10px;
             }
             QToolButton#spinStepUp, QToolButton#spinStepDown {
                 border: none;
@@ -1297,6 +1313,27 @@ class MainWindow(QMainWindow):
             QProgressBar::chunk {
                 background: #8BB4FF;
                 border-radius: 6px;
+            }
+            QMenu {
+                background: #FFFFFF;
+                color: #1F2937;
+                border: 1px solid #DCE3ED;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QMenu::item {
+                background: transparent;
+                padding: 6px 12px;
+                border-radius: 6px;
+            }
+            QMenu::item:selected {
+                background: #E0E7FF;
+                color: #1F2937;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #E5E7EB;
+                margin: 6px 4px;
             }
             QFrame#avatarWrap {
                 border: 1px solid #E7ECF4;
